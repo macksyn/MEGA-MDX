@@ -1,0 +1,6 @@
+{
+  "exec": "ts-node index.ts",
+  "watch": ["index.ts", "lib", "plugins", "config.ts", "settings.ts"],
+  "ext": "ts",
+  "ignore": ["dist/*", "*.json", "session/*", "tmp/*", "*.log"]
+}
