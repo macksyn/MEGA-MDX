@@ -13,7 +13,7 @@
     "start": "node dist/index.js",
     "build": "tsc && cp package.json dist/ && cp -r assets dist/",
     "dev": "tsc --watch & nodemon --watch dist dist/index.js",
-    "setup": "npm install && npm run build && npm run reset-data",
+    "setup": "npm run build && npm run reset-data",
     "start:optimized": "node --max-old-space-size=512 --optimize-for-size --gc-interval=100 dist/index.js",
     "reset-session": "node -e \"require('fs').rmSync('./session', {recursive:true, force:true}); console.log('Session cleared!')\"",
     "clean": "rm -rf dist/",
@@ -24,7 +24,7 @@
     "test:unit": "mocha test/unit/**/*.test.ts",
     "test:integration": "mocha test/integration/**/*.test.ts",
     "reset-data": "node dist/reset-data.js",
-    "start:fresh": "npm run reset-data && npm start"
+    "start:fresh": "npm run reset-data && npm run start"
   },
   "keywords": [
     "termux-whatsapp-bot",
