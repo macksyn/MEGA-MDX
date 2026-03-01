@@ -107,6 +107,7 @@
     "ts-mocha": "^11.1.0",
     "ts-unused-exports": "^11.0.1",
     "@typescript-eslint/eslint-plugin": "^8.56.1",
-    "@typescript-eslint/parser": "^8.56.1"
+    "@typescript-eslint/parser": "^8.56.1",
+    "ts-node": "^10.9.2"
   }
 }
