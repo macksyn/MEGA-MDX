@@ -80,7 +80,9 @@
     "simple-git": "^3.30.0",
     "stickers-formatter": "^0.0.1",
     "syntax-error": "^1.4.0",
-    "yt-search": "^2.12.1"
+    "yt-search": "^2.12.1",
+    "@typescript-eslint/eslint-plugin": "^8.56.1",
+    "@typescript-eslint/parser": "^8.56.1"
   },
   "overrides": {
     "minimatch": "^10.2.1",
@@ -99,8 +101,6 @@
   "devDependencies": {
     "@types/chai": "^5.2.3",
     "@types/mocha": "^10.0.10",
-    "@typescript-eslint/eslint-plugin": "^8.56.1",
-    "@typescript-eslint/parser": "^8.56.1",
     "chai": "^6.2.2",
     "eslint": "^10.0.2",
     "madge": "^8.0.0",
