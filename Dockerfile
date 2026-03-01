@@ -1,9 +1,14 @@
 FROM quay.io/qasimtech/mega-bot:latest
 
-WORKDIR /root/mega-md
+WORKDIR /app
 
-RUN git clone https://github.com/GlobalTechInfo/MEGA-MD . && \
-    npm install
+COPY package.json ./
+
+RUN npm install --legacy-peer-deps
+
+COPY . .
+
+RUN npm run build
 
 EXPOSE 5000
 
