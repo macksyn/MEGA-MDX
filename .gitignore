@@ -34,3 +34,9 @@ yarn-error.log*
 *.njsproj
 *.sln
 *.sw?
+baileys.db
+baileys_store.db
+temp/
+*.db
+*.db-wal
+*.db-shm

@@ -20,7 +20,7 @@ export default {
 
     try {
       const mp4Buffer = await renderBlinkingVideoWithFfmpeg(text);
-      const webpPath = await writeExifVid(mp4Buffer, { packname: 'Mega Md' });
+      const webpPath = await writeExifVid(mp4Buffer as Buffer, { packname: 'Mega Md', author: 'MEGA-MD' });
       const webpBuffer = fs.readFileSync(webpPath);
       try { fs.unlinkSync(webpPath); } catch {}
       await sock.sendMessage(chatId, { sticker: webpBuffer }, { quoted: message });
