@@ -52,9 +52,9 @@ async function saveState(state) {
 
 async function ensureDefaultSticker(state) {
     try {
-        const assetPath = path.join(__dirname, '..', state.assetPath);
+        const assetPath = path.join(process.cwd(), state.assetPath);
         if (state.assetPath.endsWith('mention_default.webp') && !fs.existsSync(assetPath)) {
-            const defaultStickerPath = path.join(__dirname, '..', 'assets', 'stickintro.webp');
+            const defaultStickerPath = path.join(process.cwd(), 'assets', 'stickintro.webp');
             if (fs.existsSync(defaultStickerPath)) {
                 fs.copyFileSync(defaultStickerPath, assetPath);
             } else {
@@ -73,6 +73,7 @@ async function ensureDefaultSticker(state) {
 export async function handleMentionDetection(sock: any, chatId: any, message: any) {
     try {
         if (message.key?.fromMe) return;
+        if (!chatId?.endsWith('@g.us')) return; // Group only
 
         const state = await loadState();
         await ensureDefaultSticker(state);
@@ -132,7 +133,7 @@ export async function handleMentionDetection(sock: any, chatId: any, message: an
             await sock.sendMessage(chatId, { text: 'Hi' }, { quoted: message });
             return;
         }
-        const assetPath = path.join(__dirname, '..', state.assetPath);
+        const assetPath = path.join(process.cwd(), state.assetPath);
         if (!fs.existsSync(assetPath)) {
             await sock.sendMessage(chatId, { text: 'Hi' }, { quoted: message });
             return;
@@ -218,7 +219,7 @@ async function setMentionCommand(sock, chatId, message, isOwner) {
     else if (type === 'text') ext = 'txt';
     const stateBefore = await loadState();
     try {
-        const assetsDir = path.join(__dirname, '..', 'assets');
+        const assetsDir = path.join(process.cwd(), 'assets');
         if (fs.existsSync(assetsDir)) {
             const files = fs.readdirSync(assetsDir);
             for (const f of files) {
@@ -229,7 +230,7 @@ async function setMentionCommand(sock, chatId, message, isOwner) {
         }
         if (stateBefore.assetPath && stateBefore.assetPath.startsWith('assets/') &&
             !stateBefore.assetPath.endsWith('mention_default.webp')) {
-            const prevPath = path.join(__dirname, '..', stateBefore.assetPath);
+            const prevPath = path.join(process.cwd(), stateBefore.assetPath);
             if (fs.existsSync(prevPath)) {
                 try { fs.unlinkSync(prevPath); } catch {}
             }

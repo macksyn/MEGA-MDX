@@ -33,6 +33,7 @@ export default {
             const pmblocker = await store.getSetting('global', 'pmblocker') as any || { enabled: false };
             const anticall = await store.getSetting('global', 'anticall') as any || { enabled: false };
             const autoReactionData = await store.getSetting('global', 'autoReaction') as any;
+            const mentionData = await store.getSetting('global', 'mention') as any;
             const autoReaction = autoReactionData?.enabled || false;
             const stealthMode = await store.getSetting('global', 'stealthMode') as any || { enabled: false };
             const autoBio = await store.getSetting('global', 'autoBio') as any || { enabled: false };
@@ -59,6 +60,7 @@ export default {
             menuText += `┃ ${getSt(cmdReactEnabled)} *Cmd Reactions*\n`;
             menuText += `┃ ${getSt(stealthMode?.enabled)} *Stealth Mode*\n`;
             menuText += `┃ ${getSt(autoBio?.enabled)} *Auto Bio*\n`;
+            menuText += `┃ ${getSt(mentionData?.enabled)} *Mention Alert*\n`;
             menuText += `┃\n`;
 
             if (isGroup) {

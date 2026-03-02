@@ -35,17 +35,28 @@ export default {
 
     const pluginName = args[0];
     if (!pluginName) {
-      return await sock.sendMessage(chatId, { text: 'Which plugin do you want to inspect? Example: *.inspect convert*' }, { quoted: message });
+      return await sock.sendMessage(chatId, { text: 'Which plugin do you want to inspect?\n\n*Examples:*\n- .inspect ping\n- .inspect ping.ts\n- .inspect ping.js' }, { quoted: message });
     }
 
     try {
-      const pluginsDir = path.join(__dirname, '../plugins');
-      
-      const fileName = pluginName.endsWith('.js') ? pluginName : `${pluginName}.js`;
-      const filePath = path.join(pluginsDir, fileName);
+      const base = pluginName.replace(/\.(ts|js)$/, '');
+      let filePath: string;
+      let fileName: string;
+
+      if (pluginName.endsWith('.js')) {
+        filePath = path.join(process.cwd(), 'dist', 'plugins', base + '.js');
+        fileName = base + '.js';
+      } else {
+        filePath = path.join(process.cwd(), 'plugins', base + '.ts');
+        fileName = base + '.ts';
+        if (!fs.existsSync(filePath)) {
+          filePath = path.join(process.cwd(), 'dist', 'plugins', base + '.js');
+          fileName = base + '.js';
+        }
+      }
 
       if (!fs.existsSync(filePath)) {
-        return await sock.sendMessage(chatId, { text: `❌ Plugin "${fileName}" not found.` }, { quoted: message });
+        return await sock.sendMessage(chatId, { text: `❌ Plugin "${base}" not found.` }, { quoted: message });
       }
 
       const code = fs.readFileSync(filePath, 'utf8');

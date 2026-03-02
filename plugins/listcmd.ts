@@ -80,7 +80,7 @@ export default {
             .filter(Boolean);
 
         await sock.sendMessage(chatId, {
-            text: `*COMMAND LIST*\n\n▢ *Info:* If it's in *bold*, it is blocked\n\n──────────────────\n${stickerList}`,
+            text: `*CUSTOM STICKER COMMANDS*\n\n▢ *Info:* Custom commands set via .setcmd\n\n──────────────────\n${stickerList}`,
             mentions: mentions
         }, { quoted: message });
     }

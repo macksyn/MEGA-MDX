@@ -1,7 +1,7 @@
 export default {
   command: 'gitclone',
   aliases: ['githubdl', 'clone'],
-  category: 'owner',
+  category: 'download',
   description: 'Download a GitHub repository as zip',
   usage: '.gitclone <url> OR <username> <repo>',
 

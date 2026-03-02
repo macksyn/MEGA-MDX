@@ -1,5 +1,5 @@
 import './config.js';
-import './settings.js';
+
 
 import { Boom } from '@hapi/boom';
 import fs from 'fs';
@@ -76,7 +76,39 @@ setInterval(() => {
 }, 30_000);
 
 let phoneNumber = global.PAIRING_NUMBER || process.env.PAIRING_NUMBER || "923051391005";
-let owner = JSON.parse(fs.readFileSync('./data/owner.json', 'utf-8'));
+
+// Auto-create data directory and default files on startup
+const DATA_DEFAULTS: Record<string, any> = {
+    'owner.json': [],
+    'banned.json': [],
+    'premium.json': [],
+    'warnings.json': {},
+    'notes.json': {},
+    'autoAi.json': {},
+    'messageCount.json': { isPublic: true, messageCount: {} },
+    'userGroupData.json': { users: [], groups: [], antilink: {}, antibadword: {}, warnings: {}, sudo: [], welcome: {}, goodbye: {}, chatbot: {}, autoReaction: false },
+    'autoStatus.json': { enabled: false },
+    'autoread.json': { enabled: false },
+    'autotyping.json': { enabled: false },
+    'pmblocker.json': { enabled: false },
+    'anticall.json': { enabled: false },
+    'stealthMode.json': { enabled: false },
+    'autoBio.json': { enabled: false, customBio: null },
+    'autoReaction.json': { enabled: false },
+    'antidelete.json': { enabled: false },
+    'antilink.json': {},
+    'antibadword.json': {},
+};
+fs.mkdirSync('./data', { recursive: true });
+for (const [file, def] of Object.entries(DATA_DEFAULTS)) {
+    const fp = `./data/${file}`;
+    if (!fs.existsSync(fp)) fs.writeFileSync(fp, JSON.stringify(def, null, 2));
+}
+
+let owner: string[] = [];
+try {
+    owner = JSON.parse(fs.readFileSync('./data/owner.json', 'utf-8'));
+} catch { owner = []; }
 
 global.botname = process.env.BOT_NAME || "MEGA-MD";
 global.themeemoji = "•";

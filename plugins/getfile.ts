@@ -25,11 +25,22 @@ export default {
         }, { quoted: message });
       }
 
-      const filePath = path.join(__dirname, '..', filename);
+      // Check project root first, then dist/ for compiled files
+      let filePath = path.join(process.cwd(), filename);
+      try {
+        await fs.access(filePath);
+      } catch {
+        // Try dist/ for .js files
+        const distPath = path.join(process.cwd(), 'dist', filename);
+        try {
+          await fs.access(distPath);
+          filePath = distPath;
+        } catch { /* will fail below */ }
+      }
 
       try {
         await fs.access(filePath);
-      } catch(e: any) {
+      } catch {
         return await sock.sendMessage(chatId, {
           text: `❌ *File not found!*\n\nNo file named "${filename}" exists.\n\n*Tip:* Use relative path from bot root directory.`
         }, { quoted: message });

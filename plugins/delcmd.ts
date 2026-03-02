@@ -61,7 +61,7 @@ export default {
         if (message.message?.extendedTextMessage?.contextInfo?.quotedMessage?.stickerMessage) {
             const fileSha256 = message.message.extendedTextMessage.contextInfo.quotedMessage.stickerMessage.fileSha256;
             if (fileSha256) {
-                hash = Buffer.from(fileSha256).toString('hex');
+                hash = Buffer.from(fileSha256).toString('base64');
             }
         }
 
@@ -72,6 +72,12 @@ export default {
         }
 
         const stickers = await getStickerCommands();
+
+        // Find by text name if hash not found
+        if (!stickers[hash]) {
+            const found = Object.entries(stickers).find(([, v]: any) => v.text === hash);
+            if (found) hash = found[0];
+        }
 
         if (stickers[hash] && stickers[hash].locked) {
             return await sock.sendMessage(chatId, { 
