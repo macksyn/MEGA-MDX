@@ -1,9 +1,9 @@
 {
-  "name": "mega",
+  "name": "mega-md",
   "version": "5.2.0",
-  "description": "High performance multi-device whatsapp bot",
+  "description": "High performance multi-device WhatsApp bot",
   "type": "module",
-  "main": "index.js",
+  "main": "dist/index.js",
   "directories": {
     "lib": "lib",
     "data": "data",
@@ -11,30 +11,29 @@
   },
   "scripts": {
     "start": "node dist/index.js",
-    "build": "tsc && cp package.json dist/ && cp -r assets dist/",
-    "dev": "tsc --watch & nodemon --watch dist dist/index.js",
-    "setup": "npm run build && npm run reset-data",
     "start:optimized": "node --max-old-space-size=512 --optimize-for-size --gc-interval=100 dist/index.js",
-    "reset-session": "node --input-type=module -e \"import fs from 'fs'; fs.rmSync('./session', {recursive:true, force:true}); console.log('Session cleared!')\"",
-    "clean": "rm -rf dist/",
+    "start:fresh": "node dist/reset-data.js && node dist/index.js",
+    "build": "tsc && cp -r assets dist/",
     "rebuild": "npm run clean && npm run build",
-    "lint": "npx eslint . --ext .ts",
-    "typecheck": "tsc --noEmit",
-    "test": "mocha",
-    "test:unit": "mocha test/unit/**/*.test.ts",
-    "test:integration": "mocha test/integration/**/*.test.ts",
+    "clean": "node -e \"import('fs').then(f=>f.default.rmSync('dist',{recursive:true,force:true}))\"",
+    "dev": "tsc --watch & nodemon --watch dist --ext js dist/index.js",
+    "setup": "npm run build && node dist/reset-data.js",
     "reset-data": "node dist/reset-data.js",
-    "start:fresh": "npm run reset-data && npm run start"
+    "reset-session": "node -e \"import('fs').then(f=>f.default.rmSync('./session',{recursive:true,force:true})).then(()=>console.log('Session cleared!'))\"",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . --ext .ts",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration",
+    "test:watch": "vitest",
+    "audit": "npm audit --omit=dev"
   },
   "keywords": [
-    "termux-whatsapp-bot",
     "whatsapp-bot",
-    "whatsapp-api",
     "baileys-bot",
-    "whatsApp",
-    "mega-bot",
     "mega-md",
     "multi-device",
+    "termux-whatsapp-bot",
     "mega-ai"
   ],
   "homepage": "https://github.com/GlobalTechInfo/MEGA-MD",
@@ -47,6 +46,16 @@
   },
   "license": "MIT",
   "author": "GlobalTechInfo",
+  "contributors": [
+    {
+      "name": "Qasim Ali",
+      "role": "Lead Developer"
+    },
+    {
+      "name": "GlobalTechInfo",
+      "role": "Maintainer"
+    }
+  ],
   "dependencies": {
     "@hapi/boom": "^10.0.1",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
@@ -80,34 +89,19 @@
     "simple-git": "^3.30.0",
     "stickers-formatter": "^0.0.1",
     "syntax-error": "^1.4.0",
-    "yt-search": "^2.12.1",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "yt-search": "^2.12.1"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^8.56.1",
+    "@typescript-eslint/parser": "^8.56.1",
+    "eslint": "^10.0.2",
+    "madge": "^8.0.0",
+    "ts-unused-exports": "^11.0.1",
+    "vitest": "^4.0.18"
   },
   "overrides": {
     "minimatch": "^10.2.1",
     "yargs-parser": "^21.1.1"
-  },
-  "contributors": [
-    {
-      "name": "Qasim Ali",
-      "role": "Lead Developer"
-    },
-    {
-      "name": "GlobalTechInfo",
-      "role": "Maintainer"
-    }
-  ],
-  "devDependencies": {
-    "@types/chai": "^5.2.3",
-    "@types/mocha": "^10.0.10",
-    "chai": "^6.2.2",
-    "eslint": "^10.0.2",
-    "madge": "^8.0.0",
-    "mocha": "^11.7.5",
-    "ts-mocha": "^11.1.0",
-    "ts-unused-exports": "^11.0.1",
-    "@typescript-eslint/eslint-plugin": "^8.56.1",
-    "@typescript-eslint/parser": "^8.56.1",
-    "ts-node": "^10.9.2"
   }
 }
