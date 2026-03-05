@@ -2,7 +2,7 @@
 set -e
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "   MEGA-MD WhatsApp Bot Installer  "
+echo "   MEGA-MDX WhatsApp Bot Installer  "
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # Check root
@@ -14,7 +14,7 @@ fi
 # Install dependencies
 echo "📦 Installing system dependencies..."
 apt-get update -qq
-apt-get install -y curl git ffmpeg imagemagick libwebp-dev
+apt-get install -y curl git ffmpeg libvips-dev build-essential libwebp-dev
 
 # Install Node.js 20
 if ! command -v node &> /dev/null || [ "$(node -v | cut -d'.' -f1 | tr -d 'v')" -lt 20 ]; then
@@ -27,8 +27,8 @@ echo "✅ Node.js $(node -v) installed"
 
 # Clone repo
 echo "📥 Cloning MEGA-MD..."
-git clone https://github.com/GlobalTechInfo/MEGA-MD /root/MEGA-MD
-cd /root/MEGA-MD
+git clone https://github.com/GlobalTechInfo/MEGA-MDX /root/MEGA-MDX
+cd /root/MEGA-MDX
 
 # Install npm packages
 echo "📦 Installing npm packages..."
@@ -52,8 +52,8 @@ if [ ! -f .env ]; then
   echo "# MYSQL_URL=" >> .env
   echo "# DB_URL=" >> .env
   echo ""
-  echo "⚠️  Please edit /root/MEGA-MD/.env with your settings"
-  echo "   nano /root/MEGA-MD/.env"
+  echo "⚠️  Please edit /root/MEGA-MDX/.env with your settings"
+  echo "   nano /root/MEGA-MDX/.env"
 fi
 
 # PM2 setup
@@ -67,8 +67,8 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "✅ Installation complete!"
 echo ""
 echo "Next steps:"
-echo "  1. Edit your config: nano /root/MEGA-MD/.env"
-echo "  2. Start the bot:    cd /root/MEGA-MD && pm2 start dist/index.js --name mega-md"
-echo "  3. View logs:        pm2 logs mega-md"
+echo "  1. Edit your config: nano /root/MEGA-MDX/.env"
+echo "  2. Start the bot:    cd /root/MEGA-MDX && pm2 start dist/index.js --name mega-mdx"
+echo "  3. View logs:        pm2 logs mega-mdx"
 echo "  4. Auto-start:       pm2 startup && pm2 save"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
