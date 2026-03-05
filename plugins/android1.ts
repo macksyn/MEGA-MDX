@@ -3,11 +3,11 @@ const QasimAny = pkg as any;
 import axios from 'axios';
 
 export default {
-  command: 'android',
-  aliases: ['an1', 'an1apk'],
-  category: 'apks',
+  command: 'apkdl',
+  aliases: ['apk', 'an1apk', 'appdl', 'app'],
+  category: 'download',
   description: 'Search APKs and download by reply',
-  usage: '.android <apk_name>',
+  usage: '.apkdl <apk_name>',
 
   async handler(sock: any, message: any, args: any, context: any = {}) {
     const chatId = context.chatId || message.key.remoteJid;
@@ -15,7 +15,7 @@ export default {
 
     try {
       if (!query) {
-        return await sock.sendMessage(chatId, { text: '*Please provide an APK name.*\nExample: .android Telegram' }, { quoted: message });
+        return await sock.sendMessage(chatId, { text: '*Please provide an APK name.*\nExample: .apkdl Telegram' }, { quoted: message });
       }
 
       await sock.sendMessage(chatId, { text: '🔎 Searching for APKs...' }, { quoted: message });

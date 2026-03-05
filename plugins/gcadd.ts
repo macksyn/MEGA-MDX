@@ -17,7 +17,7 @@
 export default {
     command: 'add',
     aliases: ['invite', 'gcadd', 'addgc'],
-    category: 'group',
+    category: 'admin',
     description: 'Add a user to the group',
     usage: '.add <number> or reply to vcard/message',
     groupOnly: 'true',

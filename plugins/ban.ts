@@ -41,7 +41,7 @@ async function isUserBanned(userId) {
 export default {
     command: 'ban',
     aliases: ['block', 'banuser'],
-    category: 'group',
+    category: 'admin',
     description: 'Ban a user from using the bot',
     usage: '.ban @user or reply to message',
 

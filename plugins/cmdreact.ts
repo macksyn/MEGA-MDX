@@ -9,8 +9,8 @@ const HAS_DB = !!(MONGO_URL || POSTGRES_URL || MYSQL_URL || SQLITE_URL);
 
 
 export default {
-  command: 'creact',
-  aliases: ['cmdreact'],
+  command: 'cmdreact',
+  aliases: ['creact', 'commandreact'],
   category: 'owner',
   description: 'Toggle command reactions',
   usage: '.creact on/off',

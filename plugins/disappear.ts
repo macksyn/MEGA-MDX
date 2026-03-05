@@ -3,7 +3,7 @@ import isAdmin from '../lib/isAdmin.js';
 export default {
     command: 'disappear',
     aliases: ['ephemeral', 'disappearing', 'vanish'],
-    category: 'group',
+    category: 'admin',
     description: 'Enable or disable disappearing messages in chat',
     usage: '.disappear off | .disappear 24h | .disappear 7d | .disappear 90d',
 

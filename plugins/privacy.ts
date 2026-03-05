@@ -1,6 +1,6 @@
 export default {
     command: 'privacy',
-    aliases: ['setprivacy'],
+    aliases: ['setprivacy', 'pvcy', 'pri'],
     category: 'menu',
     description: 'Manage all WhatsApp privacy settings, block/unblock users',
     usage: '.privacy — show menu',
@@ -16,12 +16,12 @@ export default {
         if (!setting) {
             return await sock.sendMessage(chatId, {
                 text:
-                    `╔═════════════════════╗\n` +
-                    `║   🔒 *PRIVACY SETTINGS* ║\n` +
-                    `╚═════════════════════╝\n` +
-                    `📌 *Usage:* \`.privacy <setting> <value>\`\n\n` +
-                    `──────────────────────────\n` +
-                    `*⚙️ PRIVACY CONTROLS*\n` +
+                    `╔══════════════╗\n` +
+                    `║🔒*PRIVACY SETTING*║\n` +
+                    `╚══════════════╝\n` +
+                    `📌 *Usage:* \`.pvcy <set> <val>\`\n\n` +
+                    `────────────────────\n` +
+                    `*⚙️ PRIVACY CONTROLS*\n\n` +
                     `👁️ *lastseen* — \`all\` \`contacts\` \`blacklist\` \`none\`\n\n` +
                     `🟢 *online* — \`all\` \`match_last_seen\`\n\n` +
                     `🖼️ *profile* — \`all\` \`contacts\` \`blacklist\` \`none\`\n\n` +
@@ -29,13 +29,13 @@ export default {
                     `✅ *receipts* — \`all\` \`none\`\n\n` +
                     `👥 *groups* — \`all\` \`contacts\` \`blacklist\`\n\n` +
                     `⏳ *timer* — \`off\` \`24h\` \`7d\` \`90d\`\n\n` +
-                    `*🚫 BLOCK CONTROLS*\n` +
+                    `*🚫 BLOCK CONTROLS*\n\n` +
                     `🔴 *block* — \`<number>\` or reply to msg\n\n` +
                     `🟢 *unblock* — \`<number>\` or reply to msg\n\n` +
                     `📋 *blocklist* — view blocked users\n\n` +
                     `*📊 INFO*\n` +
                     `🔍 *status* — view privacy settings\n` +
-                    `──────────────────────────\n\n` +
+                    `────────────────────\n\n` +
                     `💡 *Examples:*\n` +
                     `› \`.privacy lastseen all\`\n\n` +
                     `› \`.privacy receipts none\`\n\n` +
@@ -54,16 +54,16 @@ export default {
                 const fmt = (v: any) => v ? `\`${v}\`` : `\`unknown\``;
                 return await sock.sendMessage(chatId, {
                     text:
-                        `╔═════════════════════╗\n` +
-                        `║  🔒 *CURRENT PRIVACY*   ║\n` +
-                        `╚═════════════════════╝\n\n` +
+                        `╔═══════════════╗\n` +
+                        `║🔒*CURRENT PRIVACY*║\n` +
+                        `╚═══════════════╝\n\n` +
                         `👁️ *Last Seen:* ${fmt(s.last)}\n\n` +
                         `🟢 *Online:* ${fmt(s.online)}\n\n` +
                         `🖼️ *Profile Pic:* ${fmt(s.profile)}\n\n` +
                         `📊 *Status:* ${fmt(s.status)}\n\n` +
                         `✅ *Read Receipts:* ${fmt(s.readreceipts)}\n\n` +
                         `👥 *Groups Add:* ${fmt(s.groupadd)}\n\n` +
-                        `_Use \`.privacy <setting> <value>\` to change_`,
+                        `_Use \`.pvcy <set> <value>\` to change_`,
                     ...channelInfo
                 }, { quoted: message });
             } catch (e: any) {
@@ -81,11 +81,11 @@ export default {
                 const entries = list.map((jid: string, i: number) => `${i + 1}. +${jid.split('@')[0]}`).join('\n');
                 return await sock.sendMessage(chatId, {
                     text:
-                        `╔═════════════════════╗\n` +
-                        `║     🚫 *BLOCK LIST*     ║\n` +
-                        `╚═════════════════════╝\n\n` +
+                        `╔═════════════╗\n` +
+                        `║🚫 *BLOCK LIST*   ║\n` +
+                        `╚═════════════╝\n\n` +
                         `${entries}\n\n` +
-                        `──────────────────────────\n` +
+                        `────────────────────\n` +
                         `*Total:* ${list.length} blocked user(s)`,
                     ...channelInfo
                 }, { quoted: message });

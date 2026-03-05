@@ -290,7 +290,7 @@ export { loadConfig, saveConfig, DEFAULT_GROUP_CONFIG };
 export default {
     command: 'antispam',
     aliases: ['floodprotect', 'antiflood'],
-    category: 'group',
+    category: 'admin',
     description: 'Configure anti-spam flood protection for the group',
     usage: '.antispam on/off | .antispam set <msgs> <seconds> | .antispam action <warn/kick/mute> | .antispam warns <n>',
     groupOnly: true,

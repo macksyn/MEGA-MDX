@@ -47,7 +47,7 @@ export default {
 
             const getSt = (val) => val ? '✅' : '❌';
 
-            let menuText = `╭━〔 *MEGA SETTINGS* 〕━┈\n┃\n`;
+            let menuText = `╭━〔 *MEGA CONFIG* 〕━┈\n┃\n`;
             menuText += `┃ 👤 *User:* @${cleanJid(senderId)}\n`;
             menuText += `┃ 🤖 *Mode:* ${botMode.toUpperCase()}\n`;
             menuText += `┃\n┣━〔 *GLOBAL CONFIG* 〕━┈\n`;
