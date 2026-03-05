@@ -8,7 +8,7 @@ const config = {
     author:      process.env.AUTHOR        || 'GlobalTechInfo',
     packname:    process.env.PACKNAME      || 'MEGA-MD',
     description: process.env.DESCRIPTION  || 'High performance multi-device WhatsApp bot',
-    version:     '5.2.0',
+    version:     '6.0.0',
 
     // Bot Config
     prefixes:    process.env.PREFIXES ? process.env.PREFIXES.split(',') : ['.', '!', '/', '#'],
