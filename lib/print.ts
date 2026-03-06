@@ -1,6 +1,6 @@
 import chalk from 'chalk';
 import PhoneNumber, { parsePhoneNumber } from 'awesome-phonenumber';
-import settings from '../config.js';
+import config from '../config.js';
 
 /**
  * Extract real phone number from various JID formats
@@ -40,7 +40,7 @@ async function getNameWithFallback(jid, sock, pushName) {
         const phone = extractPhoneNumber(jid)
         if (phone && phone.length >= 10) {
             const pn = (PhoneNumber as any)('+' + phone)
-            if (pn.isValid()) {
+            if (pn.valid) {
                 return null
             }
         }
@@ -70,7 +70,7 @@ async function printMessage(message, sock) {
 
         try {
             if (fromMe) {
-                senderName = sock.user?.name || 'Bot'
+                senderName = sock.user?.name || 'Owner'
                 const botNumber = extractPhoneNumber(sock.user?.id || sock.user?.jid)
                 if (botNumber) {
                     const pn: any = parsePhoneNumber('+' + botNumber)
@@ -82,7 +82,7 @@ async function printMessage(message, sock) {
                 const phone = extractPhoneNumber(senderId)
                 if (phone && phone.length >= 10) {
                     const pn = (PhoneNumber as any)('+' + phone)
-                    senderPhone = pn.isValid() ? pn.getNumber('international') : phone
+                    senderPhone = pn.valid ? pn.getNumber('international') : phone
                 } else {
                     senderPhone = senderId.split('@')[0].split(':')[0]
                 }
@@ -173,7 +173,7 @@ async function printMessage(message, sock) {
             minute: '2-digit',
             second: '2-digit',
             hour12: false,
-            timeZone: settings.timeZone || 'Asia/Karachi'
+            timeZone: config.timeZone || 'Asia/Karachi'
         })
 
         const isCommand = messageText.startsWith('.') ||
@@ -186,11 +186,11 @@ async function printMessage(message, sock) {
         console.log((chalk as any).hex('#00D9FF').bold('╭─────────────────────────────────'))
 
         console.log(
-            (chalk as any).hex('#00D9FF')('│') + ' ' +
-            (chalk as any).cyan('🤖 Bot') + ' ' +
-            (chalk as any).black((chalk as any).bgCyan(` ${timeStr} `)) + ' ' +
-            (chalk as any).magenta(displayType) +
-            (chalk as any).gray(fileSizeStr)
+            (chalk as any).hex('#00D9FF').bold('│') + ' ' +
+            (chalk as any).cyan.bold('🤖 Bot') + ' ' +
+            (chalk as any).black((chalk as any).bgCyan.bold(` ${timeStr} `)) + ' ' +
+            (chalk as any).magenta.bold(displayType) +
+            (chalk as any).gray.blod(fileSizeStr)
         )
 
         const senderDisplay = senderName && senderName !== senderPhone
@@ -198,22 +198,22 @@ async function printMessage(message, sock) {
             : senderPhone
 
         console.log(
-            (chalk as any).hex('#00D9FF')('│') + ' ' +
-            (fromMe ? (chalk as any).green('📤 ME') : (chalk as any).yellow('📨 FROM')) + ' ' +
-            (chalk as any).white(senderDisplay)
+            (chalk as any).hex('#00D9FF').bold('│') + ' ' +
+            (fromMe ? (chalk as any).green.bold('📤 ME') : (chalk as any).yellow.bold('📨 FROM')) + ' ' +
+            (chalk as any).white.bold(senderDisplay)
         )
 
         if (isGroup && chatName) {
             console.log(
-                (chalk as any).hex('#00D9FF')('│') + ' ' +
-                (chalk as any).blue('👥 GROUP') + ' ' +
-                (chalk as any).white(chatName)
+                (chalk as any).hex('#00D9FF').bold('│') + ' ' +
+                (chalk as any).blue.bold('👥 GROUP') + ' ' +
+                (chalk as any).white.bold(chatName)
             )
         } else if (!isGroup) {
             console.log(
-                (chalk as any).hex('#00D9FF')('│') + ' ' +
-                (chalk as any).magenta('💬 PRIVATE') + ' ' +
-                (chalk as any).white('Private Chat')
+                (chalk as any).hex('#00D9FF').bold('│') + ' ' +
+                (chalk as any).magenta.bold('💬 PRIVATE') + ' ' +
+                (chalk as any).white.bold('Private Chat')
             )
         }
 
@@ -229,15 +229,15 @@ async function printMessage(message, sock) {
                                   (fromMe && messageText.includes('*'))
 
             console.log(
-                (chalk as any).hex('#00D9FF')('│') + ' ' +
-                (chalk as any).hex('#FFD700')('💭 MSG') + ' ' +
+                (chalk as any).hex('#00D9FF').bold('│') + ' ' +
+                (chalk as any).hex('#FFD700').bold('💭 MSG') + ' ' +
                 (isCommand
-                    ? (chalk as any).greenBright(displayText)
+                    ? (chalk as any).greenBright.bold(displayText)
                     : isBotResponse
-                        ? (chalk as any).cyan(displayText)
+                        ? (chalk as any).cyan.bold(displayText)
                         : fromMe
-                            ? (chalk as any).blueBright(displayText)
-                            : (chalk as any).white(displayText)
+                            ? (chalk as any).blueBright.bold(displayText)
+                            : (chalk as any).white.bold(displayText)
                 )
             )
         }
@@ -246,8 +246,8 @@ async function printMessage(message, sock) {
         console.log()
 
     } catch(error: any) {
-        console.log((chalk as any).red('❌ Error logging message:'), error.message)
-        console.log((chalk as any).gray(`[${message.key?.fromMe ? 'ME' : 'MSG'}] ${message.key?.remoteJid}`))
+        console.log((chalk as any).red.bold('❌ Error logging message:'), error.message)
+        console.log((chalk as any).gray.bold(`[${message.key?.fromMe ? 'ME' : 'MSG'}] ${message.key?.remoteJid}`))
     }
 }
 
@@ -260,7 +260,7 @@ function printLog(type, message) {
         minute: '2-digit',
         second: '2-digit',
         hour12: false,
-        timeZone: settings.timeZone || 'Asia/Karachi'
+        timeZone: config.timeZone || 'Asia/Karachi'
     })
 
     const colors = {
@@ -273,7 +273,7 @@ function printLog(type, message) {
     }
 
     const icons = {
-        info: 'ℹ️',
+        info: '💡',
         success: '✅',
         warning: '⚠️',
         error: '❌',
@@ -285,7 +285,7 @@ function printLog(type, message) {
     const icon = icons[type] || '•'
 
     console.log(
-        (chalk as any).gray(`[${timestamp}]`) + ' ' +
+        (chalk as any).gray.bold(`[${timestamp}]`) + ' ' +
         color(icon) + ' ' +
         color(message)
     )
