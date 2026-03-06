@@ -1,6 +1,6 @@
 import os from 'os';
 import process from 'process';
-import settings from '../config.js';
+import config from '../config.js';
 
 export default {
   command: 'alive',
@@ -39,8 +39,8 @@ export default {
       const nodeVersion = process.version;
 
       const text =
-        `*🤖 ${settings.botName} IS ACTIVE!*\n\n` +
-        `*Version:* ${settings.version}\n` +
+        `*🤖 ${config.botName} IS ACTIVE!*\n\n` +
+        `*Version:* ${config.version}\n` +
         `*Uptime:* ${uptimeText}\n` +
         `*RAM Usage:* ${usedMem} MB / ${totalMem} MB\n` +
         `*CPU Load:* ${cpuLoad}\n` +
@@ -54,7 +54,7 @@ export default {
           isForwarded: true,
           forwardedNewsletterMessageInfo: {
             newsletterJid: '120363319098372999@newsletter',
-            newsletterName: 'MEGA MD',
+            newsletterName: 'GlobalTechInc',
             serverMessageId: -1
           }
         }
