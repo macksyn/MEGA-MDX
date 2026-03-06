@@ -4,11 +4,11 @@ import path from 'path';
 import crypto from 'crypto';
 import webp from 'node-webpmux';
 import { fileURLToPath } from 'url';
-import settings from '../config.js';
+import config from '../config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const _tmp = path.join(process.cwd(), 'tmp');
+const _tmp = path.join(process.cwd(), 'temp');
 
 interface StickerExtra {
     [key: string]: any;
@@ -24,8 +24,8 @@ export async function sticker(
         const response = await fetch(url);
         const buffer = Buffer.from(await response.arrayBuffer());
         return await new Sticker(buffer, {
-            pack: settings.packname || 'MEGA-MD',
-            author: settings.author || 'GlobalTechInfo',
+            pack: config.packname || 'MEGA-MD',
+            author: config.author || 'GlobalTechInfo',
             type: StickerTypes.DEFAULT
         }).toBuffer();
     } catch (error) {
@@ -68,8 +68,8 @@ export async function sticker5(
 ): Promise<Buffer> {
     const input = url || img;
     return await new Sticker(input, {
-        pack: packname || settings.packname,
-        author: author || settings.author,
+        pack: packname || config.packname,
+        author: author || config.author,
         type: StickerTypes.DEFAULT,
         categories: categories as any,
         ...extra
