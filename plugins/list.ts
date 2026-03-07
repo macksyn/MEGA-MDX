@@ -14,7 +14,7 @@
  *****************************************************************************/
 
 
-import settings from '../config.js';
+import config from '../config.js';
 import commandHandler from '../lib/commandHandler.js';
 import path from 'path';
 import fs from 'fs';
@@ -24,7 +24,7 @@ function formatTime() {
         hour: '2-digit',
         minute: '2-digit',
         hour12: false,
-        timeZone: settings.timeZone || 'UTC'
+        timeZone: config.timeZone || 'UTC'
     };
     return now.toLocaleTimeString('en-US', options as any);
 }
@@ -173,7 +173,7 @@ export default {
 
   async handler(sock: any, message: any, args: any, context: any) {
     const { chatId, channelInfo } = context;
-    const prefix = settings.prefixes[0];
+    const prefix = config.prefixes[0];
     const imagePath = path.join(process.cwd(), 'assets/bot_image.jpg');
 
     if (args.length) {
@@ -219,13 +219,13 @@ export default {
     const style = pick(menuStyles);
 
     const text = style.render({
-      title: settings.botName,
+      title: config.botName,
       prefix,
       info: {
-        bot: settings.botName,
-        prefix: settings.prefixes.join(', '),
+        bot: config.botName,
+        prefix: config.prefixes.join(', '),
         total: commandHandler.commands.size,
-        version: settings.version || "5.0.0",
+        version: config.version || "6.0.0",
         time: formatTime()
       },
       categories: commandHandler.categories
