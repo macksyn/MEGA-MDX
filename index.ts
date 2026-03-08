@@ -642,20 +642,45 @@ folders.forEach(folder => {
 process.on('uncaughtException', (err) => {
     printLog('error', `Uncaught Exception: ${(err as any).message}`);
     console.error((err as any).stack);
+    writeErrorLog({
+        type: 'uncaughtException',
+        error: (err as any).message,
+        stack: (err as any).stack,
+        timestamp: new Date().toISOString()
+    });
 });
 
 process.on('unhandledRejection', (err) => {
     printLog('error', `Unhandled Rejection: ${(err as any).message}`);
     console.error((err as any).stack);
+    writeErrorLog({
+        type: 'unhandledRejection',
+        error: (err as any).message,
+        stack: (err as any).stack,
+        timestamp: new Date().toISOString()
+    });
 });
 
 server.on('error', (error) => {
     if ((error as any).code === 'EADDRINUSE') {
         printLog('error', `Address localhost:${PORT} in use`);
+        writeErrorLog({
+            type: 'serverError',
+            error: `Address localhost:${PORT} in use`,
+            timestamp: new Date().toISOString()
+        });
         server.close();
     } else {
         printLog('error', `Server error: ${error.message}`);
+        writeErrorLog({
+            type: 'serverError',
+            error: error.message,
+            stack: (error as any).stack,
+            timestamp: new Date().toISOString()
+        });
     }
 });
+
+
 
 
