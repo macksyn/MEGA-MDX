@@ -12,7 +12,7 @@ export default {
   isPrefixless: true,
 
   async handler(sock: any, message: any, args: any, context: BotContext) {
-    const chatId = context;
+    const { chatId } = context;
 
     try {
       let uptime = Math.floor(process.uptime());
