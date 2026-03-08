@@ -6,13 +6,12 @@ export default {
     aliases: ['newtrigger', 'setreply'],
     category: 'owner',
     description: 'Add an auto-reply trigger',
-    usage: '.addreply <trigger> | <response>\nFor exact match: .addreply exact:<trigger> | <response>\nUse {name} in response to mention sender name',
+    usage: '${prefix}addreply <trigger> | <response>\nFor exact match: ${prefix}addreply exact:<trigger> | <response>\nUse {name} in response to mention sender name',
     ownerOnly: true,
 
     async handler(sock: any, message: any, args: any[], context: BotContext) {
-        const chatId = context.chatId || message.key.remoteJid;
-        const senderId = context.senderId || message.key.remoteJid;
-        const channelInfo = context.channelInfo || {};
+        const { chatId, senderId, channelInfo, config: botConfig } = context;
+        const prefix = botConfig.prefix;
 
         const fullText = args.join(' ');
         const pipeIndex = fullText.indexOf('|');
@@ -21,11 +20,11 @@ export default {
             return await sock.sendMessage(chatId, {
                 text: `*➕ ADD AUTO-REPLY*\n\n` +
                       `*Usage:*\n` +
-                      `\`.addreply <trigger> | <response>\`\n\n` +
+                      `\`${prefix}addreply <trigger> | <response>\`\n\n` +
                       `*Examples:*\n` +
-                      `• \`.addreply hello | Hi there! 👋\`\n` +
-                      `• \`.addreply exact:good morning | Good morning! ☀️\`\n` +
-                      `• \`.addreply hi | Hello {name}! How are you?\`\n\n` +
+                      `• \`${prefix}addreply hello | Hi there! 👋\`\n` +
+                      `• \`${prefix}addreply exact:good morning | Good morning! ☀️\`\n` +
+                      `• \`${prefix}addreply hi | Hello {name}! How are you?\`\n\n` +
                       `*Tips:*\n` +
                       `• Use \`exact:\` prefix for full message match\n` +
                       `• Without \`exact:\` it matches if message *contains* trigger\n` +
@@ -39,7 +38,7 @@ export default {
 
         if (!trigger || !response) {
             return await sock.sendMessage(chatId, {
-                text: '❌ Both trigger and response are required.\n\nExample: `.addreply hello | Hi there!`',
+                text: `❌ Both trigger and response are required.\n\nExample: \`${prefix}addreply hello | Hi there!\``,
                 ...channelInfo
             }, { quoted: message });
         }
@@ -57,17 +56,17 @@ export default {
             }, { quoted: message });
         }
 
-        const config = await initConfig();
-        const exists = config.replies.find(r => r.trigger === trigger.toLowerCase());
+        const replyConfig = await initConfig();
+        const exists = replyConfig.replies.find((r: any) => r.trigger === trigger.toLowerCase());
 
         if (exists) {
             return await sock.sendMessage(chatId, {
-                text: `⚠️ A reply for *"${trigger}"* already exists!\n\nUse \`.delreply ${trigger}\` to remove it first.`,
+                text: `⚠️ A reply for *"${trigger}"* already exists!\n\nUse \`${prefix}delreply ${trigger}\` to remove it first.`,
                 ...channelInfo
             }, { quoted: message });
         }
 
-        config.replies.push({
+        replyConfig.replies.push({
             trigger: trigger.toLowerCase(),
             response,
             exactMatch,
@@ -75,7 +74,7 @@ export default {
             createdAt: Date.now()
         });
 
-        await saveConfig(config);
+        await saveConfig(replyConfig);
 
         await sock.sendMessage(chatId, {
             text: `✅ *Auto-Reply Added!*\n\n` +
