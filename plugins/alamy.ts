@@ -1,4 +1,4 @@
-import type { BotContext } from '../types.js';
+
 /*****************************************************************************
  *                                                                           *
  *                     Developed By Qasim Ali                                *
@@ -14,7 +14,7 @@ import type { BotContext } from '../types.js';
  *                                                                           *
  *****************************************************************************/
 
-
+import type { BotContext } from '../types.js';
 import axios from 'axios';
 
 export default {
@@ -30,7 +30,7 @@ export default {
     const url = args?.[0]?.trim();
 
     if (!url) {
-      return await sock.sendMessage(chatId, { text: 'Please provide an Alamy URL.\nExample: `${prefix}alamy https://www.alamy.com/video/beautiful-lake...`' }, { quoted: message });
+      return await sock.sendMessage(chatId, { text: `Please provide an Alamy URL.\nExample: ${prefix}alamy https://www.alamy.com/video/beautiful-lake...` }, { quoted: message });
     }
 
     try {
