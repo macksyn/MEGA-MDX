@@ -593,7 +593,9 @@ DB_URL=./data/baileys.db
 | `npm run reset-session` | Delete `session/` folder |
 | `npm run typecheck` | Type check without compiling |
 | `npm run lint` | Run ESLint |
-| `npm test` | Run all tests |
+| `npm test` | Run all tests (178 tests) |
+| `npm run test:coverage` | Run tests with coverage report |
+| `npm run test:watch` | Watch mode for tests |
 
 ---
 
@@ -641,6 +643,25 @@ export default {
 
 ---
 
+## 🧪 Testing
+
+The codebase has a comprehensive test suite covering all core systems:
+
+```bash
+npm test                # Run all 178 tests
+npm run test:coverage   # Run with coverage report
+npm run test:watch      # Watch mode during development
+Test Suite
+Coverage
+lib/ unit tests
+myfunc, paths, isOwner, isBanned, commandHandler
+Plugin structure
+ALL plugins load, no duplicate commands/aliases, correct field types
+Integration
+messageHandler flow, group updates, call handling
+Baileys mock
+Full WhatsApp socket mock for handler testing
+Tests use Vitest with a custom Baileys socket mock that simulates real WhatsApp message flows without requiring a live connection.
 ## 🔧 Troubleshooting
 
 ### Bot not connecting
@@ -688,37 +709,6 @@ rm -rf dist && npm run build
 
 ```bash
 PORT=3000 npm start
-```
-
----
-
-## 📂 Project Structure
-
-```
-MEGA-MDX/
-├── assets/               # Images and Stickers
-├── data/                 # JSON storage (auto-created)
-├── dist/                 # Compiled JS (git-ignored)
-├── lib/
-│   ├── messageHandler.ts # Message routing & feature hooks
-│   ├── commandHandler.ts # Plugin loader & dispatcher
-│   ├── isAdmin.ts        # Admin detection (handles @lid JIDs)
-│   └── ...
-├── plugins/              # 250+ commands (auto-loaded)
-├── config.ts             # Centralised config from .env
-├── index.ts              # Entry point
-├── sample.env            # Environment template
-├── Dockerfile            # Docker image
-├── Procfile              # Procfile
-├── install.sh            # One-line VPS installer
-├── render.yaml           # Render Blueprint config
-├── heroku.yml            # Heroku Docker config
-├── app.json              # Heroku app manifest
-├── koyeb.yaml            # Koyeb config
-├── fly.toml              # Fly.io config
-├── .replit               # Replit run config
-├── replit.nix            # Replit system dependencies
-└── ...
 ```
 
 ---
