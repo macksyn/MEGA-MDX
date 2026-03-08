@@ -35,12 +35,13 @@ export default {
         const query = args.join(' ').trim();
 
         if (!query) {
-            return sock.sendMessage(
+            return await sock.sendMessage(
                 chatId,
-                { text: '🤖 *AI Assistant*\n\nUsage: `${config.prefix}mistral <your question>`\nExample: `${config.prefix}mistral explain quantum physics`' },
+                { text: `🤖 *AI Assistant*\n\nUsage: \`${config.prefix}mistral <your question>\`\nExample: \`${config.prefix}mistral explain quantum physics\`` },
                 { quoted: message }
             );
         }
+        
 
         try {
             await sock.sendMessage(chatId, { react: { text: '🤖', key: message.key } });
