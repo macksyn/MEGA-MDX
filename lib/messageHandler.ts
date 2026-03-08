@@ -26,6 +26,7 @@ import { handleAutoReply } from '../plugins/autoreply.js';
 import { handleAntiSpam, invalidateGroupCache } from '../plugins/antispam.js';
 import { startSchedulerEngine } from '../plugins/schedule.js';
 import { addCommandReaction } from './reactions.js';
+import { writeErrorLog } from './logger.js';
 
 import { channelInfo } from './messageConfig.js';
 
@@ -532,8 +533,8 @@ async function handleMessages(sock, messageUpdate) {
             };
 
             try {
-                fs.appendFileSync('.error.log', JSON.stringify(errorLog) + '\n');
-                printLog('info', 'Error logged to file');
+                writeErrorLog(errorLog);
+                
             } catch(e: any) {
                 printLog('error', `Failed to write error log: ${e.message}`);
             }

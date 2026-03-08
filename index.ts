@@ -2,14 +2,13 @@ import './config.js';
 
 import fs from 'fs';
 import { existsSync, mkdirSync, rmSync } from 'fs';
-import path from 'path';
+import path, { dirname } from 'path';
 import chalk from 'chalk';
 import syntaxerror from 'syntax-error';
 import { parsePhoneNumber as PhoneNumber } from 'awesome-phonenumber';
 import readline from 'readline';
 import QRCode from 'qrcode';
 import { fileURLToPath } from 'url';
-import { dirname } from 'path';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -32,6 +31,7 @@ import store from './lib/lightweight_store.js';
 import SaveCreds from './lib/session.js';
 import { server, PORT } from './lib/server.js';
 import { printLog } from './lib/print.js';
+import { writeErrorLog } from './lib/logger.js';
 import {
     handleMessages,
     handleGroupParticipantUpdate,
@@ -107,7 +107,7 @@ if (process.stdin.isTTY && !config.pairingNumber) {
     });
 }
 
-const question = (text) => {
+const question = (text: string) => {
     if (rl && !rl.closed) {
         return new Promise((resolve) => rl.question(text, resolve));
     } else {
@@ -249,7 +249,6 @@ async function startQasimDev() {
         const originalSendPresenceUpdate = QasimDev.sendPresenceUpdate;
         const originalReadMessages = QasimDev.readMessages;
         const originalSendReceipt = QasimDev.sendReceipt;
-        const originalSendReceipt2 = QasimDev.sendReceipt;
 
         QasimDev.sendPresenceUpdate = async function (...args) {
             const ghostMode = await store.getSetting('global', 'stealthMode');
@@ -274,13 +273,6 @@ async function startQasimDev() {
             };
         }
 
-        if (originalSendReceipt2) {
-            QasimDev.sendReceipt = async function (...args) {
-                const ghostMode = await store.getSetting('global', 'stealthMode');
-                if (ghostMode && ghostMode.enabled) return;
-                return originalSendReceipt2.apply(this, args);
-            };
-        }
 
         const originalQuery = QasimDev.query;
         QasimDev.query = async function (node, ...args) {
@@ -562,7 +554,6 @@ async function main() {
 
     const sessionReady = await initializeSession();
 
-    if (sessionReady) { /* ignore */ } else { /* ignore */ }
 
     await delay(3000);
 
