@@ -29,13 +29,14 @@ export default {
     usage: '.llama <question>',
 
     async handler(sock: any, message: any, args: string[], context: any) {
-        const chatId = context.chatId || message.key.remoteJid;
+        const { chatId, config } = context
+        const prefix = config.prefix
         const query = args.join(' ').trim();
 
         if (!query) {
             return sock.sendMessage(
                 chatId,
-                { text: '🤖 *AI Assistant*\n\nUsage: `.llama <your question>`\nExample: `.llama explain quantum physics`' },
+                { text: `🤖 *AI Assistant*\n\nUsage: `${prefix}llama <your question>`\nExample: `${prefix}llama explain quantum physics`` },
                 { quoted: message }
             );
         }
