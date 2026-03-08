@@ -10,7 +10,7 @@ import { spawn } from 'child_process';
 function ffmpeg(buffer: Buffer, args: string[] = [], ext: string = '', ext2: string = '') {
   return new Promise(async (resolve, reject) => {
     try {
-      const tmp = path.join(process.cwd(), 'tmp', + new Date + '.' + ext)
+      const tmp = path.join(process.cwd(), 'temp', + new Date + '.' + ext)
       const out = tmp + '.' + ext2
       await fs.promises.writeFile(tmp, buffer)
       spawn('ffmpeg', [
