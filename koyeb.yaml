@@ -2,7 +2,7 @@ name: mega-md
 services:
   - name: mega-md
     type: web
-    dockerfile: Dockerfile
+    dockerfile: lib/Dockerfile
     ports:
       - port: 5000
         protocol: http

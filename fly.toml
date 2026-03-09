@@ -2,7 +2,7 @@ app = "mega-md"
 primary_region = "iad"
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = "lib/Dockerfile"
 
 [env]
   PORT = "5000"
