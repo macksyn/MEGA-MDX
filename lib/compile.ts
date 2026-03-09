@@ -17,6 +17,7 @@ const SOURCES: CppSource[] = [
     { src: 'dna.cpp',    bin: 'dna'    },
     { src: 'cipher.cpp', bin: 'cipher' },
     { src: 'rle.cpp',    bin: 'rle'    },
+    { src: 'analyze.cpp', bin: 'analyze' },
 ];
 
 export async function compileAll(): Promise<void> {

@@ -1,4 +1,5 @@
 import type { BotContext } from '../types.js';
+import { downloadMediaMessage } from '@whiskeysockets/baileys';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
@@ -6,29 +7,43 @@ import fs from 'fs';
 
 const execAsync = promisify(exec);
 
+function getQuoted(message: any) {
+    return message?.message?.extendedTextMessage?.contextInfo?.quotedMessage || null;
+}
+
+function getMediaType(quoted: any): string | null {
+    if (quoted?.imageMessage) return 'image';
+    if (quoted?.videoMessage) return 'video';
+    if (quoted?.audioMessage) return 'audio';
+    if (quoted?.documentMessage) return 'document';
+    if (quoted?.stickerMessage) return 'sticker';
+    return null;
+}
+
 export default {
     command: 'dna',
     aliases: ['dnaencode', 'dnadecode'],
     category: 'utility',
-    description: 'Encode any text to DNA sequence (ATCG) or decode it back',
-    usage: '${prefix}dna encode <text>\n${prefix}dna decode <DNA sequence>',
+    description: 'Encode any text or media to DNA sequence (ATCG) or decode it back',
+    usage: '${prefix}dna encode <text or reply to media>\n${prefix}dna decode <DNA or reply to DNA file>',
 
     async handler(sock: any, message: any, args: any[], context: BotContext) {
         const { chatId, channelInfo } = context;
 
-        // Get text from reply or args
-        const quoted = message?.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+        const quoted = getQuoted(message);
         const quotedText = quoted?.conversation || quoted?.extendedTextMessage?.text || '';
+        const mediaType = getMediaType(quoted);
 
-        if (!args.length && !quotedText) {
+        if (!args.length) {
             return await sock.sendMessage(chatId, {
                 text: `🧬 *DNA Encoder / Decoder*\n\n` +
-                      `*Encode text → DNA:*\n` +
-                      `\`.dna encode Hello World\`\n\n` +
-                      `*Decode DNA → text:*\n` +
+                      `*Text:*\n` +
+                      `\`.dna encode Hello World\`\n` +
                       `\`.dna decode ATCGATCG...\`\n\n` +
-                      `💡 You can also reply to any message with \`.dna encode\` or \`.dna decode\`\n\n` +
-                      `ℹ️ Each character becomes 4 DNA bases (A, T, C, G)`,
+                      `*Media/File (reply to any media):*\n` +
+                      `\`.dna encode\` — reply to image/video/audio/doc\n` +
+                      `\`.dna decode\` — reply to a .txt file with DNA\n\n` +
+                      `ℹ️ Each byte becomes 4 DNA bases (A, T, C, G)`,
                 ...channelInfo
             }, { quoted: message });
         }
@@ -36,16 +51,7 @@ export default {
         const mode = args[0]?.toLowerCase();
         if (mode !== 'encode' && mode !== 'decode') {
             return await sock.sendMessage(chatId, {
-                text: `❌ Unknown mode: *${mode || '?'}*\nUse \`encode\` or \`decode\``,
-                ...channelInfo
-            }, { quoted: message });
-        }
-
-        // Input: rest of args OR quoted message text
-        const input = args.slice(1).join(' ').trim() || quotedText;
-        if (!input) {
-            return await sock.sendMessage(chatId, {
-                text: `❌ No text provided. Reply to a message or add text after the command.`,
+                text: `❌ Use \`encode\` or \`decode\``,
                 ...channelInfo
             }, { quoted: message });
         }
@@ -54,63 +60,153 @@ export default {
         const binPath = path.join(process.cwd(), 'lib', 'bin', 'dna');
         if (!fs.existsSync(binPath)) {
             return await sock.sendMessage(chatId, {
-                text: `❌ DNA binary not compiled. Run \`.crun\` first or check if g++ is available on this server.`,
+                text: `❌ DNA binary not available on this server (g++ not installed).`,
                 ...channelInfo
             }, { quoted: message });
         }
 
-        if (mode === 'decode' && !/^[ATCGatcg\s]+$/.test(input)) {
-            return await sock.sendMessage(chatId, {
-                text: `❌ Invalid DNA sequence. Only A, T, C, G characters allowed.`,
-                ...channelInfo
-            }, { quoted: message });
-        }
+        const tempDir = path.join(process.cwd(), 'temp');
+        fs.mkdirSync(tempDir, { recursive: true });
+        const id = Date.now();
 
         try {
-            const safeInput = input.replace(/"/g, '\\"');
-            const { stdout, stderr } = await execAsync(
-                `"${binPath}" ${mode} "${safeInput}"`,
-                { timeout: 15000 }
-            );
+            if (mode === 'encode') {
+                let inputBuffer: Buffer;
+                let sourceLabel: string;
 
-            if (stderr && !stdout) {
-                return await sock.sendMessage(chatId, {
-                    text: `❌ ${stderr.trim()}`,
-                    ...channelInfo
-                }, { quoted: message });
-            }
+                if (mediaType && quoted) {
+                    // Download media
+                    await sock.sendMessage(chatId, { text: '⏳ Downloading media...', ...channelInfo }, { quoted: message });
+                    const msgObj = { message: { [`${mediaType}Message`]: quoted[`${mediaType}Message`] } };
+                    inputBuffer = await downloadMediaMessage(msgObj as any, 'buffer', {} as any) as Buffer;
+                    sourceLabel = `${mediaType} file (${inputBuffer.length} bytes)`;
+                } else {
+                    // Text input
+                    const textInput = args.slice(1).join(' ').trim() || quotedText;
+                    if (!textInput) {
+                        return await sock.sendMessage(chatId, {
+                            text: `❌ No input. Provide text or reply to a media message.`,
+                            ...channelInfo
+                        }, { quoted: message });
+                    }
+                    inputBuffer = Buffer.from(textInput, 'utf8');
+                    sourceLabel = `text (${inputBuffer.length} bytes)`;
+                }
 
-            const result = stdout.trim();
-            const inputLen = mode === 'decode' ? input.replace(/\s/g, '').length : input.length;
+                // Write input to temp file
+                const inFile = path.join(tempDir, `dna_in_${id}.bin`);
+                const outFile = path.join(tempDir, `dna_out_${id}.txt`);
+                fs.writeFileSync(inFile, inputBuffer);
 
-            // If result is long, send as document
-            if (result.length > 800) {
-                const tmpFile = path.join(process.cwd(), 'temp', `dna_${Date.now()}.txt`);
-                fs.mkdirSync(path.dirname(tmpFile), { recursive: true });
-                fs.writeFileSync(tmpFile, result);
+                await sock.sendMessage(chatId, { text: '🧬 Encoding to DNA...', ...channelInfo }, { quoted: message });
+
+                // Encode the base64 of the file
+                const b64 = inputBuffer.toString('base64');
+                const b64File = path.join(tempDir, `dna_b64_${id}.txt`);
+                fs.writeFileSync(b64File, b64);
+
+                const result = await execAsync(`"${binPath}" encode "${b64}"`, { timeout: 30000, maxBuffer: 50 * 1024 * 1024 });
+                const dnaResult = result.stdout.trim();
+
+                fs.writeFileSync(outFile, dnaResult);
 
                 await sock.sendMessage(chatId, {
-                    document: fs.readFileSync(tmpFile),
+                    document: fs.readFileSync(outFile),
                     mimetype: 'text/plain',
-                    fileName: `dna_${mode}d_${Date.now()}.txt`,
-                    caption: `🧬 *DNA ${mode === 'encode' ? 'Encoded' : 'Decoded'}*\n\n` +
-                             `📥 Input: ${inputLen} ${mode === 'decode' ? 'bases' : 'chars'}\n` +
-                             `📤 Output: ${result.length} ${mode === 'encode' ? 'bases' : 'chars'}\n\n` +
-                             `_Result is too long, sent as file_`,
+                    fileName: `dna_encoded_${id}.txt`,
+                    caption: `🧬 *DNA Encoded*\n\n` +
+                             `📥 *Source:* ${sourceLabel}\n` +
+                             `📤 *DNA bases:* ${dnaResult.length.toLocaleString()}\n\n` +
+                             `_Reply to this file with \`.dna decode\` to restore_`,
                     ...channelInfo
                 }, { quoted: message });
 
-                fs.unlinkSync(tmpFile);
+                // Cleanup
+                for (const f of [inFile, outFile, b64File]) try { fs.unlinkSync(f); } catch {}
+
             } else {
-                await sock.sendMessage(chatId, {
-                    text: `🧬 *DNA ${mode === 'encode' ? 'Encoder' : 'Decoder'}*\n\n` +
-                          `📥 *Input length:* ${inputLen} ${mode === 'decode' ? 'bases' : 'chars'}\n` +
-                          `📤 *Output length:* ${result.length} ${mode === 'encode' ? 'bases' : 'chars'}\n\n` +
-                          `📤 *Result:*\n\`\`\`\n${result}\n\`\`\``,
-                    ...channelInfo
-                }, { quoted: message });
-            }
+                // DECODE
+                let dnaInput: string;
 
+                if (quoted?.documentMessage) {
+                    // Download DNA file
+                    await sock.sendMessage(chatId, { text: '⏳ Reading DNA file...', ...channelInfo }, { quoted: message });
+                    const msgObj = { message: { documentMessage: quoted.documentMessage } };
+                    const buf = await downloadMediaMessage(msgObj as any, 'buffer', {} as any) as Buffer;
+                    dnaInput = buf.toString('utf8').trim();
+                } else {
+                    dnaInput = args.slice(1).join(' ').trim() || quotedText;
+                }
+
+                if (!dnaInput) {
+                    return await sock.sendMessage(chatId, {
+                        text: `❌ No DNA input. Provide DNA text or reply to a DNA .txt file.`,
+                        ...channelInfo
+                    }, { quoted: message });
+                }
+
+                if (!/^[ATCGatcg\s]+$/.test(dnaInput)) {
+                    return await sock.sendMessage(chatId, {
+                        text: `❌ Invalid DNA sequence. Only A, T, C, G allowed.`,
+                        ...channelInfo
+                    }, { quoted: message });
+                }
+
+                const cleanDna = dnaInput.replace(/\s/g, '');
+                await sock.sendMessage(chatId, { text: '🔬 Decoding DNA...', ...channelInfo }, { quoted: message });
+
+                const { stdout, stderr } = await execAsync(
+                    `"${binPath}" decode "${cleanDna}"`,
+                    { timeout: 30000, maxBuffer: 50 * 1024 * 1024 }
+                );
+
+                if (stderr && !stdout) {
+                    return await sock.sendMessage(chatId, { text: `❌ ${stderr.trim()}`, ...channelInfo }, { quoted: message });
+                }
+
+                const decoded = stdout.trim();
+
+                // Try to detect if it was originally base64 encoded media
+                const isBase64 = /^[A-Za-z0-9+/]+=*$/.test(decoded) && decoded.length % 4 === 0;
+
+                if (isBase64 && decoded.length > 100) {
+                    // It was a file — restore it
+                    const fileBuffer = Buffer.from(decoded, 'base64');
+                    const outFile = path.join(tempDir, `dna_decoded_${id}.bin`);
+                    fs.writeFileSync(outFile, fileBuffer);
+
+                    await sock.sendMessage(chatId, {
+                        document: fileBuffer,
+                        mimetype: 'application/octet-stream',
+                        fileName: `dna_decoded_${id}`,
+                        caption: `🧬 *DNA Decoded*\n\n` +
+                                 `📦 *Restored file:* ${fileBuffer.length.toLocaleString()} bytes`,
+                        ...channelInfo
+                    }, { quoted: message });
+
+                    try { fs.unlinkSync(outFile); } catch {}
+                } else {
+                    // Plain text result
+                    if (decoded.length > 800) {
+                        const outFile = path.join(tempDir, `dna_decoded_${id}.txt`);
+                        fs.writeFileSync(outFile, decoded);
+                        await sock.sendMessage(chatId, {
+                            document: fs.readFileSync(outFile),
+                            mimetype: 'text/plain',
+                            fileName: `dna_decoded_${id}.txt`,
+                            caption: `🧬 *DNA Decoded* — ${decoded.length} chars`,
+                            ...channelInfo
+                        }, { quoted: message });
+                        try { fs.unlinkSync(outFile); } catch {}
+                    } else {
+                        await sock.sendMessage(chatId, {
+                            text: `🧬 *DNA Decoded*\n\n` +
+                                  `📤 *Result:*\n\`\`\`\n${decoded}\n\`\`\``,
+                            ...channelInfo
+                        }, { quoted: message });
+                    }
+                }
+            }
         } catch (error: any) {
             await sock.sendMessage(chatId, {
                 text: `❌ Failed: ${error.message}`,

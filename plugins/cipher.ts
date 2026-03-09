@@ -61,7 +61,7 @@ export default {
             }, { quoted: message });
         }
 
-        if (cipherType === 'caesar' && isNaN(parseInt(key))) {
+        if (cipherType === 'caesar' && isNaN(parseInt(key, 10))) {
             return await sock.sendMessage(chatId, {
                 text: `❌ Caesar cipher key must be a number (e.g. 13)`,
                 ...channelInfo

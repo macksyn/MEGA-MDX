@@ -35,6 +35,7 @@ function safeMath(expr: string): string {
         throw new Error('Invalid characters in expression');
     }
 
+    // eslint-disable-next-line no-new-func
     const result = Function(`"use strict"; return (${sanitized})`)();
     if (typeof result !== 'number') throw new Error('Result is not a number');
     if (!isFinite(result)) throw new Error('Result is Infinity or NaN');
