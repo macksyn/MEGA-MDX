@@ -41,6 +41,32 @@
 [![Windows](https://img.shields.io/badge/Windows_WSL-0078D4?style=for-the-badge&logo=windows&logoColor=white)](#-windows-wsl)
 [![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)](#-dockerfile)
 
+<br/>
+
+| Platform | One-Click Deploy |
+|---|---|
+| **Render** | [
+
+![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)
+
+](https://render.com/deploy?repo=https://github.com/GlobalTechInfo/MEGA-MDX) |
+| **Railway** | [
+
+![Deploy on Railway](https://railway.app/button.svg)
+
+](https://railway.app/new/template?template=https://github.com/GlobalTechInfo/MEGA-MDX) |
+| **Koyeb** | [
+
+![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)
+
+](https://app.koyeb.com/deploy?type=git&repository=github.com/GlobalTechInfo/MEGA-MDX&branch=main&name=mega-md) |
+| **Heroku** | [
+
+![Deploy to Heroku](https://www.herokucdn.com/deploy/button.svg)
+
+](https://heroku.com/deploy?template=https://github.com/GlobalTechInfo/MEGA-MDX) |
+
+
 </div>
 
 ---
