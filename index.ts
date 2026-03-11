@@ -94,7 +94,7 @@ try {
     owner = JSON.parse(fs.readFileSync('./data/owner.json', 'utf-8'));
 } catch { owner = []; }
 
-global.botname = config.botName || "MEGA-MD";
+global.botname = config.botName || "GROQ-AI";
 global.themeemoji = "•";
 
 const pairingCode = !process.argv.includes("--qr-code");
@@ -328,7 +328,7 @@ async function startQasimDev(): Promise<any> {
                                 isForwarded: true,
                                 forwardedNewsletterMessageInfo: {
                                     newsletterJid: '120363319098372999@newsletter',
-                                    newsletterName: 'GlobalTechInc',
+                                    newsletterName: 'GROQ-AIc',
                                     serverMessageId: -1
                                 }
                             }
@@ -467,13 +467,13 @@ async function startQasimDev(): Promise<any> {
                     const ghostStatus = (ghostMode && ghostMode.enabled) ? '\n👻 Stealth Mode: ACTIVE' : '';
 
                     await QasimDev.sendMessage(botNumber, {
-                        text: `🤖 Bot Connected Successfully!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!${ghostStatus}\n\n✅Make sure to join below channel`,
+                        text: `🤖 Bot Connected Successfully!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!${ghostStatus}\n\n✅Make sure to join our channel`,
                         contextInfo: {
                             forwardingScore: 1,
                             isForwarded: true,
                             forwardedNewsletterMessageInfo: {
                                 newsletterJid: '120363319098372999@newsletter',
-                                newsletterName: 'GlobalTechInc',
+                                newsletterName: 'GROQ-AI',
                                 serverMessageId: -1
                             }
                         }
@@ -484,7 +484,7 @@ async function startQasimDev(): Promise<any> {
 
                 await delay(1999);
                 try { owner = JSON.parse(fs.readFileSync('./data/owner.json', 'utf-8')); } catch (_e: any) {}
-                printLog('info',    `[ ${config.botName || 'MEGA-MD'} ]`);
+                printLog('info',    `[ ${config.botName || 'GROQ-AI'} ]`);
                 printLog('info',    `WA NUMBER  : ${owner[0] || config.ownerNumber || ''}`);
                 printLog('success', `Bot Connected Successfully!`);
                 printLog('info',    `Plugins   : ${commandHandler.commands.size}`);
