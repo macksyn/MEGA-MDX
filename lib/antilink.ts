@@ -53,7 +53,7 @@ async function Antilink(msg: any, sock: any) {
                 switch (action) {
                         case 'delete':
                                 await sock.sendMessage(jid, {
-                                        text: `\`\`\`@${sender.split('@')[0]} link are not allowed here\`\`\``,
+                                        text: `\`\`\`@${sender.split('@')[0]} links are not allowed here\`\`\``,
                                         mentions: [sender]
                                 });
                                 break;
@@ -61,7 +61,7 @@ async function Antilink(msg: any, sock: any) {
                         case 'kick':
                                 await sock.groupParticipantsUpdate(jid, [sender], 'remove');
                                 await sock.sendMessage(jid, {
-                                        text: `\`\`\`@${sender.split('@')[0]} has been kicked for sending links\`\`\``,
+                                        text: `\`\`\`@${sender.split('@')[0]} has been removed for sending links\`\`\``,
                                         mentions: [sender]
                                 });
                                 break;
@@ -72,7 +72,7 @@ async function Antilink(msg: any, sock: any) {
                                         await sock.groupParticipantsUpdate(jid, [sender], 'remove');
                                         await resetWarningCount(jid, sender);
                                         await sock.sendMessage(jid, {
-                                                text: `\`\`\`@${sender.split('@')[0]} has been kicked after ${WARN_COUNT} warnings\`\`\``,
+                                                text: `\`\`\`@${sender.split('@')[0]} has been removed after ${WARN_COUNT} warnings\`\`\``,
                                                 mentions: [sender]
                                         });
                                 } else {
