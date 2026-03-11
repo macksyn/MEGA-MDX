@@ -39,13 +39,13 @@
     "nodejs-bot",
     "typescript-bot"
   ],
-  "homepage": "https://github.com/GlobalTechInfo/MEGA-MDX",
+  "homepage": "https://github.com/macksyn/MEGA-MDX",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/GlobalTechInfo/MEGA-MDX.git"
+    "url": "git+https://github.com/macksyn/MEGA-MDX.git"
   },
   "bugs": {
-    "url": "https://github.com/GlobalTechInfo/MEGA-MDX/issues"
+    "url": "https://github.com/macksyn/MEGA-MDX/issues"
   },
   "license": "MIT",
   "author": "Qasim Ali",

@@ -1,5 +1,5 @@
 const channelInfo = {
-    contextInfo: {
+    /*contextInfo: {
         forwardingScore: 1,
         isForwarded: true,
         forwardedNewsletterMessageInfo: {
@@ -7,7 +7,7 @@ const channelInfo = {
             newsletterName: 'GlobalTechInc',
             serverMessageId: -1
         }
-    }
+    }*/
 };
 
 export {

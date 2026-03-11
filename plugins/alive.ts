@@ -40,7 +40,7 @@ export default {
 
       const text =
         `*🤖 ${config.botName} IS ACTIVE!*\n\n` +
-        `*Version:* ${config.version}\n` +
+        `*Version 1:* ${config.version}\n` +
         `*Uptime:* ${uptimeText}\n` +
         `*RAM Usage:* ${usedMem} MB / ${totalMem} MB\n` +
         `*CPU Load:* ${cpuLoad}\n` +
@@ -51,7 +51,7 @@ export default {
         text,
         contextInfo: {
           forwardingScore: 999,
-          isForwarded: true,
+          isForwarded: false,
           forwardedNewsletterMessageInfo: {
             newsletterJid: '120363319098372999@newsletter',
             newsletterName: 'GlobalTechInc',
