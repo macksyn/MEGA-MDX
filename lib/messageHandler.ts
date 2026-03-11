@@ -289,7 +289,7 @@ if (isGroup && !message.key.fromMe) {
     printLog('info', `[DEBUG] rawText preview: ${rawText.substring(0, 80)}`);
 }
 
-if (isGroup && !message.key.fromMe && /GIST\s+HQ/i.test(rawText)) {
+if (isGroup && !message.key.fromMe && /GIST\s+HQ/i.test(rawText))
 
 // ── Attendance auto-detection (groups only) ───────────────────────────────────
         if (isGroup && !message.key.fromMe && /GIST\s+HQ/i.test(rawText)) {
