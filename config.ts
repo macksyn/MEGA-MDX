@@ -6,7 +6,7 @@ const config = {
     // Bot Identity
     botName:     process.env.BOT_NAME      || 'GROQ-AI',
     botOwner:    process.env.BOT_OWNER     || 'Alex Macksyn',
-    ownerNumber: process.env.OWNER_NUMBER  || '923051391007',
+    ownerNumber: process.env.OWNER_NUMBER  || '2348089782988',
     author:      process.env.AUTHOR        || 'Alex Macksyn',
     packname:    process.env.PACKNAME      || 'GROQ-AI',
     description: process.env.DESCRIPTION  || 'High performance multi-device WhatsApp bot',
@@ -19,7 +19,7 @@ const config = {
     timeZone:    process.env.TIMEZONE      || 'Africa/Lagos',
 
     // Links
-    channelLink:   process.env.CHANNEL_LINK || 'https://whatsapp.com/channel/0029VagJIAr3bbVBCpEkAM07',
+    channelLink:   process.env.CHANNEL_LINK || 'https://whatsapp.com/channel/0029Vad8fY6HwXbB83yLIx2n',
     updateZipUrl:  process.env.UPDATE_URL   || 'https://github.com/macksyn/MEGA-MDX/archive/refs/heads/main.zip',
     ytChannel:     process.env.YT_CHANNEL   || 'Macksyn',
 
