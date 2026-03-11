@@ -325,10 +325,10 @@ async function startQasimDev(): Promise<any> {
                             text: '❌ An error occurred while processing your message.',
                             contextInfo: {
                                 forwardingScore: 1,
-                                isForwarded: true,
+                                isForwarded: false,
                                 forwardedNewsletterMessageInfo: {
                                     newsletterJid: '120363319098372999@newsletter',
-                                    newsletterName: 'GROQ-AIc',
+                                    newsletterName: 'GROQ-AI',
                                     serverMessageId: -1
                                 }
                             }
@@ -387,7 +387,7 @@ async function startQasimDev(): Promise<any> {
             } else if (process.env.PAIRING_NUMBER) {
                 phoneNumberInput = process.env.PAIRING_NUMBER;
             } else if (rl && !rlClosed) {
-                phoneNumberInput = await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number 😍\nFormat: 923001234567 (without + or spaces) : `)));
+                phoneNumberInput = await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number 😍\nFormat: 2348012345678 (without + or spaces) : `)));
             } else {
                 phoneNumberInput = phoneNumber;
                 printLog('info', `Using default phone number: ${phoneNumberInput}`);
@@ -470,7 +470,7 @@ async function startQasimDev(): Promise<any> {
                         text: `🤖 Bot Connected Successfully!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!${ghostStatus}\n\n✅Make sure to join our channel`,
                         contextInfo: {
                             forwardingScore: 1,
-                            isForwarded: true,
+                            isForwarded: false,
                             forwardedNewsletterMessageInfo: {
                                 newsletterJid: '120363319098372999@newsletter',
                                 newsletterName: 'GROQ-AI',
@@ -543,7 +543,7 @@ async function startQasimDev(): Promise<any> {
 async function main() {
     await compileAll();
     await commandHandler.loadCommands();
-    printLog('info', 'Starting MEGA MD BOT...');
+    printLog('info', 'Starting GROQ AI...');
     await initializeSession();
     await delay(3000);
     startQasimDev().catch((error: any) => {
