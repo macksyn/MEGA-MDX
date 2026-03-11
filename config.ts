@@ -4,24 +4,24 @@ const _prefixes = process.env.PREFIXES ? process.env.PREFIXES.split(',') : ['.',
 
 const config = {
     // Bot Identity
-    botName:     process.env.BOT_NAME      || 'MEGA-MD',
-    botOwner:    process.env.BOT_OWNER     || 'Qasim Ali',
+    botName:     process.env.BOT_NAME      || 'GROQ-AI',
+    botOwner:    process.env.BOT_OWNER     || 'Alex Macksyn',
     ownerNumber: process.env.OWNER_NUMBER  || '923051391007',
-    author:      process.env.AUTHOR        || 'GlobalTechInfo',
-    packname:    process.env.PACKNAME      || 'MEGA-MD',
+    author:      process.env.AUTHOR        || 'Alex Macksyn',
+    packname:    process.env.PACKNAME      || 'GROQ-AI',
     description: process.env.DESCRIPTION  || 'High performance multi-device WhatsApp bot',
     version:     '6.0.0',
 
     // Bot Config
     prefixes:    _prefixes,
     prefix:      _prefixes[0],
-    commandMode: process.env.COMMAND_MODE  || 'private,
-    timeZone:    process.env.TIMEZONE      || 'Asia/Karachi',
+    commandMode: process.env.COMMAND_MODE  || 'private',
+    timeZone:    process.env.TIMEZONE      || 'Africa/Lagos',
 
     // Links
     channelLink:   process.env.CHANNEL_LINK || 'https://whatsapp.com/channel/0029VagJIAr3bbVBCpEkAM07',
     updateZipUrl:  process.env.UPDATE_URL   || 'https://github.com/macksyn/MEGA-MD/archive/refs/heads/main.zip',
-    ytChannel:     process.env.YT_CHANNEL   || 'GlobalTechInfo',
+    ytChannel:     process.env.YT_CHANNEL   || 'Macksyn',
 
     // Session
     sessionId:     process.env.SESSION_ID      || '',
