@@ -40,7 +40,7 @@ export default {
 
       const text =
         `*🤖 ${config.botName} IS ACTIVE!*\n\n` +
-        `*Version 1:* ${config.version}\n` +
+        `*Version:* ${config.version}\n` +
         `*Uptime:* ${uptimeText}\n` +
         `*RAM Usage:* ${usedMem} MB / ${totalMem} MB\n` +
         `*CPU Load:* ${cpuLoad}\n` +

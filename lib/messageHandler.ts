@@ -30,6 +30,7 @@ import { addCommandReaction } from './reactions.js';
 import { writeErrorLog } from './logger.js';
 
 import { channelInfo } from './messageConfig.js';
+import { handleAutoAttendance } from '../plugins/attendance.js';
 
 const MONGO_URL = process.env.MONGO_URL;
 const POSTGRES_URL = process.env.POSTGRES_URL;
@@ -282,6 +283,16 @@ async function handleMessages(sock: any, messageUpdate: any) {
 
         const senderIsSudo = await isSudo(senderId);
         startSchedulerEngine(sock);
+
+// ── Attendance auto-detection (groups only) ───────────────────────────────────
+        if (isGroup && !message.key.fromMe && /GIST\s+HQ/i.test(rawText)) {
+            try {
+                const handled = await handleAutoAttendance(message, sock);
+                if (handled) return;
+            } catch (e: any) {
+                printLog('error', `[ATTENDANCE] Auto-detection failed: ${e.message}`);
+            }
+        }
 
         if (!message.key.fromMe) {
             const replied = await handleAutoReply(sock, chatId, message, userMessage);
