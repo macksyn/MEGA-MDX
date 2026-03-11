@@ -1,5 +1,5 @@
 {
-  "name": "mega-mdx",
+  "name": "groq-ai",
   "version": "6.0.0",
   "description": "High performance multi-device WhatsApp bot",
   "type": "module",
@@ -33,7 +33,7 @@
   "keywords": [
     "whatsapp-bot",
     "baileys-bot",
-    "Mega-Md",
+    "Groq-ai",
     "Suhail-Md",
     "multi-device",
     "nodejs-bot",
@@ -48,7 +48,7 @@
     "url": "https://github.com/macksyn/MEGA-MDX/issues"
   },
   "license": "MIT",
-  "author": "Qasim Ali",
+  "author": "Alex Macksyn",
   "dependencies": {
     "@hapi/boom": "^10.0.1",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
