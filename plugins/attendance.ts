@@ -23,9 +23,9 @@ moment.tz.setDefault('Africa/Lagos');
 // ── Storage ───────────────────────────────────────────────────────────────────
 
 const db         = createStore('attendance');
-const dbUsers    = db.table('users');
-const dbRecords  = db.table('records');
-const dbSettings = db.table('settings');
+const dbUsers    = db.table!('users');
+const dbRecords  = db.table!('records');
+const dbSettings = db.table!('settings');
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 

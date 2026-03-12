@@ -14,9 +14,9 @@ moment.tz.setDefault(TZ);
 // ── Storage ───────────────────────────────────────────────────────────────────
 
 const db              = createStore('activitytracker');
-const dbStats         = db.table('stats');    // key: userId__groupId__YYYY-MM
-const dbGroupSettings = db.table('groups');   // key: groupId
-const dbSettings      = db.table('settings'); // key: 'config'
+const dbStats         = db.table!('stats');    // key: userId__groupId__YYYY-MM
+const dbGroupSettings = db.table!('groups');   // key: groupId
+const dbSettings      = db.table!('settings'); // key: 'config'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 

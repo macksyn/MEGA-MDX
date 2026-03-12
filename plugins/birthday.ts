@@ -77,9 +77,9 @@ interface BirthdayDoc {
 
 const db             = createStore('birthdays');
 const dbBirthdays    = db;
-const dbSettings     = db.table('settings');
-const dbWishesLog    = db.table('wishes_log');
-const dbRemindersLog = db.table('reminders_log');
+const dbSettings     = db.table!('settings');
+const dbWishesLog    = db.table!('wishes_log');
+const dbRemindersLog = db.table!('reminders_log');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
