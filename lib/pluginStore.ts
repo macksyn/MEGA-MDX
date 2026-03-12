@@ -75,8 +75,7 @@ function sanitize(name: string): string {
 }
 
 function physicalName(namespace: string, tableName?: string): string {
-  const base = `plugin_${sanitize(namespace)}`;
-  return tableName ? `${base}_${sanitize(tableName)}` : base;
+  return tableName ? `${sanitize(namespace)}-${sanitize(tableName)}` : sanitize(namespace);
 }
 
 // ── Backend adapter factory ───────────────────────────────────────────────────
