@@ -192,7 +192,7 @@ function buildPrompt(userMessage: string, messages: string[], userInfo: Record<s
     ].filter(Boolean).join('\n\n');
 
     // Hard safety net: if still too long, drop history but keep name/system context
-    if (full.length > 600) {
+    if (full.length > 1000) {
         return [system, `User: ${userMessage}`, 'Bot:'].join('\n\n');
     }
 
