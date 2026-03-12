@@ -245,6 +245,7 @@ export default {
         }
 
         await run('npm install --no-audit --no-fund');
+        await run('npm run build');
       } else {
         const zipOverride = args[0] || null;
         const { copiedFiles } = await updateViaZip(sock, chatId, message, zipOverride);
