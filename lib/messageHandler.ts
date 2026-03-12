@@ -358,6 +358,16 @@ if (isGroup && !message.key.fromMe && /GIST\s+HQ/i.test(rawText))
             await store.incrementMessageCount(chatId, ownJid, ownName);
         }
 
+        // After incrementMessageCount
+        if (!message.key.fromMe) {
+            try {
+                const { trackActivity } = await import('../plugins/activitytracker.js');
+                await trackActivity(message);
+            } catch (e: any) {
+                printLog('error', `[ACTIVITY] Tracking error: ${e.message}`);
+            }
+        }
+
         if (isGroup) {
             if (userMessage) {
                 await handleBadwordDetection(sock, chatId, message, userMessage, senderId);
