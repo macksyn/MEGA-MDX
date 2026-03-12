@@ -19,12 +19,12 @@ const chatMemory = {
 const API_ENDPOINTS = [
     {
         name: 'Venice AI',
-        url: (text: string) => `https://malvin-api.vercel.app/ai/venice?text=${encodeURIComponent(t)}`,
+        url: (text: string) => `https://malvin-api.vercel.app/ai/venice?text=${encodeURIComponent(text)}`,
         parse: (data: any) => data?.result
     },
     {
         name: 'GPT-5',
-        url: (text: string) => `https://malvin-api.vercel.app/ai/gpt-5?text=${encodeURIComponent(t)}`,
+        url: (text: string) => `https://malvin-api.vercel.app/ai/gpt-5?text=${encodeURIComponent(text)}`,
         parse: (data: any) => data?.result
     },
     {
