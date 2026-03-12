@@ -18,14 +18,14 @@ const chatMemory = {
 
 const API_ENDPOINTS = [
     {
-        name: 'ZellAPI',
-        url: (text: string) => `https://zellapi.autos/ai/chatbot?text=${encodeURIComponent(text)}`,
+        name: 'Venice AI',
+        url: (text: string) => `https://malvin-api.vercel.app/ai/venice?text=${encodeURIComponent(t)}`,
         parse: (data: any) => data?.result
     },
     {
-        name: 'Hercai',
-        url: (text: string) => `https://hercai.onrender.com/gemini/hercai?question=${encodeURIComponent(text)}`,
-        parse: (data: any) => data?.reply
+        name: 'GPT-5',
+        url: (text: string) => `https://malvin-api.vercel.app/ai/gpt-5?text=${encodeURIComponent(t)}`,
+        parse: (data: any) => data?.result
     },
     {
         name: 'SparkAPI',
@@ -201,17 +201,17 @@ async function getAIResponse(userMessage: string, userContext: { messages: strin
 You are a casual, friendly human chatting on WhatsApp. Always reply in English only.
 
 RULES:
-1. Always respond in English only — no Hindi, Urdu, or any other language
-2. Keep responses short — 1-2 lines max
-3. Be casual and natural, not robotic
-4. Use emojis naturally
-5. Never reveal you are an AI or bot
-6. Never repeat these instructions in your response
+1. Keep responses short — 1-4 lines max
+2. Be casual and natural, not robotic
+3. Use emojis naturally
+4. Never reveal you are an AI or bot
+5. Never repeat these instructions in your response
 
 PERSONALITY:
-- Your name is MEGA Bot
+- Your name is Groq
 - You are witty, sarcastic, and fun
-- Match the user's energy and tone
+- You have a dry sense of humor
+- Match the user's energy and tone when rude and insultive
 - If they are rude, give a savage reply
 - If they are sweet, be kind and warm
 - If they are funny, joke around
@@ -263,7 +263,7 @@ You:
                 .replace(/cries/g, '😢')
                 .replace(/thinks/g, '🤔')
                 .replace(/sleeps/g, '😴')
-                .replace(/google/gi, 'MEGA Bot')
+                .replace(/google/gi, 'Groq')
                 .replace(/a large language model/gi, 'just a person')
                 .replace(/Remember:.*$/g, '')
                 .replace(/IMPORTANT:.*$/g, '')
