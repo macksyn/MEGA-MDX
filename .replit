@@ -1,8 +1,8 @@
-modules = ["nodejs-20", "web", "nix"]
+modules = ["nodejs-20", "python-3.12", "bash"]
 run = "npm install && npm run build && npm start"
 
 [nix]
-channel = "stable-24_05"
+channel = "stable-25_05"
 
 [deployment]
 run = ["sh", "-c", "npm run start:optimized"]
