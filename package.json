@@ -11,8 +11,8 @@
     "plugins": "plugins"
   },
   "scripts": {
-    "start": "node dist/index.js",
-    "start:optimized": "node --max-old-space-size=512 --optimize-for-size --gc-interval=100 dist/index.js",
+    "start": "tsc && node dist/index.js",
+    "start:optimized": "tsc && node --max-old-space-size=512 --optimize-for-size --gc-interval=100 dist/index.js",
     "start:fresh": "node dist/reset-data.js && node dist/index.js",
     "build": "tsc && cp -r assets dist/",
     "rebuild": "npm run clean && npm run build",
