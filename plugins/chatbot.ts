@@ -331,6 +331,20 @@ export async function handleChatbotResponse(
         let cleanedMessage = userMessage;
         if (isBotMentioned) cleanedMessage = cleanedMessage.replace(new RegExp(`@${botNumber}`, 'g'), '').trim();
 
+        // ── RESOLVE @MENTIONS to names ────────────────────────────────────────
+        const allMentioned: string[] = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+        const contacts = (sock as any).store?.contacts || {};
+        for (const jid of allMentioned) {
+            const numPart = jid.split('@')[0].split(':')[0];
+            const isBotJid = botJids.some((b: string) => b.split('@')[0].split(':')[0] === numPart);
+            if (isBotJid) continue;
+            const contact = contacts[jid] || contacts[`${numPart}@s.whatsapp.net`] || contacts[`${numPart}@lid`];
+            const displayName = contact?.notify || contact?.name || contact?.pushName;
+            if (displayName) {
+                cleanedMessage = cleanedMessage.replace(new RegExp(`@${numPart}`, 'g'), `@${displayName}`);
+            }
+        }
+
         // ── GRUDGE CHECK ──────────────────────────────────────────────────────
         const activeGrudge = await getGrudge(chatId, senderId, profileCache);
         if (activeGrudge) {
