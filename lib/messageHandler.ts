@@ -39,6 +39,15 @@ const SQLITE_URL = process.env.DB_URL;
 const HAS_DB = !!(MONGO_URL || POSTGRES_URL || MYSQL_URL || SQLITE_URL);
 const STICKER_FILE = dataFile('sticker_commands.json');
 
+const processedMessageIds = new Map<string, number>();
+const MESSAGE_DEDUP_TTL_MS = 5 * 60 * 1000;
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, ts] of processedMessageIds) {
+        if (now - ts > MESSAGE_DEDUP_TTL_MS) processedMessageIds.delete(id);
+    }
+}, 60_000);
+
 async function getStickerCommands() {
     if (HAS_DB) {
         const data = await store.getSetting('global', 'stickerCommands');
@@ -62,6 +71,12 @@ async function handleMessages(sock: any, messageUpdate: any) {
 
         const message = messages[0];
         if (!message?.message) return;
+
+        const msgId = message.key.id;
+        if (msgId) {
+            if (processedMessageIds.has(msgId)) return;
+            processedMessageIds.set(msgId, Date.now());
+        }
 
         await printMessage(message, sock);
 
