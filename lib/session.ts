@@ -1,41 +1,50 @@
-import { fileURLToPath} from 'url';
+import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+
 import path from 'path';
 import fs from 'fs';
-import axios from 'axios';
-
-const GITHUB_USERNAME = 'stormfiber';
+import { File } from 'megajs';
+import { printLog } from './print.js';
 
 /**
- * Save credentials from GitHub Gist to session/creds.json
- * @param {string} txt - Gist ID with optional prefix
+ * Save credentials from Mega to session/creds.json
+ * @param {string} txt - Mega file ID (with or without full URL)
  */
-async function SaveCreds(txt: any) {
-    const __dirname = path.dirname(__filename);
+async function SaveCreds(txt: string): Promise<void> {
+    if (!txt || !txt.trim()) {
+        throw new Error('SESSION_ID is empty');
+    }
 
-    const gistId = txt.replace('GlobalTechInfo/MEGA-MD_', '');
-    const gistUrl = `https://gist.githubusercontent.com/${GITHUB_USERNAME}/${gistId}/raw/creds.json`;
+    let megaId = txt.trim();
+
+    // Strip full URL if provided: https://mega.nz/file/ABC123#KEY
+    if (megaId.includes('mega.nz/file/')) {
+        megaId = megaId.split('mega.nz/file/')[1];
+    }
+
+    // Strip any legacy prefix from old format
+    megaId = megaId.replace('GlobalTechInfo/MEGA-MD_', '').trim();
+
+    const megaUrl = `https://mega.nz/file/${megaId}`;
+    printLog('info', `📥 Downloading session from Mega: ${megaUrl}`);
 
     try {
-        const response = await axios.get(gistUrl);
-        const data = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
+        const file = File.fromURL(megaUrl);
+        await file.loadAttributes();
+        const data = await file.downloadBuffer();
 
-        const sessionDir = path.join(process.cwd(), 'session');
+        const sessionDir = path.join(__dirname, '..', 'session');
         if (!fs.existsSync(sessionDir)) {
             fs.mkdirSync(sessionDir, { recursive: true });
         }
 
         const credsPath = path.join(sessionDir, 'creds.json');
         fs.writeFileSync(credsPath, data);
-
-    } catch(error: any) {
-        console.error('❌ Error downloading or saving credentials:', error.message);
-        if (error.response) {
-            console.error('❌ Status:', error.response.status);
-            console.error('❌ Response:', error.response.data);
-        }
+        printLog('success', 'Session credentials downloaded from Mega successfully');
+    } catch (error: any) {
+        printLog('error', `Error downloading credentials from Mega: ${error.message}`);
         throw error;
     }
 }
