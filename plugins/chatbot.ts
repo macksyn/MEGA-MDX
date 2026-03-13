@@ -331,34 +331,18 @@ export async function handleChatbotResponse(
         let cleanedMessage = userMessage;
         if (isBotMentioned) cleanedMessage = cleanedMessage.replace(new RegExp(`@${botNumber}`, 'g'), '').trim();
 
-        // ── RESOLVE @MENTIONS to names + build reply-tag map ─────────────────
+        // ── RESOLVE @MENTIONS to names ────────────────────────────────────────
         const allMentioned: string[] = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
         const contacts = (sock as any).store?.contacts || {};
-
-        // name (lowercase) → { replyJid: @s.whatsapp.net JID, numPart, displayName }
-        const mentionMap = new Map<string, { replyJid: string; numPart: string; displayName: string }>();
-
         for (const jid of allMentioned) {
             const numPart = jid.split('@')[0].split(':')[0];
             const isBotJid = botJids.some((b: string) => b.split('@')[0].split(':')[0] === numPart);
             if (isBotJid) continue;
-
             const contact = contacts[jid] || contacts[`${numPart}@s.whatsapp.net`] || contacts[`${numPart}@lid`];
             const displayName = contact?.notify || contact?.name || contact?.pushName;
-            if (!displayName) continue;
-
-            // Resolve LID to a real @s.whatsapp.net JID for the mentions array
-            let replyJid = jid.includes('@s.whatsapp.net') ? jid : `${numPart}@s.whatsapp.net`;
-            if (jid.includes('@lid')) {
-                const resolved = Object.keys(contacts).find(k =>
-                    k.includes('@s.whatsapp.net') &&
-                    (contacts[k]?.lid === jid || contacts[k]?.lid?.split(':')[0] === numPart)
-                );
-                if (resolved) replyJid = resolved;
+            if (displayName) {
+                cleanedMessage = cleanedMessage.replace(new RegExp(`@${numPart}`, 'g'), `@${displayName}`);
             }
-
-            cleanedMessage = cleanedMessage.replace(new RegExp(`@${numPart}`, 'g'), `@${displayName}`);
-            mentionMap.set(displayName.toLowerCase(), { replyJid, numPart: replyJid.split('@')[0], displayName });
         }
 
         // ── GRUDGE CHECK ──────────────────────────────────────────────────────
@@ -438,24 +422,8 @@ export async function handleChatbotResponse(
             while (messages.length > 6) messages.shift();
             await saveHistory(senderId, messages);
 
-            // ── INJECT @TAGS into the reply ───────────────────────────────────
-            let finalResponse = response;
-            const replyMentions: string[] = [];
-
-            for (const [, { replyJid, numPart, displayName }] of mentionMap) {
-                const nameRegex = new RegExp(`(?<![\\w@])${displayName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w])`, 'gi');
-                const replaced = finalResponse.replace(nameRegex, `@${numPart}`);
-                if (replaced !== finalResponse) {
-                    finalResponse = replaced;
-                    replyMentions.push(replyJid);
-                }
-            }
-
-            await showTyping(sock, chatId, finalResponse.length);
-            await sock.sendMessage(chatId, {
-                text: finalResponse,
-                ...(replyMentions.length ? { mentions: replyMentions } : {})
-            }, { quoted: message });
+            await showTyping(sock, chatId, response.length);
+            await sock.sendMessage(chatId, { text: response }, { quoted: message });
 
         } finally {
             // Always release the lock — whether success, early return, or error
