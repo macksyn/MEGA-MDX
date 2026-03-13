@@ -34,7 +34,7 @@ const historyCache = new Map<string, string[]>();
 // ── Per-user processing lock ──────────────────────────────────────────────────
 const processingLock = new Set<string>();
 
-// ── Profile / history helpers (unchanged) ─────────────────────────────────────
+// ── Profile / history helpers ─────────────────────────────────────────────────
 
 async function loadProfile(senderId: string): Promise<Record<string, any>> {
     if (profileCache.has(senderId)) return profileCache.get(senderId)!;
@@ -60,7 +60,7 @@ async function saveHistory(senderId: string, messages: string[]): Promise<void> 
     await dbHistory.set(senderId, messages);
 }
 
-// ── API endpoints (unchanged) ─────────────────────────────────────────────────
+// ── API endpoints ─────────────────────────────────────────────────────────────
 
 const API_ENDPOINTS = [
     {
@@ -106,7 +106,7 @@ setInterval(() => {
     }
 }, API_FAILURE_RESET_MS);
 
-// ── Chatbot config storage (unchanged) ───────────────────────────────────────
+// ── Chatbot config storage ────────────────────────────────────────────────────
 
 async function loadUserGroupData() {
     try {
@@ -134,7 +134,7 @@ async function saveUserGroupData(data: any) {
     }
 }
 
-// ── Typing indicator (unchanged) ─────────────────────────────────────────────
+// ── Typing indicator ──────────────────────────────────────────────────────────
 
 async function showTyping(sock: any, chatId: string, estimatedResponseLength = 80) {
     try {
@@ -154,7 +154,7 @@ async function showTyping(sock: any, chatId: string, estimatedResponseLength = 8
     }
 }
 
-// ── User info extractor (unchanged) ──────────────────────────────────────────
+// ── User info extractor ───────────────────────────────────────────────────────
 
 function extractUserInfo(message: string) {
     const info: Record<string, any> = {};
@@ -170,7 +170,7 @@ function extractUserInfo(message: string) {
     return info;
 }
 
-// ── Prompt builder (unchanged) ────────────────────────────────────────────────
+// ── Prompt builder ────────────────────────────────────────────────────────────
 
 function buildPrompt(userMessage: string, messages: string[], userInfo: Record<string, any>): string {
     const info = userInfo || {};
@@ -186,8 +186,9 @@ function buildPrompt(userMessage: string, messages: string[], userInfo: Record<s
 
     const system =
         'You are a casual human in Gist HQ WhatsApp group living in Lagos. Use 1-4 lines, emojis ok. ' +
-        'Name: Groq. Match energy: savage if rude, warm if sweet, ' +
-        'sarcastic if joking, supportive if sad. Never admit being AI or robot. ' +
+        'Name: Groq. Match the energy of whoever you\'re talking to — chill and warm for greetings, ' +
+        'funny when they\'re joking, savage when they\'re rude, supportive when they\'re down. ' +
+        'Never force humour. Never admit being AI or robot. ' +
         (nameLine ? nameLine + ' ' : '') +
         (extraInfo ? `Other info: ${extraInfo}.` : '');
 
@@ -207,7 +208,7 @@ function buildPrompt(userMessage: string, messages: string[], userInfo: Record<s
     return full;
 }
 
-// ── AI call (unchanged) ───────────────────────────────────────────────────────
+// ── AI call ───────────────────────────────────────────────────────────────────
 
 async function getAIResponse(
     userMessage: string,
@@ -245,23 +246,23 @@ async function getAIResponse(
             console.log(`${api.name} success`);
 
             return result.trim()
-                .replace(/winks/g,                   '😉')
-                .replace(/eye roll/g,                 '🙄')
-                .replace(/shrug/g,                    '🤷')
-                .replace(/raises eyebrow/g,           '🤨')
-                .replace(/smiles/g,                   '😊')
-                .replace(/laughs/g,                   '😂')
-                .replace(/cries/g,                    '😢')
-                .replace(/thinks/g,                   '🤔')
-                .replace(/sleeps/g,                   '😴')
-                .replace(/google/gi,                  'Groq')
-                .replace(/a large language model/gi,  'just a person')
-                .replace(/Remember:.*$/gm,            '')
-                .replace(/IMPORTANT:.*$/gm,           '')
-                .replace(/^(Groq|Bot|AI|Assistant)\s*:\s*/gim, '')
-                .replace(/^[•\-]\s.*$/gm,             '')
-                .replace(/^[✅❌].*$/gm,               '')
-                .replace(/\n{2,}/g,                   '\n')
+                .replace(/winks/g,                                '😉')
+                .replace(/eye roll/g,                              '🙄')
+                .replace(/shrug/g,                                 '🤷')
+                .replace(/raises eyebrow/g,                        '🤨')
+                .replace(/smiles/g,                                '😊')
+                .replace(/laughs/g,                                '😂')
+                .replace(/cries/g,                                 '😢')
+                .replace(/thinks/g,                                '🤔')
+                .replace(/sleeps/g,                                '😴')
+                .replace(/google/gi,                               'Groq')
+                .replace(/a large language model/gi,               'just a person')
+                .replace(/Remember:.*$/gm,                         '')
+                .replace(/IMPORTANT:.*$/gm,                        '')
+                .replace(/^(Groq|Bot|AI|Assistant)\s*:\s*/gim,    '')
+                .replace(/^[•\-]\s.*$/gm,                         '')
+                .replace(/^[✅❌].*$/gm,                            '')
+                .replace(/\n{2,}/g,                                '\n')
                 .trim();
 
         } catch (error: any) {
@@ -275,7 +276,7 @@ async function getAIResponse(
     return null;
 }
 
-// ── Main chatbot handler ───────────────────────────────────────────────────────
+// ── Main chatbot handler ──────────────────────────────────────────────────────
 
 export async function handleChatbotResponse(
     sock: any,
@@ -326,13 +327,8 @@ export async function handleChatbotResponse(
         if (isBotMentioned) cleanedMessage = cleanedMessage.replace(new RegExp(`@${botNumber}`, 'g'), '').trim();
 
         // ── GRUDGE CHECK ──────────────────────────────────────────────────────
-        // Must happen BEFORE any AI call so the bot truly stays silent.
         const activeGrudge = await getGrudge(chatId, senderId, profileCache);
-
         if (activeGrudge) {
-            // Still in grudge window — full silence. No reaction, no read receipt.
-            // (The read-receipt suppression is handled upstream by stealth mode;
-            //  here we simply return without sending anything.)
             console.log(`[GRUDGE] Silent treatment: ${senderId.split('@')[0]} (expires in ${Math.round((activeGrudge.expiresAt - Date.now()) / 3600000)}h)`);
             return;
         }
@@ -343,83 +339,77 @@ export async function handleChatbotResponse(
 
         try {
 
-        // ── INSULT DETECTION ──────────────────────────────────────────────────
-        const insult = detectInsult(cleanedMessage);
+            // ── INSULT DETECTION ──────────────────────────────────────────────
+            const insult = detectInsult(cleanedMessage);
 
-        if (insult.hit) {
-            // Fire one savage clap-back then record the grudge.
-            const grudge   = await setGrudge(chatId, senderId, insult.severity, cleanedMessage, profileCache);
-            const clapback = getGrudgeClapback(insult.severity);
-            const hoursLeft = Math.round((grudge.expiresAt - Date.now()) / 3600000);
+            if (insult.hit) {
+                const grudge    = await setGrudge(chatId, senderId, insult.severity, cleanedMessage, profileCache);
+                const clapback  = getGrudgeClapback(insult.severity);
+                const hoursLeft = Math.round((grudge.expiresAt - Date.now()) / 3600000);
 
-            console.log(`[GRUDGE] Set for ${senderId.split('@')[0]} — severity: ${insult.severity}, matched: ${insult.matchedLabels.join(', ')}, duration: ${hoursLeft}h, strikes: ${grudge.strikes}`);
+                console.log(`[GRUDGE] Set for ${senderId.split('@')[0]} — severity: ${insult.severity}, matched: ${insult.matchedLabels.join(', ')}, duration: ${hoursLeft}h, strikes: ${grudge.strikes}`);
 
-            // Slight delay before clap-back so it feels like a human pause
-            await new Promise(r => setTimeout(r, 1200 + Math.random() * 1000));
-            await sock.sendMessage(chatId, { text: clapback }, { quoted: message });
+                await new Promise(r => setTimeout(r, 1200 + Math.random() * 1000));
+                await sock.sendMessage(chatId, { text: clapback }, { quoted: message });
+                return;
+            }
 
-            // No further processing — the AI doesn't get called.
-            return;
-        }
+            // ── THAW CHECK ────────────────────────────────────────────────────
+            const profile    = await loadProfile(senderId);
+            const wasGrudged = profile._justThawed?.[chatId];
 
-        // ── THAW CHECK ────────────────────────────────────────────────────────
-        // If the grudge JUST expired (getGrudge cleared it), check if user had
-        // a prior grudge record so we can greet them coldly.
-        // We detect this by checking if the profile still has a resolved grudge
-        // marker we set during clearGrudge (optional approach used below).
-        const profile = await loadProfile(senderId);
-        const wasGrudged = profile._justThawed?.[chatId];
+            if (wasGrudged) {
+                if (profile._justThawed) delete profile._justThawed[chatId];
+                await saveProfile(senderId, profile);
+                await showTyping(sock, chatId, 20);
+                await sock.sendMessage(chatId, { text: getThawMessage() }, { quoted: message });
+                return;
+            }
 
-        if (wasGrudged) {
-            // Clear the thaw marker
-            if (profile._justThawed) delete profile._justThawed[chatId];
+            // ── NORMAL FLOW ───────────────────────────────────────────────────
+            const messages = await loadHistory(senderId);
+
+            const pushName: string | undefined = message.pushName;
+            if (pushName && !profile.name) {
+                profile.name      = pushName.trim().split(/\s+/)[0];
+                profile.pushName  = pushName;
+                profile.firstSeen = profile.firstSeen ?? Date.now();
+            }
+            profile.lastSeen = Date.now();
+
+            const extracted = extractUserInfo(cleanedMessage);
+            if (extracted.name)     profile.name     = extracted.name;
+            if (extracted.age)      profile.age      = extracted.age;
+            if (extracted.location) profile.location = extracted.location;
+
             await saveProfile(senderId, profile);
 
-            await showTyping(sock, chatId, 20);
-            await sock.sendMessage(chatId, { text: getThawMessage() }, { quoted: message });
-            return;
+            const response = await getAIResponse(cleanedMessage, {
+                messages,
+                userInfo: profile
+            });
+
+            if (!response) {
+                await showTyping(sock, chatId, 40);
+                await sock.sendMessage(chatId, {
+                    text: "Hmm... I lost my train of thought there 🤔 try again?"
+                }, { quoted: message });
+                return;
+            }
+
+            const userTurn = `User: ${cleanedMessage.length > 120 ? cleanedMessage.slice(0, 120) + '...' : cleanedMessage}`;
+            const botTurn  = `Bot: ${response.length > 120 ? response.slice(0, 120) + '...' : response}`;
+            messages.push(userTurn, botTurn);
+            while (messages.length > 6) messages.shift();
+            await saveHistory(senderId, messages);
+
+            await showTyping(sock, chatId, response.length);
+            await sock.sendMessage(chatId, { text: response }, { quoted: message });
+
+        } finally {
+            // Always release the lock — whether success, early return, or error
+            processingLock.delete(senderId);
         }
-
-        // ── NORMAL FLOW ───────────────────────────────────────────────────────
-
-        const messages = await loadHistory(senderId);
-
-        const pushName: string | undefined = message.pushName;
-        if (pushName && !profile.name) {
-            profile.name      = pushName.trim().split(/\s+/)[0];
-            profile.pushName  = pushName;
-            profile.firstSeen = profile.firstSeen ?? Date.now();
-        }
-        profile.lastSeen = Date.now();
-
-        const extracted = extractUserInfo(cleanedMessage);
-        if (extracted.name)     profile.name     = extracted.name;
-        if (extracted.age)      profile.age      = extracted.age;
-        if (extracted.location) profile.location = extracted.location;
-
-        await saveProfile(senderId, profile);
-
-        const response = await getAIResponse(cleanedMessage, {
-            messages,
-            userInfo: profile
-        });
-
-        if (!response) {
-            await showTyping(sock, chatId, 40);
-            await sock.sendMessage(chatId, {
-                text: "Hmm... I lost my train of thought there 🤔 try again?"
-            }, { quoted: message });
-            return;
-        }
-
-        const userTurn = `User: ${cleanedMessage.length > 120 ? cleanedMessage.slice(0, 120) + '...' : cleanedMessage}`;
-        const botTurn  = `Bot: ${response.length > 120 ? response.slice(0, 120) + '...' : response}`;
-        messages.push(userTurn, botTurn);
-        while (messages.length > 6) messages.shift();
-        await saveHistory(senderId, messages);
-
-        await showTyping(sock, chatId, response.length);
-        await sock.sendMessage(chatId, { text: response }, { quoted: message });
 
     } catch (error: any) {
         console.error('Error in chatbot response:', error.message);
@@ -441,7 +431,7 @@ export default {
     aliases:     ['bot', 'ai', 'achat'],
     category:    'admin',
     description: 'Enable or disable AI chatbot for the group',
-    usage:       '.chatbot <on|off|stats|pardon>',
+    usage:       '.chatbot <on|off|stats|pardon|grudges>',
     groupOnly:   true,
     adminOnly:   true,
 
@@ -520,7 +510,6 @@ export default {
 
         // ── grudges ───────────────────────────────────────────────────────────
         if (match === 'grudges') {
-            // Scan profileCache for active grudges in this chatId
             const now     = Date.now();
             const entries: string[] = [];
 
@@ -528,7 +517,7 @@ export default {
                 const g: GrudgeRecord | undefined = profile.grudges?.[chatId];
                 if (g && g.active && now < g.expiresAt) {
                     const hoursLeft = ((g.expiresAt - now) / 3600000).toFixed(1);
-                    const name = profile.name || uid.split('@')[0];
+                    const name      = profile.name || uid.split('@')[0];
                     entries.push(`• @${uid.split('@')[0]} (${name}) — ${hoursLeft}h left [${g.severity}, strike ${g.strikes}]`);
                 }
             }
@@ -559,7 +548,6 @@ export default {
                 return `${icon} *${api.name}*: ${s.count} failure(s)\n   ${lastFail} · ${lastOk}`;
             }).join('\n');
 
-            // Count active grudges across all groups
             let totalGrudges = 0;
             for (const [, profile] of profileCache.entries()) {
                 for (const g of Object.values(profile.grudges ?? {})) {
