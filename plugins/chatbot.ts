@@ -13,7 +13,7 @@ import {
     getThawMessage,
     GRUDGE_DURATIONS,
     type GrudgeRecord
-} from './lib/grudge.js';
+} from '../lib/grudge.js';
 
 const MONGO_URL    = process.env.MONGO_URL;
 const POSTGRES_URL = process.env.POSTGRES_URL;
@@ -30,6 +30,9 @@ const dbConfig  = db.table!('config');
 
 const profileCache = new Map<string, Record<string, any>>();
 const historyCache = new Map<string, string[]>();
+
+// ── Per-user processing lock ──────────────────────────────────────────────────
+const processingLock = new Set<string>();
 
 // ── Profile / history helpers (unchanged) ─────────────────────────────────────
 
@@ -183,8 +186,8 @@ function buildPrompt(userMessage: string, messages: string[], userInfo: Record<s
 
     const system =
         'You are a casual human in Gist HQ WhatsApp group living in Lagos. Use 1-4 lines, emojis ok. ' +
-        'Name: Groq. Witty/sarcastic. Match energy: savage if rude, warm if sweet, ' +
-        'funny if joking, supportive if sad. Never admit being AI or robot. ' +
+        'Name: Groq. Match energy: savage if rude, warm if sweet, ' +
+        'sarcastic if joking, supportive if sad. Never admit being AI or robot. ' +
         (nameLine ? nameLine + ' ' : '') +
         (extraInfo ? `Other info: ${extraInfo}.` : '');
 
@@ -255,7 +258,7 @@ async function getAIResponse(
                 .replace(/a large language model/gi,  'just a person')
                 .replace(/Remember:.*$/gm,            '')
                 .replace(/IMPORTANT:.*$/gm,           '')
-                .replace(/^[A-Z\s]{3,}:.*$/gm,       '')
+                .replace(/^(Groq|Bot|AI|Assistant)\s*:\s*/gim, '')
                 .replace(/^[•\-]\s.*$/gm,             '')
                 .replace(/^[✅❌].*$/gm,               '')
                 .replace(/\n{2,}/g,                   '\n')
@@ -333,6 +336,12 @@ export async function handleChatbotResponse(
             console.log(`[GRUDGE] Silent treatment: ${senderId.split('@')[0]} (expires in ${Math.round((activeGrudge.expiresAt - Date.now()) / 3600000)}h)`);
             return;
         }
+
+        // ── PROCESSING LOCK ───────────────────────────────────────────────────
+        if (processingLock.has(senderId)) return;
+        processingLock.add(senderId);
+
+        try {
 
         // ── INSULT DETECTION ──────────────────────────────────────────────────
         const insult = detectInsult(cleanedMessage);

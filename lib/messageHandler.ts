@@ -354,7 +354,7 @@ async function handleMessages(sock: any, messageUpdate: any) {
         // After incrementMessageCount
         if (!message.key.fromMe) {
             try {
-                const { trackActivity } = await import('../plugins/activitytracker.js');
+                const { trackActivity } = await import('../lib/activitytracker.js');
                 await trackActivity(message);
             } catch (e: any) {
                 printLog('error', `[ACTIVITY] Tracking error: ${e.message}`);

@@ -20,7 +20,7 @@ import {
   getUserRank,
   getMonthlyLeaderboard,
   getInactiveMembers
-} from './lib/activitytracker.js';
+} from '../lib/activitytracker.js';
 
 const TZ = config.timeZone;
 moment.tz.setDefault(TZ);
