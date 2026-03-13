@@ -128,7 +128,7 @@ process.on('SIGINT', () => {
 });
 
 function ensureSessionDirectory(): string {
-    const sessionPath = path.join(__dirname, 'session');
+    const sessionPath = path.join(process.cwd(), 'session');
     if (!existsSync(sessionPath)) {
         mkdirSync(sessionPath, { recursive: true });
     }
@@ -137,7 +137,7 @@ function ensureSessionDirectory(): string {
 
 function hasValidSession(): boolean {
     try {
-        const credsPath = path.join(__dirname, 'session', 'creds.json');
+        const credsPath = path.join(process.cwd(), 'session', 'creds.json');
         if (!existsSync(credsPath)) return false;
 
         const fileContent = fs.readFileSync(credsPath, 'utf8');
@@ -154,7 +154,7 @@ function hasValidSession(): boolean {
             }
             if (creds.registered === false) {
                 printLog('warning', 'Session not registered. Clearing for fresh pairing...');
-                try { rmSync(path.join(__dirname, 'session'), { recursive: true, force: true }); } catch (_e: any) { /* ignore */ }
+                try { rmSync(path.join(process.cwd(), 'session'), { recursive: true, force: true }); } catch (_e: any) { /* ignore */ }
                 return false;
             }
             printLog('success', 'Valid and registered session credentials found');
@@ -213,7 +213,7 @@ async function startQasimDev(): Promise<any> {
         ensureSessionDirectory();
         await delay(1000);
 
-        const { state, saveCreds } = await useMultiFileAuthState(`./session`);
+        const { state, saveCreds } = await useMultiFileAuthState(path.join(process.cwd(), 'session'));
         const _saveCreds = async () => {
             ensureSessionDirectory();
             await saveCreds();
@@ -411,7 +411,7 @@ async function startQasimDev(): Promise<any> {
                     if (rl && !rlClosed) { rl.close(); rl = null; }
                 } catch (error: any) {
                     if (attempt < 3) {
-                        try { rmSync('./session', { recursive: true, force: true }); } catch (_e: any) { /* ignore */ }
+                        try { rmSync(path.join(process.cwd(), 'session'), { recursive: true, force: true }); } catch (_e: any) { /* ignore */ }
                         await delay(3000);
                         startQasimDev();
                     } else {
@@ -498,7 +498,7 @@ async function startQasimDev(): Promise<any> {
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401;
 
                 if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-                    try { rmSync('./session', { recursive: true, force: true }); } catch (_e: any) { /* ignore */ }
+                    try { rmSync(path.join(process.cwd(), 'session'), { recursive: true, force: true }); } catch (_e: any) { /* ignore */ }
                     await delay(3000);
                     startQasimDev();
                     return;
@@ -556,7 +556,7 @@ async function main() {
 main();
 
 // Session cleanup interval
-const sessionDir = path.join(process.cwd(), 'session');
+const sessionDir = path.join(__dirname, 'session');
 setInterval(() => {
     if (!fs.existsSync(sessionDir)) return;
     fs.readdir(sessionDir, (err, files) => {

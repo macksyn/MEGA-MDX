@@ -1,8 +1,3 @@
-import { fileURLToPath } from 'url';
-import { dirname } from 'path';
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
 import path from 'path';
 import fs from 'fs';
 import { File } from 'megajs';
@@ -35,7 +30,7 @@ async function SaveCreds(txt: string): Promise<void> {
         await file.loadAttributes();
         const data = await file.downloadBuffer({});
 
-        const sessionDir = path.join(__dirname, '..', 'session');
+        const sessionDir = path.join(process.cwd(), 'session');
         if (!fs.existsSync(sessionDir)) {
             fs.mkdirSync(sessionDir, { recursive: true });
         }
