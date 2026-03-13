@@ -13,22 +13,11 @@ const HAS_DB       = !!(MONGO_URL || POSTGRES_URL || MYSQL_URL || SQLITE_URL);
 
 const USER_GROUP_DATA = dataFile('userGroupData.json');
 
-// ── Chatbot DB tables ─────────────────────────────────────────────────────────
-// chatbot-users   : persistent user profiles (name, age, location, seen timestamps)
-// chatbot-history : per-user message history (survives restarts)
-// chatbot-config  : per-group on/off state (replaces userGroupData.json for chatbot)
-//
-// In MongoDB these become collections:   chatbot-users, chatbot-history, chatbot-config
-// In Postgres/MySQL/SQLite: tables with those names
-// In file mode: data/chatbot-users.json, etc.
-
 const db            = createStore('chatbot');
-const dbUsers       = db.table!('users');    // profile per sender JID
-const dbHistory     = db.table!('history');  // message history per sender JID
-const dbConfig      = db.table!('config');   // group on/off setting
+const dbUsers       = db.table!('users');
+const dbHistory     = db.table!('history');
+const dbConfig      = db.table!('config');
 
-// In-memory write-through cache — avoids a DB read on every single message
-// while still persisting across restarts.
 const profileCache  = new Map<string, Record<string, any>>();
 const historyCache  = new Map<string, string[]>();
 
@@ -84,13 +73,32 @@ const API_ENDPOINTS = [
     }
 ];
 
+// ── API failure tracking ──────────────────────────────────────────────────────
+// Each entry: { count: number, lastFailAt: number, lastSuccessAt: number }
+// count resets automatically after 5 min of no failures (auto-recovery).
+
+const API_FAILURE_RESET_MS = 5 * 60 * 1000;
+
+const apiStats: Record<string, { count: number; lastFailAt: number; lastSuccessAt: number }> = {};
+API_ENDPOINTS.forEach(api => {
+    apiStats[api.name] = { count: 0, lastFailAt: 0, lastSuccessAt: 0 };
+});
+
+// Reset stale failure counts every 5 min so a recovered API goes back to ✅
+setInterval(() => {
+    const now = Date.now();
+    for (const name of Object.keys(apiStats)) {
+        if (apiStats[name].count > 0 && now - apiStats[name].lastFailAt > API_FAILURE_RESET_MS) {
+            apiStats[name].count = 0;
+        }
+    }
+}, API_FAILURE_RESET_MS);
+
 // Storage
 
-// Group on/off config — stored in chatbot-config table, keyed by group JID
 async function loadUserGroupData() {
     try {
         const enabled = await dbConfig.getAll();
-        // Shape: { [chatId]: true }  (only enabled groups are stored)
         return { groups: [], chatbot: enabled };
     } catch (error: any) {
         console.error('Error loading chatbot config:', error.message);
@@ -100,13 +108,10 @@ async function loadUserGroupData() {
 
 async function saveUserGroupData(data: any) {
     try {
-        // data.chatbot is the full map — sync it: set new entries, delete removed ones
         const current = await dbConfig.getAll();
-        // Add / update
         for (const [chatId, val] of Object.entries(data.chatbot ?? {})) {
             await dbConfig.set(chatId, val);
         }
-        // Remove keys that were deleted (e.g. .chatbot off)
         for (const chatId of Object.keys(current)) {
             if (!(chatId in (data.chatbot ?? {}))) {
                 await dbConfig.del(chatId);
@@ -117,21 +122,13 @@ async function saveUserGroupData(data: any) {
     }
 }
 
-// Natural typing simulation
-// Only called before actual AI responses, never before command replies.
-// Duration scales with response length so it feels like real typing.
-
 async function showTyping(sock: any, chatId: string, estimatedResponseLength = 80) {
     try {
-        // ~40ms per char (40 WPM typist), clamped 1.5s–6s, with +/-30% jitter
         const base   = Math.min(Math.max(estimatedResponseLength * 40, 1500), 6000);
         const delay  = Math.round(base * (0.7 + Math.random() * 0.6));
-
         await sock.presenceSubscribe(chatId);
         await sock.sendPresenceUpdate('composing', chatId);
         await new Promise(resolve => setTimeout(resolve, delay));
-
-        // 25% chance of a mid-typing pause — like a person reconsidering a word
         if (Math.random() < 0.25) {
             await sock.sendPresenceUpdate('paused', chatId);
             await new Promise(resolve => setTimeout(resolve, 400 + Math.random() * 600));
@@ -142,8 +139,6 @@ async function showTyping(sock: any, chatId: string, estimatedResponseLength = 8
         console.error('Typing indicator error:', error.message);
     }
 }
-
-// User info extraction
 
 function extractUserInfo(message: string) {
     const info: Record<string, any> = {};
@@ -159,15 +154,9 @@ function extractUserInfo(message: string) {
     return info;
 }
 
-// Build a URL-safe prompt that stays well under GET request limits.
-// These APIs use ?text= query params — once the encoded URL exceeds ~2000 chars
-// (happens fast with a verbose system prompt + full history) servers return 400/414.
-
 function buildPrompt(userMessage: string, messages: string[], userInfo: Record<string, any>): string {
     const info = userInfo || {};
 
-    // Name line — tells the AI who it's talking to and how to use the name naturally.
-    // "sometimes" is key: using someone's name every single reply feels robotic.
     const nameLine = info.name
         ? `The user's name is ${info.name}. Use their name occasionally in replies (not every time) to feel personal, e.g. when greeting them, reacting with surprise, or when it flows naturally. If they ask what your name is or what their name is, respond correctly.`
         : '';
@@ -184,9 +173,6 @@ function buildPrompt(userMessage: string, messages: string[], userInfo: Record<s
         (nameLine ? nameLine + ' ' : '') +
         (extraInfo ? `Other info: ${extraInfo}.` : '');
 
-    // History contains labeled "User: ..." / "Bot: ..." turns from previous exchanges.
-    // Take last 4 turns (2 exchanges) — enough for follow-up context without bloating the URL.
-    // Current message is NOT in history yet; it goes at the end as the live prompt.
     const history = messages.slice(-4).join('\n');
 
     const full = [
@@ -196,15 +182,12 @@ function buildPrompt(userMessage: string, messages: string[], userInfo: Record<s
         'Bot:'
     ].filter(Boolean).join('\n\n');
 
-    // Hard safety net: if still too long, drop history but keep name/system context
     if (full.length > 1000) {
         return [system, `User: ${userMessage}`, 'Bot:'].join('\n\n');
     }
 
     return full;
 }
-
-// AI response fetching
 
 async function getAIResponse(
     userMessage: string,
@@ -221,14 +204,25 @@ async function getAIResponse(
             clearTimeout(timeoutId);
 
             if (!response.ok) {
+                apiStats[api.name].count++;
+                apiStats[api.name].lastFailAt = Date.now();
                 console.log(`${api.name} failed: HTTP ${response.status}`);
                 continue;
             }
 
             const data   = await response.json() as any;
             const result = api.parse(data);
-            if (!result) { console.log(`${api.name} returned no result`); continue; }
 
+            if (!result) {
+                apiStats[api.name].count++;
+                apiStats[api.name].lastFailAt = Date.now();
+                console.log(`${api.name} returned no result`);
+                continue;
+            }
+
+            // Success — reset failure count, record success time
+            apiStats[api.name].count         = 0;
+            apiStats[api.name].lastSuccessAt = Date.now();
             console.log(`${api.name} success`);
 
             return result.trim()
@@ -252,6 +246,8 @@ async function getAIResponse(
                 .trim();
 
         } catch (error: any) {
+            apiStats[api.name].count++;
+            apiStats[api.name].lastFailAt = Date.now();
             console.log(`${api.name} error: ${error.message}`);
         }
     }
@@ -259,8 +255,6 @@ async function getAIResponse(
     console.error('All AI APIs failed');
     return null;
 }
-
-// Main chatbot response (called from messageHandler.ts)
 
 export async function handleChatbotResponse(
     sock: any,
@@ -310,21 +304,17 @@ export async function handleChatbotResponse(
         let cleanedMessage = userMessage;
         if (isBotMentioned) cleanedMessage = cleanedMessage.replace(new RegExp(`@${botNumber}`, 'g'), '').trim();
 
-        // ── Load persisted profile & history from DB ──────────────────────────
         const profile  = await loadProfile(senderId);
         const messages = await loadHistory(senderId);
 
-        // Seed name from WhatsApp pushName on very first contact.
-        // pushName is the sender's WhatsApp display name — no need to ask.
         const pushName: string | undefined = message.pushName;
         if (pushName && !profile.name) {
-            profile.name      = pushName.trim().split(/\s+/)[0]; // first word only
-            profile.pushName  = pushName;                         // store full name too
+            profile.name      = pushName.trim().split(/\s+/)[0];
+            profile.pushName  = pushName;
             profile.firstSeen = profile.firstSeen ?? Date.now();
         }
         profile.lastSeen = Date.now();
 
-        // Explicit "my name is X" in message always beats pushName
         const extracted = extractUserInfo(cleanedMessage);
         if (extracted.name)     profile.name     = extracted.name;
         if (extracted.age)      profile.age      = extracted.age;
@@ -332,10 +322,8 @@ export async function handleChatbotResponse(
 
         await saveProfile(senderId, profile);
 
-        // Pass history as-is (previous exchanges only — current message NOT included yet).
-        // The AI sees: prior labeled turns + the fresh "User: X" at the end of the prompt.
         const response = await getAIResponse(cleanedMessage, {
-            messages,   // previous "User: ..." / "Bot: ..." turns
+            messages,
             userInfo: profile
         });
 
@@ -347,12 +335,9 @@ export async function handleChatbotResponse(
             return;
         }
 
-        // ── Persist this exchange as a labeled pair ───────────────────────────
-        // Truncate both sides to keep history compact and URL-safe
         const userTurn = `User: ${cleanedMessage.length > 120 ? cleanedMessage.slice(0, 120) + '...' : cleanedMessage}`;
         const botTurn  = `Bot: ${response.length > 120 ? response.slice(0, 120) + '...' : response}`;
         messages.push(userTurn, botTurn);
-        // Keep last 6 turns = 3 full exchanges (user + bot each)
         while (messages.length > 6) messages.shift();
         await saveHistory(senderId, messages);
 
@@ -372,22 +357,18 @@ export async function handleChatbotResponse(
     }
 }
 
-// Plugin export
-
 export default {
     command:     'chatbot',
     aliases:     ['bot', 'ai', 'achat'],
     category:    'admin',
     description: 'Enable or disable AI chatbot for the group',
-    usage:       '.chatbot <on|off>',
+    usage:       '.chatbot <on|off|stats>',
     groupOnly:   true,
     adminOnly:   true,
 
     async handler(sock: any, message: any, args: any, context: BotContext) {
         const chatId = context.chatId || message.key.remoteJid;
         const match  = args.join(' ').toLowerCase();
-
-        // No typing indicator on command responses — only AI replies get typing
 
         if (!match) {
             return sock.sendMessage(chatId, {
@@ -397,7 +378,8 @@ export default {
                     `*APIs:* ${API_ENDPOINTS.length} endpoints with fallback\n\n` +
                     `*Commands:*\n` +
                     `• \`.chatbot on\` - Enable chatbot\n` +
-                    `• \`.chatbot off\` - Disable chatbot\n\n` +
+                    `• \`.chatbot off\` - Disable chatbot\n` +
+                    `• \`.chatbot stats\` - API health & memory stats\n\n` +
                     `*How it works:*\n` +
                     `When enabled, bot responds when mentioned or replied to.\n\n` +
                     `*Features:*\n` +
@@ -436,8 +418,32 @@ export default {
             }, { quoted: message });
         }
 
+        if (match === 'stats') {
+            const now      = Date.now();
+            const apiLines = API_ENDPOINTS.map(api => {
+                const s       = apiStats[api.name];
+                const icon    = s.count === 0 ? '✅' : s.count < 3 ? '⚠️' : '❌';
+                const lastFail = s.lastFailAt
+                    ? `last fail ${Math.round((now - s.lastFailAt) / 60000)}m ago`
+                    : 'no failures recorded';
+                const lastOk = s.lastSuccessAt
+                    ? `last ok ${Math.round((now - s.lastSuccessAt) / 60000)}m ago`
+                    : 'never succeeded this session';
+                return `${icon} *${api.name}*: ${s.count} failure(s)\n   ${lastFail} · ${lastOk}`;
+            }).join('\n');
+
+            return sock.sendMessage(chatId, {
+                text:
+                    `*📊 CHATBOT STATS*\n\n` +
+                    `*Users cached in memory:* ${profileCache.size}\n` +
+                    `*History entries cached:* ${historyCache.size}\n` +
+                    `*Failure auto-reset:* every ${API_FAILURE_RESET_MS / 60000}m\n\n` +
+                    `*API Health:*\n${apiLines}`
+            }, { quoted: message });
+        }
+
         return sock.sendMessage(chatId, {
-            text: '❌ *Invalid command*\n\nUse: `.chatbot on/off`'
+            text: '❌ *Invalid command*\n\nUse: `.chatbot on/off/stats`'
         }, { quoted: message });
     },
 
