@@ -234,10 +234,10 @@ const CLAPBACKS: Record<'mild' | 'medium' | 'heavy', string[]> = {
         "You really pressed send on that? 😐 interesting. We are done.",
         "Rude for no reason 😒 okay. I see you.",
         "It takes one to know one, doesn't it? Sha dey your lane make i dey my lane",
-        "Who dey dash all dis dullards data sef?",
+        "Who dey dash all dis dullards data sef? Abeg go one side. 😡",
         "I'm not even upset, I'm just... done with you for now 😌",
         " If you use this energy now take learn mechanic...... only God know wetin u no fit repair by now.",
-        "Didn't expect that but okay 😶 we move.",
+        "Didn't expect that from you but okay 😶 we move.",
     ],
 
     medium: [
@@ -264,7 +264,7 @@ const CLAPBACKS: Record<'mild' | 'medium' | 'heavy', string[]> = {
         "Oh we're doing this? Okay. I have NOTHING else to say to you.",
         "Take a chill pill, its good for your health.. any time they discussing matters, you are always on the wrong side..",
         "The fact that you think I'll keep responding to you after that trash u just said....😂 adorable. Bye.",
-        "I'm not even angry, I'm just done. Completely. Fully. Done. 😑",
+        "Hope say no be this brain you dey use cross road?🤦",
         "You must have me confused with someone who tolerates insults. Noted. Blocked in my heart.",
         "I've genuinely lost respect for you rn and I'm a cool guy 😐....that's says a lot.",
         "Omo. You really said that? 😶 okay. I will not talk to you again. Thank you, next.",
