@@ -58,6 +58,18 @@ export function normalise(text: string): string {
 // president" never triggers but "you stupid" or "u be mumu" always does.
 function isDirectedAtBot(text: string, matchIndex: number): boolean {
     const window = text.slice(Math.max(0, matchIndex - 35), matchIndex + 35);
+    
+    // ── NEW: Bail out if "you" is inside a conditional/hypothetical clause ──
+    // "if you...", "when you...", "once you..." → generic "you", not the bot
+    if (/\b(if|when|once|anytime|whenever)\s+(you|u|yu)\b/i.test(window)) return false;
+
+    // ── NEW: "you be X to [noun]" is social commentary, not a direct insult ──
+    // e.g. "you be trash to ladies", "you be nothing to them"
+    if (/\byou\s+be\s+\w+\s+to\s+\w/i.test(window)) return false;
+
+    return /\b(you|u|yu|ur|this\s*bot|dis\s*bot|groq|yourself|urself)\b/i.test(window);
+}
+    
     return /\b(you|u|yu|ur|this\s*bot|dis\s*bot|groq|yourself|urself)\b/i.test(window);
 }
 
