@@ -58,13 +58,18 @@ async function saveHistory(senderId: string, messages: string[]): Promise<void> 
 
 const API_ENDPOINTS = [
     {
-        name:  'Venice AI',
-        url:   (text: string) => `https://malvin-api.vercel.app/ai/venice?text=${encodeURIComponent(text)}`,
+        name:  'GPT-5',
+        url:   (text: string) => `https://malvin-api.vercel.app/ai/gpt-5?text=${encodeURIComponent(text)}`,
         parse: (data: any) => data?.result
     },
     {
-        name:  'GPT-5',
-        url:   (text: string) => `https://malvin-api.vercel.app/ai/gpt-5?text=${encodeURIComponent(text)}`,
+        name:  'Copilot',
+        url:   (text: string) => `https://malvin-api.vercel.app/ai/copilot?text=${encodeURIComponent(text)}`,
+        parse: (data: any) => data?.result
+    },
+    {
+        name:  'Venice AI',
+        url:   (text: string) => `https://malvin-api.vercel.app/ai/venice?text=${encodeURIComponent(text)}`,
         parse: (data: any) => data?.result
     },
     {
