@@ -58,8 +58,17 @@ export function normalise(text: string): string {
 // president" never triggers but "you stupid" or "u be mumu" always does.
 function isDirectedAtBot(text: string, matchIndex: number): boolean {
     const window = text.slice(Math.max(0, matchIndex - 35), matchIndex + 35);
-    
+
+    // Generic/hypothetical "you" — "if you no get money", "when you hustle"
+    // This is social commentary, not directed at the bot
+    if (/\b(if|when|once|anytime|whenever)\s+(you|u|yu)\b/i.test(window)) return false;
+
+    // "you be X to [someone]" — Pidgin social observation, not a bot insult
+    // e.g. "you be trash to ladies", "you be nothing to them"
+    if (/\b(you|u|yu)\s+be\s+\w+\s+to\s+\w/i.test(window)) return false;
+
     return /\b(you|u|yu|ur|this\s*bot|dis\s*bot|groq|yourself|urself)\b/i.test(window);
+}
 
 // ── Insult patterns ───────────────────────────────────────────────────────────
 export const INSULT_PATTERNS: InsultPattern[] = [
