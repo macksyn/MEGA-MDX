@@ -474,7 +474,7 @@ export default {
             data.chatbot[chatId] = true;
             await saveUserGroupData(data);
             return sock.sendMessage(chatId, {
-                text: '✅ *Chatbot enabled!*\n\nMention me or reply to my messages to chat.\n⚠️ Don\'t insult me though, I hold grudges 😑'
+                text: '✅ *Chatbot enabled!*\n\nMention me or reply to my messages to chat.'
             }, { quoted: message });
         }
 
