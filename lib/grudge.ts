@@ -82,7 +82,7 @@ export const INSULT_PATTERNS: InsultPattern[] = [
     { pattern: /\b(you|u|yu)\s*(wan)?\s*kil+\s*(me|us)\b/i,                              severity: 'medium', label: 'you_wan_kill',     needsTarget: false },
 
     // ── "this bot/thing/groq" + insult combos ────────────────── needsTarget: false (explicit bot ref)
-    { pattern: /\b(this|dis)\s+(bot|thing|groq|ai)\s+(is\s+)?(mad|stupid|trash|useless|fool|dumb|ode|mumu)\b/i, severity: 'heavy', label: 'bot_insult_direct', needsTarget: false },
+    { pattern: /\b(this|dis)\s+(bot|thing|groq|ai)\s+(is\s+)?(mad|stupid|useless|fool|dumb|ode|mumu)\b/i, severity: 'heavy', label: 'bot_insult_direct', needsTarget: false },
 
     // ── "go die" / "kill yourself" ───────────────────────────── needsTarget: false (inherently directed)
     { pattern: /\bg[o0]\s*d[i]+e\b/i,                                                    severity: 'heavy',  label: 'go_die',           needsTarget: false },
