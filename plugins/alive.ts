@@ -8,7 +8,7 @@ export default {
   category: 'general',
   description: 'Check bot status and system info',
   usage: '.alive',
-  isPrefixless: true,
+  isPrefixless: false,
 
   async handler(sock: any, message: any, args: any, context: BotContext) {
     const { chatId, config } = context;
