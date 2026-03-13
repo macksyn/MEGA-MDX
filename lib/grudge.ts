@@ -74,7 +74,7 @@ function isDirectedAtBot(text: string, matchIndex: number): boolean {
 export const INSULT_PATTERNS: InsultPattern[] = [
 
     // ── "your papa/father/daddy" family ─────────────────────── needsTarget: false (direction baked in)
-    { pattern: /\by[ou]+r?\s*(papa|fada|father|daddy|pop|baba|old\s*man)\b/i,             severity: 'medium', label: 'your_papa',       needsTarget: false },
+    { pattern: /\by[ou]+r?\s*(papa|fada|father|pop|baba|old\s*man)\b/i,             severity: 'medium', label: 'your_papa',       needsTarget: false },
     { pattern: /\bur\s*(papa|fada|father|daddy|pop|baba)\b/i,                             severity: 'medium', label: 'ur_papa',          needsTarget: false },
 
     // ── "your mama/mother" family ────────────────────────────── needsTarget: false
