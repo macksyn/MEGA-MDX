@@ -33,7 +33,7 @@ async function SaveCreds(txt: string): Promise<void> {
     try {
         const file = File.fromURL(megaUrl);
         await file.loadAttributes();
-        const data = await file.downloadBuffer();
+        const data = await file.downloadBuffer({});
 
         const sessionDir = path.join(__dirname, '..', 'session');
         if (!fs.existsSync(sessionDir)) {
