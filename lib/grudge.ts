@@ -1,0 +1,316 @@
+/**
+ * lib/grudge.ts
+ * Nigerian-aware insult detection + grudge state management for chatbot.ts
+ */
+
+import { createStore } from './pluginStore.js';
+
+const db      = createStore('chatbot');
+const dbUsers = db.table!('users');
+
+// ── Duration tiers (ms) ───────────────────────────────────────────────────────
+export const GRUDGE_DURATIONS = {
+    mild:   2  * 60 * 60 * 1000,   // 2 hours
+    medium: 6  * 60 * 60 * 1000,   // 6 hours
+    heavy:  24 * 60 * 60 * 1000,   // 24 hours
+};
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+export interface GrudgeRecord {
+    active:    boolean;
+    expiresAt: number;
+    severity:  'mild' | 'medium' | 'heavy';
+    strikes:   number;
+    chatId:    string;
+    reason:    string;
+}
+
+export interface InsultPattern {
+    pattern:     RegExp;
+    severity:    'mild' | 'medium' | 'heavy';
+    label:       string;
+    needsTarget: boolean; // true = bare word, must have "you/u/ur" nearby to count
+}
+
+// ── Normaliser ────────────────────────────────────────────────────────────────
+// Collapses repeated chars, strips zero-width chars, lowercases,
+// handles leet subs so "maaaad", "m@d", "stu.pid" all normalise cleanly.
+export function normalise(text: string): string {
+    return text
+        .toLowerCase()
+        .replace(/[\u200B-\u200D\uFEFF]/g, '')     // zero-width chars
+        .replace(/[0@]/g,  'o')
+        .replace(/[1!|]/g, 'i')
+        .replace(/[3]/g,   'e')
+        .replace(/[4]/g,   'a')
+        .replace(/[5\$]/g, 's')
+        .replace(/[7]/g,   't')
+        .replace(/[8]/g,   'b')
+        .replace(/\./g,    '')                       // "stu.pid" → "stupid"
+        .replace(/(.)\1{2,}/g, '$1$1')              // "maaaad" → "maad"
+        .replace(/\s+/g,   ' ')
+        .trim();
+}
+
+// ── Direction check ───────────────────────────────────────────────────────────
+// For bare-word patterns (needsTarget: true), confirm there's a directed
+// pronoun or bot reference within ~35 chars of the match so "our stupid
+// president" never triggers but "you stupid" or "u be mumu" always does.
+function isDirectedAtBot(text: string, matchIndex: number): boolean {
+    const window = text.slice(Math.max(0, matchIndex - 35), matchIndex + 35);
+    return /\b(you|u|yu|ur|this\s*bot|dis\s*bot|groq|yourself|urself)\b/i.test(window);
+}
+
+// ── Insult patterns ───────────────────────────────────────────────────────────
+export const INSULT_PATTERNS: InsultPattern[] = [
+
+    // ── "your papa/father/daddy" family ─────────────────────── needsTarget: false (direction baked in)
+    { pattern: /\by[ou]+r?\s*(papa|fada|father|daddy|pop|baba|old\s*man)\b/i,             severity: 'medium', label: 'your_papa',       needsTarget: false },
+    { pattern: /\bur\s*(papa|fada|father|daddy|pop|baba)\b/i,                             severity: 'medium', label: 'ur_papa',          needsTarget: false },
+
+    // ── "your mama/mother" family ────────────────────────────── needsTarget: false
+    { pattern: /\by[ou]+r?\s*(mama|mum+a?|mother|mo[mt]|iya)\b/i,                        severity: 'medium', label: 'your_mama',        needsTarget: false },
+    { pattern: /\bur\s*(mama|mum+a?|mother|mo[mt]|iya)\b/i,                              severity: 'medium', label: 'ur_mama',           needsTarget: false },
+
+    // ── "you are mad" + all Pidgin/spelling variants ─────────── needsTarget: false
+    // covers: "you mad", "u r mad", "ur mad", "you dey mad",
+    //         "u don mad", "you craze", "u don craze", "you crazy sef"
+    { pattern: /\b(you|u|yu)\s*(are|r|dey|don|don\s*de)?\s*ma+d\b/i,                    severity: 'heavy',  label: 'you_are_mad',      needsTarget: false },
+    { pattern: /\b(you|u|yu)\s*(are|r|dey|don|don\s*de)?\s*kra+ze?\b/i,                 severity: 'heavy',  label: 'you_craze_k',      needsTarget: false },
+    { pattern: /\b(you|u|yu)\s*(are|r|dey|don|don\s*de)?\s*craz(y|e)\b/i,               severity: 'heavy',  label: 'you_craze',        needsTarget: false },
+    { pattern: /\b(you|u|yu)\s*(don)?\s*lose\s*(am|it|ur\s*mind|your\s*mind)\b/i,       severity: 'heavy',  label: 'lost_your_mind',   needsTarget: false },
+    { pattern: /\b(you|u|yu)\s*(wan)?\s*kil+\s*(me|us)\b/i,                              severity: 'medium', label: 'you_wan_kill',     needsTarget: false },
+
+    // ── "this bot/thing/groq" + insult combos ────────────────── needsTarget: false (explicit bot ref)
+    { pattern: /\b(this|dis)\s+(bot|thing|groq|ai)\s+(is\s+)?(mad|stupid|trash|useless|fool|dumb|ode|mumu)\b/i, severity: 'heavy', label: 'bot_insult_direct', needsTarget: false },
+
+    // ── "go die" / "kill yourself" ───────────────────────────── needsTarget: false (inherently directed)
+    { pattern: /\bg[o0]\s*d[i]+e\b/i,                                                    severity: 'heavy',  label: 'go_die',           needsTarget: false },
+    { pattern: /\bkill\s+your(self)?\b/i,                                                 severity: 'heavy',  label: 'kill_yourself',    needsTarget: false },
+
+    // ── "wey dem born" ───────────────────────────────────────── needsTarget: false
+    { pattern: /\bwey\s+dem\s+born\b/i,                                                   severity: 'heavy',  label: 'wey_dem_born',     needsTarget: false },
+
+    // ── Bare-word Nigerian insults ────────────────────────────── needsTarget: true (need "you/u" nearby)
+    { pattern: /\bo+l[o0]+d[o0]+\b/i,                                                    severity: 'heavy',  label: 'olodo',            needsTarget: true  },
+    { pattern: /\bo+d[e3]+\b/i,                                                           severity: 'heavy',  label: 'ode',              needsTarget: true  },
+    { pattern: /\bm[u]+m[u]+\b/i,                                                         severity: 'heavy',  label: 'mumu',             needsTarget: true  },
+    { pattern: /\bo+l[o0]+s[h]+[o0]+\b/i,                                                severity: 'heavy',  label: 'olosho',           needsTarget: true  },
+    { pattern: /\ba+s[h]+[e3]w[o0]+\b/i,                                                  severity: 'heavy',  label: 'ashewo',           needsTarget: true  },
+    { pattern: /\bb[o0]+k[o0]+\b/i,                                                       severity: 'medium', label: 'boko',             needsTarget: true  },
+    { pattern: /\baj[e3]b[o0]t[a4]?\b/i,                                                  severity: 'mild',   label: 'ajebo',            needsTarget: true  },
+    { pattern: /\bomo\s*(ale|oshi|buruku)\b/i,                                             severity: 'heavy',  label: 'omo_ale',          needsTarget: true  },
+    { pattern: /\bosh[i]+\b/i,                                                             severity: 'heavy',  label: 'oshi',             needsTarget: true  },
+
+    // ── Bare-word English insults ─────────────────────────────── needsTarget: true
+    { pattern: /\bfo[o0]+l(ish)?\b/i,                                                    severity: 'medium', label: 'foolish',          needsTarget: true  },
+    { pattern: /\bst[u]+p[i]+d\b/i,                                                       severity: 'medium', label: 'stupid',           needsTarget: true  },
+    { pattern: /\bi+d[i]+[o0]+t\b/i,                                                      severity: 'medium', label: 'idiot',            needsTarget: true  },
+    { pattern: /\bd[u]+mb\b/i,                                                             severity: 'mild',   label: 'dumb',             needsTarget: true  },
+    { pattern: /\buses+les+\b/i,                                                           severity: 'medium', label: 'useless',          needsTarget: true  },
+    { pattern: /\btr[a4]+sh\b/i,                                                           severity: 'mild',   label: 'trash',            needsTarget: true  },
+    { pattern: /\bdum+[ao]ss\b/i,                                                          severity: 'medium', label: 'dumbass',          needsTarget: true  },
+    { pattern: /\bwaste\s+of\s+(space|time|life)\b/i,                                    severity: 'medium', label: 'waste_of_space',   needsTarget: true  },
+    { pattern: /\bmoron\b/i,                                                               severity: 'medium', label: 'moron',            needsTarget: true  },
+    { pattern: /\bimbecile\b/i,                                                            severity: 'medium', label: 'imbecile',         needsTarget: true  },
+    { pattern: /\bjok[e3]+\b/i,                                                            severity: 'mild',   label: 'joke',             needsTarget: true  },
+];
+
+// ── Severity scorer ───────────────────────────────────────────────────────────
+export function detectInsult(rawText: string): {
+    hit:           boolean;
+    severity:      'mild' | 'medium' | 'heavy';
+    matchedLabels: string[];
+} {
+    const norm = normalise(rawText);
+    const matchedLabels: string[] = [];
+    let highestSeverity: 'mild' | 'medium' | 'heavy' = 'mild';
+    const severityRank = { mild: 1, medium: 2, heavy: 3 };
+
+    for (const { pattern, severity, label, needsTarget } of INSULT_PATTERNS) {
+        // Try normalised first, fall back to raw
+        const match = pattern.exec(norm) ?? pattern.exec(rawText);
+        if (!match) continue;
+
+        // Bare-word patterns require a directed pronoun/bot ref nearby
+        if (needsTarget && !isDirectedAtBot(norm, match.index)) continue;
+
+        matchedLabels.push(label);
+        if (severityRank[severity] > severityRank[highestSeverity]) {
+            highestSeverity = severity;
+        }
+    }
+
+    return {
+        hit:           matchedLabels.length > 0,
+        severity:      highestSeverity,
+        matchedLabels
+    };
+}
+
+// ── Grudge store helpers ──────────────────────────────────────────────────────
+// Grudges are group-scoped: stored as profile.grudges[chatId]
+// so insulting in Group A has zero effect in Group B.
+
+export async function getGrudge(
+    chatId:       string,
+    senderId:     string,
+    profileCache: Map<string, Record<string, any>>,
+): Promise<GrudgeRecord | null> {
+    const profile: Record<string, any> = profileCache.get(senderId) ?? (await dbUsers.get(senderId)) ?? {};
+    const grudges: Record<string, GrudgeRecord> = profile.grudges ?? {};
+    const g = grudges[chatId];
+    if (!g) return null;
+
+    // Auto-expire
+    if (Date.now() > g.expiresAt) {
+        // Mark as just-thawed so chatbot.ts can greet them coldly
+        profile._justThawed         = profile._justThawed ?? {};
+        profile._justThawed[chatId] = true;
+        delete grudges[chatId];
+        profile.grudges = grudges;
+        profileCache.set(senderId, profile);
+        await dbUsers.set(senderId, profile);
+        return null;
+    }
+
+    return g;
+}
+
+export async function setGrudge(
+    chatId:       string,
+    senderId:     string,
+    severity:     'mild' | 'medium' | 'heavy',
+    reason:       string,
+    profileCache: Map<string, Record<string, any>>,
+): Promise<GrudgeRecord> {
+    const profile: Record<string, any> = profileCache.get(senderId) ?? (await dbUsers.get(senderId)) ?? {};
+    const grudges: Record<string, GrudgeRecord> = profile.grudges ?? {};
+    const existing = grudges[chatId];
+
+    // Repeat offender: multiply duration by strike count, capped at 48 hours
+    const strikes  = (existing?.strikes ?? 0) + 1;
+    const base     = GRUDGE_DURATIONS[severity];
+    const duration = Math.min(base * strikes, GRUDGE_DURATIONS.heavy * 2);
+
+    const grudge: GrudgeRecord = {
+        active:    true,
+        expiresAt: Date.now() + duration,
+        severity,
+        strikes,
+        chatId,
+        reason:    reason.slice(0, 80),
+    };
+
+    grudges[chatId] = grudge;
+    profile.grudges = grudges;
+    profileCache.set(senderId, profile);
+    await dbUsers.set(senderId, profile);
+
+    return grudge;
+}
+
+export async function clearGrudge(
+    chatId:       string,
+    senderId:     string,
+    profileCache: Map<string, Record<string, any>>,
+): Promise<void> {
+    const profile: Record<string, any> = profileCache.get(senderId) ?? (await dbUsers.get(senderId)) ?? {};
+    const grudges: Record<string, GrudgeRecord> = profile.grudges ?? {};
+    delete grudges[chatId];
+    profile.grudges = grudges;
+    profileCache.set(senderId, profile);
+    await dbUsers.set(senderId, profile);
+}
+
+// ── Clapback pool ─────────────────────────────────────────────────────────────
+
+const CLAPBACKS: Record<'mild' | 'medium' | 'heavy', string[]> = {
+
+    mild: [
+        "Okay wow. That was rude 🙄 don't talk to me.",
+        "Alright noted. I'll just... not reply you anymore 🚶",
+        "That's a weird way to talk to someone. Cool, I'm done. 😑",
+        "You really pressed send on that 😐 interesting. Bye.",
+        "Rude for no reason 😒 okay. I see you.",
+        "Not even gonna argue. Just noted. 🚶‍♂️",
+        "That's the energy? Okay. I'll match it by saying nothing. 😶",
+        "I'm not even upset, I'm just... done with you for now 😌",
+        "Wow. Okay. I'll remember this energy next time you need help 😌",
+        "Didn't expect that but okay 😶 we move.",
+    ],
+
+    medium: [
+        "Say it again and see 😒 actually don't bother, we're done here.",
+        "Lmao okay. I don't deal with that kind of energy. Peace ✌️",
+        "Interesting choice of words. I'll remember this 🙂",
+        "You got a lot of nerve abi? Cool. Ghost mode activated.",
+        "So that's how you are 😌 okay. Don't mention me again.",
+        "The audacity is actually impressive 😐 goodbye.",
+        "I was literally minding my business 😒",
+        "And just like that, you lost my attention. Congrats 🎉",
+        "I've seen better insults from a primary school debate 😴 try again never.",
+        "Okay bestie you clearly woke up and chose chaos 😑 I'm out.",
+        "Hmm. You really said that with your full chest 😒 respect I guess. Bye.",
+        "Some people just don't deserve responses and today you've joined that list 😌",
+        "I don't even have the energy to be offended. You're just blocked in my heart 💔",
+        "See ehn, this behaviour? Not it. Not today. Not ever. 😑",
+        "I came in peace and you chose war. Interesting life choices. Goodbye. ✌️",
+        "The disrespect jumped out so fast I almost didn't catch it 😐 but I did. Noted.",
+    ],
+
+    heavy: [
+        "Your papa 😐 I said what I said. Don't @ me.",
+        "Oh we're doing this? Okay. I have NOTHING else to say to you.",
+        "You really woke up and chose violence 😒 respect the disrespect. I'm out.",
+        "The fact that you think I'll keep responding after that 😂 adorable. Bye.",
+        "I'm not even angry, I'm just done. Completely. Fully. Done. 😑",
+        "You must have me confused with someone who tolerates that. Noted. Blocked in my heart.",
+        "I've genuinely lost respect for you rn and I'm a bot 😐 that's saying a lot.",
+        "Omo. You really said that 😶 okay. I will not be responding. Thank you, next.",
+        "See me see trouble 😒 I didn't come to this group for this. We are DONE.",
+        "Ehn? You said what now? 😐 okay. Talk to the void because I'm gone.",
+        "I was going to respond but then I remembered I have standards 😌 so no.",
+        "God punish you softly 😒 I'm moving on with my life.",
+        "The fact that you typed that, read it back, and still pressed send 😂 the confidence.",
+        "You know what, I'm not even going to waste my energy. You're not worth the keystrokes.",
+        "Ah. So this is who you are in real life 😐 interesting. Very interesting. Goodbye.",
+        "My guy really came to a group chat and decided to make an enemy today 😒 bold.",
+        "I don't forget and I don't forgive quickly 😑 enjoy talking to yourself for a while.",
+        "Since you have so much to say, you can say it to the wall. I'm done here. 🚶‍♂️",
+        "Wow. I actually liked you before this moment 😐 rest in peace to that relationship.",
+        "Not me catching feelings over this 😒 except the feelings are just pure unbothered energy. Bye.",
+        "You really had all day to say something nice and chose this 😂 I can't even be mad.",
+        "This is why people have trust issues 😑 adding you to the list. Goodbye.",
+        "Ehn okay. Let me not talk before I say something that'll scatter this group 😒 just don't mention me.",
+        "The level of audacity in this message could power a generator 😐 goodbye sha.",
+        "I don't have time for this. I really don't. 😑 Peace.",
+    ],
+};
+
+export function getGrudgeClapback(severity: 'mild' | 'medium' | 'heavy'): string {
+    const pool = CLAPBACKS[severity];
+    return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// ── Thaw messages — when grudge expires and they dare to speak again ───────────
+const THAW_MESSAGES: string[] = [
+    "...what do you want 🙄",
+    "Hmm. You again. 😒 what?",
+    "I was minding my business but go on.",
+    "Took you long enough. What is it.",
+    "We still cool? Barely. But talk.",
+    "Oh so now you want to talk 😐 interesting.",
+    "I see you're back. Didn't miss you but go on.",
+    "Ehn. I'll listen. But know that I remembered 😒",
+    "You're lucky I'm in a forgiving mood. Barely. What?",
+    "Okay fine. I'll acknowledge your existence again. What do you want. 😑",
+    "Clock ran out. You get one more chance. Don't waste it. 🙂",
+    "Back already? Okay. Just know I have a long memory 😌 what?",
+    "I was genuinely enjoying the silence but here we are 😒 speak.",
+    "Amnesty granted. Reluctantly. Very reluctantly. What is it.",
+];
+
+export function getThawMessage(): string {
+    return THAW_MESSAGES[Math.floor(Math.random() * THAW_MESSAGES.length)];
+}

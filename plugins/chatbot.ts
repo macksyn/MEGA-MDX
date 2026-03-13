@@ -4,6 +4,16 @@ import path from 'path';
 import { dataFile } from '../lib/paths.js';
 import store from '../lib/lightweight_store.js';
 import { createStore } from '../lib/pluginStore.js';
+import {
+    detectInsult,
+    getGrudge,
+    setGrudge,
+    clearGrudge,
+    getGrudgeClapback,
+    getThawMessage,
+    GRUDGE_DURATIONS,
+    type GrudgeRecord
+} from './lib/grudge.js';
 
 const MONGO_URL    = process.env.MONGO_URL;
 const POSTGRES_URL = process.env.POSTGRES_URL;
@@ -13,13 +23,15 @@ const HAS_DB       = !!(MONGO_URL || POSTGRES_URL || MYSQL_URL || SQLITE_URL);
 
 const USER_GROUP_DATA = dataFile('userGroupData.json');
 
-const db            = createStore('chatbot');
-const dbUsers       = db.table!('users');
-const dbHistory     = db.table!('history');
-const dbConfig      = db.table!('config');
+const db        = createStore('chatbot');
+const dbUsers   = db.table!('users');
+const dbHistory = db.table!('history');
+const dbConfig  = db.table!('config');
 
-const profileCache  = new Map<string, Record<string, any>>();
-const historyCache  = new Map<string, string[]>();
+const profileCache = new Map<string, Record<string, any>>();
+const historyCache = new Map<string, string[]>();
+
+// ── Profile / history helpers (unchanged) ─────────────────────────────────────
 
 async function loadProfile(senderId: string): Promise<Record<string, any>> {
     if (profileCache.has(senderId)) return profileCache.get(senderId)!;
@@ -44,6 +56,8 @@ async function saveHistory(senderId: string, messages: string[]): Promise<void> 
     historyCache.set(senderId, messages);
     await dbHistory.set(senderId, messages);
 }
+
+// ── API endpoints (unchanged) ─────────────────────────────────────────────────
 
 const API_ENDPOINTS = [
     {
@@ -73,10 +87,6 @@ const API_ENDPOINTS = [
     }
 ];
 
-// ── API failure tracking ──────────────────────────────────────────────────────
-// Each entry: { count: number, lastFailAt: number, lastSuccessAt: number }
-// count resets automatically after 5 min of no failures (auto-recovery).
-
 const API_FAILURE_RESET_MS = 5 * 60 * 1000;
 
 const apiStats: Record<string, { count: number; lastFailAt: number; lastSuccessAt: number }> = {};
@@ -84,7 +94,6 @@ API_ENDPOINTS.forEach(api => {
     apiStats[api.name] = { count: 0, lastFailAt: 0, lastSuccessAt: 0 };
 });
 
-// Reset stale failure counts every 5 min so a recovered API goes back to ✅
 setInterval(() => {
     const now = Date.now();
     for (const name of Object.keys(apiStats)) {
@@ -94,7 +103,7 @@ setInterval(() => {
     }
 }, API_FAILURE_RESET_MS);
 
-// Storage
+// ── Chatbot config storage (unchanged) ───────────────────────────────────────
 
 async function loadUserGroupData() {
     try {
@@ -122,10 +131,12 @@ async function saveUserGroupData(data: any) {
     }
 }
 
+// ── Typing indicator (unchanged) ─────────────────────────────────────────────
+
 async function showTyping(sock: any, chatId: string, estimatedResponseLength = 80) {
     try {
-        const base   = Math.min(Math.max(estimatedResponseLength * 40, 1500), 6000);
-        const delay  = Math.round(base * (0.7 + Math.random() * 0.6));
+        const base  = Math.min(Math.max(estimatedResponseLength * 40, 1500), 6000);
+        const delay = Math.round(base * (0.7 + Math.random() * 0.6));
         await sock.presenceSubscribe(chatId);
         await sock.sendPresenceUpdate('composing', chatId);
         await new Promise(resolve => setTimeout(resolve, delay));
@@ -140,6 +151,8 @@ async function showTyping(sock: any, chatId: string, estimatedResponseLength = 8
     }
 }
 
+// ── User info extractor (unchanged) ──────────────────────────────────────────
+
 function extractUserInfo(message: string) {
     const info: Record<string, any> = {};
     if (message.toLowerCase().includes('my name is')) {
@@ -153,6 +166,8 @@ function extractUserInfo(message: string) {
     }
     return info;
 }
+
+// ── Prompt builder (unchanged) ────────────────────────────────────────────────
 
 function buildPrompt(userMessage: string, messages: string[], userInfo: Record<string, any>): string {
     const info = userInfo || {};
@@ -189,6 +204,8 @@ function buildPrompt(userMessage: string, messages: string[], userInfo: Record<s
     return full;
 }
 
+// ── AI call (unchanged) ───────────────────────────────────────────────────────
+
 async function getAIResponse(
     userMessage: string,
     userContext: { messages: string[]; userInfo: Record<string, any> }
@@ -220,7 +237,6 @@ async function getAIResponse(
                 continue;
             }
 
-            // Success — reset failure count, record success time
             apiStats[api.name].count         = 0;
             apiStats[api.name].lastSuccessAt = Date.now();
             console.log(`${api.name} success`);
@@ -255,6 +271,8 @@ async function getAIResponse(
     console.error('All AI APIs failed');
     return null;
 }
+
+// ── Main chatbot handler ───────────────────────────────────────────────────────
 
 export async function handleChatbotResponse(
     sock: any,
@@ -304,7 +322,57 @@ export async function handleChatbotResponse(
         let cleanedMessage = userMessage;
         if (isBotMentioned) cleanedMessage = cleanedMessage.replace(new RegExp(`@${botNumber}`, 'g'), '').trim();
 
-        const profile  = await loadProfile(senderId);
+        // ── GRUDGE CHECK ──────────────────────────────────────────────────────
+        // Must happen BEFORE any AI call so the bot truly stays silent.
+        const activeGrudge = await getGrudge(chatId, senderId, profileCache);
+
+        if (activeGrudge) {
+            // Still in grudge window — full silence. No reaction, no read receipt.
+            // (The read-receipt suppression is handled upstream by stealth mode;
+            //  here we simply return without sending anything.)
+            console.log(`[GRUDGE] Silent treatment: ${senderId.split('@')[0]} (expires in ${Math.round((activeGrudge.expiresAt - Date.now()) / 3600000)}h)`);
+            return;
+        }
+
+        // ── INSULT DETECTION ──────────────────────────────────────────────────
+        const insult = detectInsult(cleanedMessage);
+
+        if (insult.hit) {
+            // Fire one savage clap-back then record the grudge.
+            const grudge   = await setGrudge(chatId, senderId, insult.severity, cleanedMessage, profileCache);
+            const clapback = getGrudgeClapback(insult.severity);
+            const hoursLeft = Math.round((grudge.expiresAt - Date.now()) / 3600000);
+
+            console.log(`[GRUDGE] Set for ${senderId.split('@')[0]} — severity: ${insult.severity}, matched: ${insult.matchedLabels.join(', ')}, duration: ${hoursLeft}h, strikes: ${grudge.strikes}`);
+
+            // Slight delay before clap-back so it feels like a human pause
+            await new Promise(r => setTimeout(r, 1200 + Math.random() * 1000));
+            await sock.sendMessage(chatId, { text: clapback }, { quoted: message });
+
+            // No further processing — the AI doesn't get called.
+            return;
+        }
+
+        // ── THAW CHECK ────────────────────────────────────────────────────────
+        // If the grudge JUST expired (getGrudge cleared it), check if user had
+        // a prior grudge record so we can greet them coldly.
+        // We detect this by checking if the profile still has a resolved grudge
+        // marker we set during clearGrudge (optional approach used below).
+        const profile = await loadProfile(senderId);
+        const wasGrudged = profile._justThawed?.[chatId];
+
+        if (wasGrudged) {
+            // Clear the thaw marker
+            if (profile._justThawed) delete profile._justThawed[chatId];
+            await saveProfile(senderId, profile);
+
+            await showTyping(sock, chatId, 20);
+            await sock.sendMessage(chatId, { text: getThawMessage() }, { quoted: message });
+            return;
+        }
+
+        // ── NORMAL FLOW ───────────────────────────────────────────────────────
+
         const messages = await loadHistory(senderId);
 
         const pushName: string | undefined = message.pushName;
@@ -357,18 +425,20 @@ export async function handleChatbotResponse(
     }
 }
 
+// ── Command handler ───────────────────────────────────────────────────────────
+
 export default {
     command:     'chatbot',
     aliases:     ['bot', 'ai', 'achat'],
     category:    'admin',
     description: 'Enable or disable AI chatbot for the group',
-    usage:       '.chatbot <on|off|stats>',
+    usage:       '.chatbot <on|off|stats|pardon>',
     groupOnly:   true,
     adminOnly:   true,
 
     async handler(sock: any, message: any, args: any, context: BotContext) {
         const chatId = context.chatId || message.key.remoteJid;
-        const match  = args.join(' ').toLowerCase();
+        const match  = args.join(' ').toLowerCase().trim();
 
         if (!match) {
             return sock.sendMessage(chatId, {
@@ -377,21 +447,25 @@ export default {
                     `*Storage:* ${HAS_DB ? 'Database' : 'File System'}\n` +
                     `*APIs:* ${API_ENDPOINTS.length} endpoints with fallback\n\n` +
                     `*Commands:*\n` +
-                    `• \`.chatbot on\` - Enable chatbot\n` +
-                    `• \`.chatbot off\` - Disable chatbot\n` +
-                    `• \`.chatbot stats\` - API health & memory stats\n\n` +
+                    `• \`.chatbot on\` — Enable chatbot\n` +
+                    `• \`.chatbot off\` — Disable chatbot\n` +
+                    `• \`.chatbot stats\` — API health & memory stats\n` +
+                    `• \`.chatbot pardon @user\` — Lift a grudge early\n` +
+                    `• \`.chatbot grudges\` — List active grudges in this group\n\n` +
                     `*How it works:*\n` +
-                    `When enabled, bot responds when mentioned or replied to.\n\n` +
-                    `*Features:*\n` +
-                    `• Natural English conversations\n` +
-                    `• Remembers recent context\n` +
-                    `• Personality-based replies\n` +
-                    `• Auto fallback if API fails`
+                    `When enabled, bot responds when mentioned or replied to.\n` +
+                    `Insult the bot → it claps back once then ignores you for hours.\n\n` +
+                    `*Grudge tiers:*\n` +
+                    `• Mild insult → 2 hours silent treatment\n` +
+                    `• Medium insult → 6 hours silent treatment\n` +
+                    `• Heavy insult → 24 hours silent treatment\n` +
+                    `• Repeat offender → duration multiplies per strike`
             }, { quoted: message });
         }
 
         const data = await loadUserGroupData();
 
+        // ── on ────────────────────────────────────────────────────────────────
         if (match === 'on') {
             if (data.chatbot[chatId]) {
                 return sock.sendMessage(chatId, {
@@ -401,10 +475,11 @@ export default {
             data.chatbot[chatId] = true;
             await saveUserGroupData(data);
             return sock.sendMessage(chatId, {
-                text: '✅ *Chatbot enabled!*\n\nMention me or reply to my messages to chat.'
+                text: '✅ *Chatbot enabled!*\n\nMention me or reply to my messages to chat.\n⚠️ Don\'t insult me though, I hold grudges 😑'
             }, { quoted: message });
         }
 
+        // ── off ───────────────────────────────────────────────────────────────
         if (match === 'off') {
             if (!data.chatbot[chatId]) {
                 return sock.sendMessage(chatId, {
@@ -418,32 +493,84 @@ export default {
             }, { quoted: message });
         }
 
+        // ── pardon @user ──────────────────────────────────────────────────────
+        if (match.startsWith('pardon')) {
+            const mentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+            if (!mentioned) {
+                return sock.sendMessage(chatId, {
+                    text: '❌ Mention the user to pardon. Example: `.chatbot pardon @username`'
+                }, { quoted: message });
+            }
+            await clearGrudge(chatId, mentioned, profileCache);
+            const tag = `@${mentioned.split('@')[0]}`;
+            return sock.sendMessage(chatId, {
+                text: `✅ Grudge cleared for ${tag}. They can talk to me again.`,
+                mentions: [mentioned]
+            }, { quoted: message });
+        }
+
+        // ── grudges ───────────────────────────────────────────────────────────
+        if (match === 'grudges') {
+            // Scan profileCache for active grudges in this chatId
+            const now     = Date.now();
+            const entries: string[] = [];
+
+            for (const [uid, profile] of profileCache.entries()) {
+                const g: GrudgeRecord | undefined = profile.grudges?.[chatId];
+                if (g && g.active && now < g.expiresAt) {
+                    const hoursLeft = ((g.expiresAt - now) / 3600000).toFixed(1);
+                    const name = profile.name || uid.split('@')[0];
+                    entries.push(`• @${uid.split('@')[0]} (${name}) — ${hoursLeft}h left [${g.severity}, strike ${g.strikes}]`);
+                }
+            }
+
+            if (entries.length === 0) {
+                return sock.sendMessage(chatId, {
+                    text: '✅ *No active grudges in this group.*\n\nEveryone has been behaving 🙂'
+                }, { quoted: message });
+            }
+
+            return sock.sendMessage(chatId, {
+                text: `*😒 ACTIVE GRUDGES (${entries.length})*\n\n${entries.join('\n')}\n\nUse \`.chatbot pardon @user\` to clear one.`
+            }, { quoted: message });
+        }
+
+        // ── stats ─────────────────────────────────────────────────────────────
         if (match === 'stats') {
             const now      = Date.now();
             const apiLines = API_ENDPOINTS.map(api => {
-                const s       = apiStats[api.name];
-                const icon    = s.count === 0 ? '✅' : s.count < 3 ? '⚠️' : '❌';
+                const s        = apiStats[api.name];
+                const icon     = s.count === 0 ? '✅' : s.count < 3 ? '⚠️' : '❌';
                 const lastFail = s.lastFailAt
                     ? `last fail ${Math.round((now - s.lastFailAt) / 60000)}m ago`
                     : 'no failures recorded';
-                const lastOk = s.lastSuccessAt
+                const lastOk   = s.lastSuccessAt
                     ? `last ok ${Math.round((now - s.lastSuccessAt) / 60000)}m ago`
                     : 'never succeeded this session';
                 return `${icon} *${api.name}*: ${s.count} failure(s)\n   ${lastFail} · ${lastOk}`;
             }).join('\n');
+
+            // Count active grudges across all groups
+            let totalGrudges = 0;
+            for (const [, profile] of profileCache.entries()) {
+                for (const g of Object.values(profile.grudges ?? {})) {
+                    if ((g as GrudgeRecord).active && Date.now() < (g as GrudgeRecord).expiresAt) totalGrudges++;
+                }
+            }
 
             return sock.sendMessage(chatId, {
                 text:
                     `*📊 CHATBOT STATS*\n\n` +
                     `*Users cached in memory:* ${profileCache.size}\n` +
                     `*History entries cached:* ${historyCache.size}\n` +
+                    `*Active grudges (all groups):* ${totalGrudges}\n` +
                     `*Failure auto-reset:* every ${API_FAILURE_RESET_MS / 60000}m\n\n` +
                     `*API Health:*\n${apiLines}`
             }, { quoted: message });
         }
 
         return sock.sendMessage(chatId, {
-            text: '❌ *Invalid command*\n\nUse: `.chatbot on/off/stats`'
+            text: '❌ *Invalid command*\n\nUse: `.chatbot on/off/stats/pardon/grudges`'
         }, { quoted: message });
     },
 
