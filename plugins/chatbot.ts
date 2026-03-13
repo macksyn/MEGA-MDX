@@ -176,7 +176,7 @@ function buildPrompt(userMessage: string, messages: string[], userInfo: Record<s
     const info = userInfo || {};
 
     const nameLine = info.name
-        ? `The user's name is ${info.name}. Only use their name if they directly ask you what their name is. Do not use their name in regular replies.`
+        ? `The user's name is ${info.name}. Use their name very occasionally — at most once per conversation, only when it flows completely naturally (e.g. a greeting or a moment of surprise). Never force it. If they ask what their name is, answer correctly.`
         : '';
 
     const extraInfo = [
