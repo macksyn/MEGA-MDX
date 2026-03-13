@@ -71,7 +71,6 @@ function isDirectedAtBot(text: string, matchIndex: number): boolean {
 }
     
     return /\b(you|u|yu|ur|this\s*bot|dis\s*bot|groq|yourself|urself)\b/i.test(window);
-}
 
 // ── Insult patterns ───────────────────────────────────────────────────────────
 export const INSULT_PATTERNS: InsultPattern[] = [
