@@ -193,17 +193,21 @@ function buildPrompt(userMessage: string, messages: string[], userInfo: Record<s
         (nameLine ? nameLine + ' ' : '') +
         (extraInfo ? `Other info: ${extraInfo}.` : '');
 
-    const history = messages.slice(-4).join('\n');
+    const MAX_PROMPT = 5000;
 
-    const full = [
+    const buildFull = (hist: string[]) => [
         system,
-        history ? `Conversation so far:\n${history}` : '',
+        hist.length ? `Conversation so far:\n${hist.join('\n')}` : '',
         `User: ${userMessage}`,
         'Bot:'
     ].filter(Boolean).join('\n\n');
 
-    if (full.length > 1300) {
-        return [system, `User: ${userMessage}`, 'Bot:'].join('\n\n');
+    let trimmed = messages.slice(-8);
+    let full = buildFull(trimmed);
+
+    while (full.length > MAX_PROMPT && trimmed.length >= 2) {
+        trimmed = trimmed.slice(2);
+        full = buildFull(trimmed);
     }
 
     return full;

@@ -32,40 +32,57 @@ async function handleLeaveEvent(sock: any, id: any, participants: any) {
             }
 
             let finalMessage;
+            const usePP = customMessage?.includes('{pp}');
+
             if (customMessage) {
                 finalMessage = customMessage
+                    .replace(/{pp}/g, '')
                     .replace(/{user}/g, `@${displayName}`)
-                    .replace(/{group}/g, groupName);
+                    .replace(/{group}/g, groupName)
+                    .trim();
             } else {
                 finalMessage = `*@${displayName}* just left Gist HQ!`;
             }
 
+            let profilePicUrl = `https://img.pyrocdn.com/dbKUgahg.png`;
             try {
-                let profilePicUrl = `https://img.pyrocdn.com/dbKUgahg.png`;
+                const profilePic = await sock.profilePictureUrl(participantString, 'image');
+                if (profilePic) profilePicUrl = profilePic;
+            } catch(profileError: any) {
+                console.log('Could not fetch profile picture, using default');
+            }
+
+            if (usePP) {
                 try {
-                    const profilePic = await sock.profilePictureUrl(participantString, 'image');
-                    if (profilePic) {
-                        profilePicUrl = profilePic;
+                    const ppResponse = await fetch(profilePicUrl);
+                    if (ppResponse.ok) {
+                        const imageBuffer = Buffer.from(await ppResponse.arrayBuffer());
+                        await sock.sendMessage(id, {
+                            image: imageBuffer,
+                            caption: finalMessage,
+                            mentions: [participantString]
+                        });
+                        continue;
                     }
-                } catch(profileError: any) {
-                    console.log('Could not fetch profile picture, using default');
+                } catch(ppError: any) {
+                    console.log('Could not fetch profile picture for {pp}, falling back to text');
                 }
-
-                const apiUrl = `https://api.some-random-api.com/welcome/img/2/gaming1?type=leave&textcolor=red&username=${encodeURIComponent(displayName)}&guildName=${encodeURIComponent(groupName)}&memberCount=${groupMetadata.participants.length}&avatar=${encodeURIComponent(profilePicUrl)}`;
-
-                const response = await fetch(apiUrl);
-                if (response.ok) {
-                    const imageBuffer = Buffer.from(await response.arrayBuffer());
-
-                    await sock.sendMessage(id, {
-                        image: imageBuffer,
-                        caption: finalMessage,
-                        mentions: [participantString]
-                    });
-                    continue;
+            } else {
+                try {
+                    const apiUrl = `https://api.some-random-api.com/welcome/img/2/gaming1?type=leave&textcolor=red&username=${encodeURIComponent(displayName)}&guildName=${encodeURIComponent(groupName)}&memberCount=${groupMetadata.participants.length}&avatar=${encodeURIComponent(profilePicUrl)}`;
+                    const response = await fetch(apiUrl);
+                    if (response.ok) {
+                        const imageBuffer = Buffer.from(await response.arrayBuffer());
+                        await sock.sendMessage(id, {
+                            image: imageBuffer,
+                            caption: finalMessage,
+                            mentions: [participantString]
+                        });
+                        continue;
+                    }
+                } catch(imageError: any) {
+                    console.log('Image generation failed, falling back to text');
                 }
-            } catch(imageError: any) {
-                console.log('Image generation failed, falling back to text');
             }
 
             await sock.sendMessage(id, {
