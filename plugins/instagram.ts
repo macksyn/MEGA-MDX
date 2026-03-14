@@ -89,7 +89,7 @@ export default {
             {
               video: { url },
               mimetype: 'video/mp4',
-              caption: '📥 *Downloaded by MEGA-MD*'
+              caption: '📥 *_Groq™_*'
             },
             { quoted: message }
           );
@@ -98,7 +98,7 @@ export default {
             chatId,
             {
               image: { url },
-              caption: '📥 *Downloaded by MEGA-MD*'
+              caption: '📥 *_Groq™_*'
             },
             { quoted: message }
           );
