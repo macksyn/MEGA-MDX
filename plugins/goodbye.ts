@@ -37,7 +37,7 @@ async function handleLeaveEvent(sock: any, id: any, participants: any) {
                     .replace(/{user}/g, `@${displayName}`)
                     .replace(/{group}/g, groupName);
             } else {
-                finalMessage = `*@${displayName}* we will never miss you!`;
+                finalMessage = `*@${displayName}* just left Gist HQ!`;
             }
 
             try {
