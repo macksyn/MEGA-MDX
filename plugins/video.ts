@@ -87,7 +87,7 @@ export default {
                 video: { url: videoData.downloadUrl },
                 mimetype: 'video/mp4',
                 fileName: `${videoData.title || videoTitle || 'video'}.mp4`,
-                caption: `🎬 *${videoData.title || videoTitle || 'Video'}*\n\n> *_Downloaded by MEGA-MD_*`
+                caption: `🎬 *${videoData.title || videoTitle || 'Video'}*\n\n> *_GROQ™_*`
             }, { quoted: message });
 
         } catch (err: any) {
