@@ -34,7 +34,7 @@ const DETECTORS: Array<{ regex: RegExp; plugin: string }> = [
     { regex: /(?:x\.com|twitter\.com)/i,            plugin: './twitter.js'   },
     { regex: /facebook\.com|fb\.watch/i,            plugin: './facebook.js'  },
     { regex: /instagram\.com|instagr\.am/i,         plugin: './instagram.js' },
-    { regex: /(?:youtube\.com|youtu\.be)/i,          plugin: './song.js'      },
+    { regex: /(?:youtube\.com|youtu\.be)/i,          plugin: './video.js'      },
     { regex: /mega\.nz/i,                           plugin: './mega.js'      },
     { regex: /terabox\.com|1024terabox\.com/i,      plugin: './terabox.js'   },
     { regex: /snapchat\.com|snap\.chat/i,           plugin: './snapchat.js'  },
