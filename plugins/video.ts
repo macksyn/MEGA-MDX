@@ -77,9 +77,8 @@ export default {
             const thumb = videoThumbnail || `https://i.ytimg.com/vi/${ytId}/sddefault.jpg`;
 
             await sock.sendMessage(chatId, {
-                image: { url: thumb },
-                caption: `🎬 *${videoTitle || query}*\n⬇️ Downloading... *(may take up to 30s)*`
-            }, { quoted: message });
+        react: { text: '⏳', key: message.key }
+      });
 
             const videoData = await downloadWithRetry(videoUrl);
 
