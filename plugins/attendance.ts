@@ -1,10 +1,7 @@
 // @ts-nocheck
 // plugins/attendance.ts - MEGA-MD Attendance System
 
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-
-const moment       = require('moment-timezone');
+import moment from 'moment-timezone';
 import isAdmin       from '../lib/isAdmin.js';
 import isOwnerOrSudo from '../lib/isOwner.js';
 import { createStore } from '../lib/pluginStore.js';

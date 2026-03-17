@@ -1,11 +1,10 @@
 import type { BotContext } from '../types.js';
 import config from '../config.js';
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
 import { exec } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import https from 'https';
+import http from 'http';
 
 function run(cmd: string) {
   return new Promise((resolve, reject) => {
@@ -48,7 +47,6 @@ function downloadFile(url: string, dest: string, visited: Set<string> = new Set(
       visited.add(url);
 
       const useHttps = url.startsWith('https://');
-      const http = require('http');
       const client: any = useHttps ? https : http;
       const req = client.get(url, {
         headers: {

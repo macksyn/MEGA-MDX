@@ -1,10 +1,7 @@
 // plugins/birthday.ts
 
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-
-const cron     = require('node-cron');
-const moment   = require('moment-timezone');
+import cron   from 'node-cron';
+import moment from 'moment-timezone';
 
 import { printLog }   from '../lib/print.js';
 import isOwnerOrSudo  from '../lib/isOwner.js';
