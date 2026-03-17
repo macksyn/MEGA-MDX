@@ -374,6 +374,13 @@ async function handleMessages(sock: any, messageUpdate: any) {
             } catch (e: any) {
                 printLog('error', `[ACTIVITY] Tracking error: ${e.message}`);
             }
+
+            try {
+                const { trackInactivity } = await import('../plugins/inactive.js');
+                await trackInactivity(message);
+            } catch (e: any) {
+                printLog('error', `[INACTIVE] Tracking error: ${e.message}`);
+            }
         }
 
         if (isGroup) {

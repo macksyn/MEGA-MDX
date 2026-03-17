@@ -16,6 +16,7 @@ import isAdmin             from '../lib/isAdmin.js';
 import isOwnerOrSudo       from '../lib/isOwner.js';
 import { printLog }        from '../lib/print.js';
 import config              from '../config.js';
+import cron                from 'node-cron';
 
 // ── Storage ───────────────────────────────────────────────────────────────────
 // Tables created automatically by pluginStore on first access.
@@ -590,12 +591,26 @@ export async function trackInactivity(message: any): Promise<void> {
 }
 
 // ── Scheduler export ──────────────────────────────────────────────────────────
-// Wire this into your scheduler / startSchedulerEngine the same way other
-// timed jobs are registered — or call it directly from index.ts on connect.
 
 export async function runInactivityScheduler(sock: any): Promise<void> {
     printLog('info', '[INACTIVE] ⏰ Running scheduled inactivity check...');
     await checkInactiveUsers(sock);
+}
+
+// ── onLoad — sets up daily cron job ──────────────────────────────────────────
+
+let inactivitySchedulerStarted = false;
+
+export async function onLoad(sock: any): Promise<void> {
+    if (inactivitySchedulerStarted) return;
+    inactivitySchedulerStarted = true;
+
+    // Run daily at 10:00 AM Lagos time
+    cron.schedule('0 10 * * *', () => runInactivityScheduler(sock), {
+        timezone: 'Africa/Lagos'
+    });
+
+    printLog('info', '[INACTIVE] ⏰ Daily inactivity scheduler started (10:00 AM WAT)');
 }
 
 // ── Plugin export ─────────────────────────────────────────────────────────────
@@ -683,6 +698,7 @@ export default {
     },
 
     // Expose for external wiring
+    onLoad,
     trackInactivity,
     runInactivityScheduler,
     checkInactiveUsers,
