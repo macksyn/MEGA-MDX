@@ -10,7 +10,7 @@ const config = {
     author:      process.env.AUTHOR        || 'Alex Macksyn',
     packname:    process.env.PACKNAME      || 'GROQ-AI',
     description: process.env.DESCRIPTION  || 'High performance multi-device WhatsApp bot',
-    version:     '6.0.0',
+    version:     '6.0.1',
 
     // Bot Config
     prefixes:    _prefixes,
