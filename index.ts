@@ -448,6 +448,12 @@ async function startQasimDev(): Promise<any> {
                 printLog('success', 'Bot connected successfully!');
 
                 try {
+                    await commandHandler.runOnLoad(QasimDev);
+                } catch (e: any) {
+                    printLog('error', `Failed to run plugin onLoad hooks: ${e.message}`);
+                }
+
+                try {
                     const setbioModule = await import('./plugins/setbio.js');
                     const startAutoBio = setbioModule.startAutoBio || (setbioModule.default as any)?.startAutoBio;
                     if (typeof startAutoBio === 'function') startAutoBio(QasimDev);
