@@ -170,6 +170,25 @@ function extractUserInfo(message: string) {
     return info;
 }
 
+// ── Live query detector ───────────────────────────────────────────────────────
+
+function requiresLiveData(message: string): boolean {
+    const lower = message.toLowerCase();
+    const livePatterns = [
+        // Sports
+        /\b(playing|match|game|score|fixture|result|vs\.?|versus|kickoff|kick.off|lineup|squad|today.s (game|match|fixture))\b/,
+        // Time-sensitive
+        /\b(today|tonight|right now|current(ly)?|live|latest|just now|this (week|month|season))\b/,
+        // News & prices
+        /\b(news|headline|price|stock|weather|forecast|transfer|announce(d|ment)?|winner|champion)\b/,
+        // Explicit search cues
+        /\b(who is|who are|what is|what are|when is|when did|did .+ (win|lose|score|play))\b/,
+        // Sports entities
+        /\b(psg|chelsea|arsenal|barcelona|real madrid|man (city|utd|united)|liverpool|champions league|premier league|laliga|serie a|bundesliga|nba|nfl|nhl|uefa|fifa)\b/i
+    ];
+    return livePatterns.some(p => p.test(lower));
+}
+
 // ── Prompt builder ────────────────────────────────────────────────────────────
 
 function buildPrompt(userMessage: string, messages: string[], userInfo: Record<string, any>): string {
@@ -184,15 +203,21 @@ function buildPrompt(userMessage: string, messages: string[], userInfo: Record<s
         info.location ? `location: ${info.location}` : ''
     ].filter(Boolean).join(', ');
 
+    // ── Detect if this needs a live web lookup ────────────────────────────────
+    const needsWeb = requiresLiveData(userMessage);
+    const webInstruction = needsWeb
+        ? 'IMPORTANT: This question requires current real-time information, search the web RIGHT NOW for the answer before responding. Do not guess. Always convert any times to WAT (West Africa Time, UTC+1) — the user is in Nigeria. Never give times in GMT or UTC unless explicitly asked. '
+        : '';
+    
     const system =
         'You are an intellectual human in GHQ WhatsApp group. Name: Groq. 1-4 lines, emojis ok. ' +
-        'You live in Lagos, Nigeria. The user is in Nigeria (WAT, UTC+1). Always give times in WAT. ' +
-        'If you are being asked questions requiring current real-time information, search the web for the answer before responding. Never guess.  ' +
+        'You live in Lagos, Nigeria. The user is in Nigeria (WAT, UTC+1). Always give times in WAT— never in GMT or UTC. ' +
         'Match the energy of whoever you\'re talking to — chill and warm for greetings, ' +
         'Sacarstic when they\'re joking, savage when they\'re rude, supportive when they\'re down. ' +
         'Never force humour. Never admit being AI or robot. ' +
         (nameLine ? nameLine + ' ' : '') +
-        (extraInfo ? `Other info: ${extraInfo}.` : '');
+        (extraInfo ? `Other info: ${extraInfo}.` : ''); +
+        webInstruction;
 
     const history = messages.slice(-4).join('\n');
 
