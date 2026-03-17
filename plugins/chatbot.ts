@@ -134,62 +134,6 @@ async function saveUserGroupData(data: any) {
     }
 }
 
-// ── Live query detection ──────────────────────────────────────────────────────
-
-const LIVE_PATTERNS = [
-    /\b(today|tonight|right now|currently|at the moment|this (morning|afternoon|evening|week|month))\b/i,
-    /\b(score|scores|scoreline|result|results|fixture|fixtures|standings?|table)\b/i,
-    /\b(playing|vs\.?|versus|match|matches|game|games|kickoff|kick[- ]off|line[- ]?up)\b/i,
-    /\b(latest|breaking|recent news|just (happened|announced|released|dropped))\b/i,
-    /\b(weather|temperature|forecast|chance of rain|how hot|how cold)\b/i,
-    /\b(price|how much (is|does|are)|current (rate|price|cost)|exchange rate|dollar|naira|pound|euro)\b/i,
-    /\b(stock|crypto|bitcoin|btc|eth|ethereum|coin)\b/i,
-    /\b(who (won|scored|leads?|is winning|is playing|are playing))\b/i,
-    /\b(what('?s| is) the (score|result|time|date|news|latest))\b/i,
-    /\b(news about|update on|what happened (to|with|in))\b/i,
-];
-
-function needsLiveData(message: string): boolean {
-    return LIVE_PATTERNS.some(p => p.test(message));
-}
-
-// ── Web search (DuckDuckGo — no API key needed) ───────────────────────────────
-
-async function fetchLiveContext(query: string): Promise<string | null> {
-    try {
-        const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1&t=groqbot`;
-        const ctrl = new AbortController();
-        const tid  = setTimeout(() => ctrl.abort(), 7000);
-
-        const res = await fetch(url, {
-            signal:  ctrl.signal,
-            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; GroqBot/1.0)' }
-        });
-        clearTimeout(tid);
-
-        if (!res.ok) return null;
-
-        const data = await res.json() as any;
-
-        // Prefer direct Answer > AbstractText > top RelatedTopics snippets
-        const parts: string[] = [];
-
-        if (data?.Answer)       parts.push(data.Answer);
-        if (data?.AbstractText) parts.push(data.AbstractText);
-
-        if (!parts.length && Array.isArray(data?.RelatedTopics)) {
-            for (const t of data.RelatedTopics.slice(0, 3)) {
-                if (t?.Text) parts.push(t.Text);
-            }
-        }
-
-        const result = parts.join(' ').trim();
-        return result.length > 20 ? result : null;
-    } catch {
-        return null;
-    }
-}
-
 // ── Typing indicator ──────────────────────────────────────────────────────────
 
 async function showTyping(sock: any, chatId: string, estimatedResponseLength = 80) {
@@ -228,12 +172,7 @@ function extractUserInfo(message: string) {
 
 // ── Prompt builder ────────────────────────────────────────────────────────────
 
-function buildPrompt(
-    userMessage: string,
-    messages: string[],
-    userInfo: Record<string, any>,
-    liveContext?: string | null
-): string {
+function buildPrompt(userMessage: string, messages: string[], userInfo: Record<string, any>): string {
     const info = userInfo || {};
 
     const nameLine = info.name
@@ -246,39 +185,27 @@ function buildPrompt(
     ].filter(Boolean).join(', ');
 
     const system =
-        'You are a casual tech-savvy educated human in GHQ WhatsApp group. Name: Groq. 1-4 lines, emojis ok. ' +
-        'You live in Lagos' +
+        'You are a casual human in GHQ WhatsApp group. Name: Groq. 1-4 lines, emojis ok. ' +
+        'CRITICAL: Always reply in the EXACT same language or dialect the user writes in. ' +
+        'If they write standard English, reply in standard English. ' +
+        'You are from Lagos, but lives in Miami, US.' +
         'Match the energy of whoever you\'re talking to — chill and warm for greetings, ' +
         'Sacarstic when they\'re joking, savage when they\'re rude, supportive when they\'re down. ' +
         'Never force humour. Never admit being AI or robot. ' +
         (nameLine ? nameLine + ' ' : '') +
         (extraInfo ? `Other info: ${extraInfo}.` : '');
 
-    // liveContext === undefined  → not a live query, no note added
-    // liveContext === null       → live query but search found nothing → warn AI
-    // liveContext === string     → live query with real data → inject it
-    const liveNote = liveContext !== undefined
-        ? (liveContext
-            ? `[LIVE WEB DATA — use this to answer accurately, do not ignore it]\n${liveContext}`
-            : 'Note: The user is asking about something that likely needs real-time data. You don\'t have access to live info right now — say you\'re not sure naturally instead of guessing specifics.')
-        : '';
+    const history = messages.slice(-4).join('\n');
 
-    const MAX_PROMPT = 5000;
-
-    const buildFull = (hist: string[]) => [
+    const full = [
         system,
-        liveNote,
-        hist.length ? `Conversation so far:\n${hist.join('\n')}` : '',
+        history ? `Conversation so far:\n${history}` : '',
         `User: ${userMessage}`,
         'Bot:'
     ].filter(Boolean).join('\n\n');
 
-    let trimmed = messages.slice(-8);
-    let full = buildFull(trimmed);
-
-    while (full.length > MAX_PROMPT && trimmed.length >= 2) {
-        trimmed = trimmed.slice(2);
-        full = buildFull(trimmed);
+    if (full.length > 1300) {
+        return [system, `User: ${userMessage}`, 'Bot:'].join('\n\n');
     }
 
     return full;
@@ -288,9 +215,9 @@ function buildPrompt(
 
 async function getAIResponse(
     userMessage: string,
-    userContext: { messages: string[]; userInfo: Record<string, any>; liveContext?: string | null }
+    userContext: { messages: string[]; userInfo: Record<string, any> }
 ): Promise<string | null> {
-    const prompt = buildPrompt(userMessage, userContext.messages, userContext.userInfo, userContext.liveContext);
+    const prompt = buildPrompt(userMessage, userContext.messages, userContext.userInfo);
 
     for (const api of API_ENDPOINTS) {
         try {
@@ -474,21 +401,9 @@ export async function handleChatbotResponse(
 
             await saveProfile(senderId, profile);
 
-            // ── LIVE DATA CHECK ───────────────────────────────────────────
-            // undefined = not a live question (no note in prompt)
-            // null      = live question but search returned nothing (warn AI)
-            // string    = live question with real data found (inject into prompt)
-            let liveContext: string | null | undefined;
-            if (needsLiveData(cleanedMessage)) {
-                console.log(`[CHATBOT] Live query detected — fetching web data...`);
-                liveContext = await fetchLiveContext(cleanedMessage);
-                console.log(`[CHATBOT] Live context: ${liveContext ? liveContext.slice(0, 80) + '...' : 'none found'}`);
-            }
-
             const response = await getAIResponse(cleanedMessage, {
                 messages,
-                userInfo: profile,
-                liveContext
+                userInfo: profile
             });
 
             if (!response) {
