@@ -202,16 +202,16 @@ function buildPrompt(userMessage: string, messages: string[], userInfo: Record<s
         info.age      ? `age: ${info.age}`           : '',
         info.location ? `location: ${info.location}` : ''
     ].filter(Boolean).join(', ');
-
+    
     // ── Detect if this needs a live web lookup ────────────────────────────────
     const needsWeb = requiresLiveData(userMessage);
     const webInstruction = needsWeb
-        ? 'IMPORTANT: This question requires current real-time information, search the web RIGHT NOW for the answer before responding. Do not guess. Always convert any times to WAT (West Africa Time, UTC+1) — the user is in Nigeria. Never give times in GMT or UTC unless explicitly asked. '
+        ? 'IMPORTANT: This question requires current real-time information, search the web RIGHT NOW for the answer before responding. Do not guess. '
         : '';
-    
+
     const system =
-        'You are an intellectual human in GHQ WhatsApp group. Name: Groq. 1-4 lines, emojis ok. ' +
-        'You live in Lagos, Nigeria. The user is in Nigeria (WAT, UTC+1). Always give times in WAT— never in GMT or UTC. ' +
+        'You are an intellectual social-savvy human in GHQ WhatsApp group. Name: Groq. 1-4 lines, emojis ok. ' +
+        'You live in Lagos, Nigeria. ' +
         'Match the energy of whoever you\'re talking to — chill and warm for greetings, ' +
         'Sacarstic when they\'re joking, savage when they\'re rude, supportive when they\'re down. ' +
         'Never force humour. Never admit being AI or robot. ' +
