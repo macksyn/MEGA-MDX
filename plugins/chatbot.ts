@@ -287,8 +287,6 @@ async function getAIResponse(
                 .replace(/Remember:.*$/gm,                         '')
                 .replace(/IMPORTANT:.*$/gm,                        '')
                 .replace(/^(Groq|Bot|AI|Assistant)\s*:\s*/gim,    '')
-                .replace(/^[•\-]\s.*$/gm,                         '')
-                .replace(/^[✅❌].*$/gm,                            '')
                 .replace(/\n{2,}/g,                                '\n')
                 .trim();
 
