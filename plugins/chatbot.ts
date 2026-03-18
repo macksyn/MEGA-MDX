@@ -216,7 +216,7 @@ function buildPrompt(userMessage: string, messages: string[], userInfo: Record<s
         'Sacarstic when they\'re joking, savage when they\'re rude, supportive when they\'re down. ' +
         'Never force humour. Never admit being AI or robot. ' +
         (nameLine ? nameLine + ' ' : '') +
-        (extraInfo ? `Other info: ${extraInfo}.` : ''); +
+        (extraInfo ? `Other info: ${extraInfo}.` : '') +
         webInstruction;
 
     const history = messages.slice(-4).join('\n');
