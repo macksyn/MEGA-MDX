@@ -642,10 +642,10 @@ export async function handleInactiveReply(sock: any, message: any): Promise<bool
         if (!chatId || chatId.endsWith('@g.us')) return false;
         if (message.key?.fromMe) return false;
 
-        const senderId = message.key?.remoteJid;
-        if (!senderId) return false;
-
-        const pending = await dbReplies.get(senderId) as PendingReply | null;
+        // In a private DM, remoteJid equals the member's user JID —
+        // the same value used as the key when writing to dbReplies in checkInactiveUsers.
+        const userId  = chatId;
+        const pending = await dbReplies.get(userId) as PendingReply | null;
         if (!pending) return false;
 
         const userMessage = (
@@ -663,7 +663,7 @@ export async function handleInactiveReply(sock: any, message: any): Promise<bool
                 await sock.sendMessage(chatId, {
                     text: `Got it. I've quietly let the admins know. Hopefully someone will reach out to you soon. 💙`,
                 });
-                const userName = await getUserName(sock, senderId);
+                const userName = await getUserName(sock, chatId);
                 await alertAdmins(
                     sock, pending,
                     pending.originalMsg ?? '',
@@ -671,12 +671,12 @@ export async function handleInactiveReply(sock: any, message: any): Promise<bool
                     'Member consented to admin notification after indicating group discomfort.',
                     'conflict',
                 );
-                await dbReplies.del(senderId);
+                await dbReplies.del(userId);
             } else if (consent === 'no') {
                 await sock.sendMessage(chatId, {
                     text: `Understood, no worries. Your reply stays between us. Take care of yourself. 🙏`,
                 });
-                await dbReplies.del(senderId);
+                await dbReplies.del(userId);
             } else {
                 // Ambiguous — ask once more
                 await sock.sendMessage(chatId, {
@@ -690,7 +690,7 @@ export async function handleInactiveReply(sock: any, message: any): Promise<bool
 
         // ── Stage: boring follow-up — collecting specific feedback ────────────
         if (pending.stage === 'boring_followup') {
-            await dbReplies.set(senderId, {
+            await dbReplies.set(userId, {
                 ...pending,
                 stage:        'boring_consent',
                 boringDetail: userMessage,
@@ -719,7 +719,7 @@ export async function handleInactiveReply(sock: any, message: any): Promise<bool
                         `Hopefully the admins can use it to make things better. ` +
                         `Come back whenever you feel like it — the group will be here. 😊`,
                 });
-                const userName = await getUserName(sock, senderId);
+                const userName = await getUserName(sock, chatId);
                 await alertAdmins(
                     sock, pending,
                     pending.boringDetail ?? pending.originalMsg ?? '',
@@ -727,12 +727,12 @@ export async function handleInactiveReply(sock: any, message: any): Promise<bool
                     'Member shared specific feedback about group engagement.',
                     'boring',
                 );
-                await dbReplies.del(senderId);
+                await dbReplies.del(userId);
             } else if (consent === 'no') {
                 await sock.sendMessage(chatId, {
                     text: `No worries at all — it stays between us. Thanks for being honest either way. 💙`,
                 });
-                await dbReplies.del(senderId);
+                await dbReplies.del(userId);
             } else {
                 // Ambiguous — ask once more
                 await sock.sendMessage(chatId, {
@@ -745,7 +745,7 @@ export async function handleInactiveReply(sock: any, message: any): Promise<bool
         }
 
         // ── Stage: initial — first reply to the inactivity DM ────────────────
-        printLog('info', `[INACTIVE] Reply from ${senderId.split('@')[0]} — classifying...`);
+        printLog('info', `[INACTIVE] Reply from ${chatId.split('@')[0]} — classifying...`);
         const { category, reasoning } = await classifyReply(userMessage);
         printLog('info', `[INACTIVE] Classified as "${category}": ${reasoning}`);
 
@@ -753,14 +753,14 @@ export async function handleInactiveReply(sock: any, message: any): Promise<bool
         await sock.sendMessage(chatId, { text: botReply });
 
         if (category === 'serious') {
-            const userName = await getUserName(sock, senderId);
+            const userName = await getUserName(sock, chatId);
             await alertAdmins(sock, pending, userMessage, userName, reasoning, 'serious');
-            await resetUserActivity(pending.groupId, senderId);
-            await dbReplies.del(senderId);
+            await resetUserActivity(pending.groupId, chatId);
+            await dbReplies.del(userId);
 
         } else if (category === 'conflict') {
             // Move to consent stage — keep pending state
-            await dbReplies.set(senderId, {
+            await dbReplies.set(userId, {
                 ...pending,
                 stage:       'conflict_consent',
                 originalMsg: userMessage,
@@ -768,12 +768,12 @@ export async function handleInactiveReply(sock: any, message: any): Promise<bool
 
         } else if (category === 'exams') {
             // Reset so they get a fresh cycle after exams — no admin alert needed
-            await resetUserActivity(pending.groupId, senderId);
-            await dbReplies.del(senderId);
+            await resetUserActivity(pending.groupId, chatId);
+            await dbReplies.del(userId);
 
         } else if (category === 'boring') {
             // Move to follow-up stage to get specific feedback
-            await dbReplies.set(senderId, {
+            await dbReplies.set(userId, {
                 ...pending,
                 stage:       'boring_followup',
                 originalMsg: userMessage,
@@ -781,12 +781,12 @@ export async function handleInactiveReply(sock: any, message: any): Promise<bool
             // botReply already sent above — it contains the follow-up question
 
         } else if (category === 'returning') {
-            await resetUserActivity(pending.groupId, senderId);
-            await dbReplies.del(senderId);
+            await resetUserActivity(pending.groupId, chatId);
+            await dbReplies.del(userId);
 
         } else {
             // casual / unknown — warm reply already sent, clear state
-            await dbReplies.del(senderId);
+            await dbReplies.del(userId);
         }
 
         return true;
@@ -903,7 +903,9 @@ async function cmdMsg(sock: any, chatId: string, message: any, senderId: string,
 
     if (!newMsg.includes('{user}') && !newMsg.includes('{groupName}')) {
         await sock.sendMessage(chatId, {
-            text: '⚠️ Tip: no variables detected. Add {user} or {groupName} to personalise the message.'
+            text:
+                `✅ DM message saved!\n\n` +
+                `⚠️ Tip: no variables detected. Add *{user}* or *{groupName}* to personalise each message.`,
         }, { quoted: message });
         return;
     }
@@ -1157,7 +1159,7 @@ export default {
 
             case 'excludeadmins': {
                 const state = subArgs[0]?.toLowerCase();
-                if (!['on', 'off'].includes(state)) {
+                if (!state || !['on', 'off'].includes(state)) {
                     await sock.sendMessage(chatId, {
                         text: `⚠️ Usage: ${config.prefixes[0]}inactive excludeadmins on/off`
                     }, { quoted: message });
@@ -1193,7 +1195,7 @@ export default {
                 }, { quoted: message });
         }
     },
-==
+
     // Exposed for external wiring and testing
     onLoad,
     trackInactivity,
