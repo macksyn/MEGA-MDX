@@ -301,7 +301,7 @@ Respond with exactly: {"category":"<one of the seven>","reasoning":"<one short s
 
         if (!response.ok) throw new Error(`API ${response.status}`);
 
-        const data   = await response.json();
+        const data   = await response.json() as { content?: { text?: string }[] };
         const raw    = data.content?.[0]?.text?.trim() ?? '';
         const parsed = JSON.parse(raw) as ClassifiedReply;
 
@@ -345,7 +345,7 @@ Classify their reply as consent (yes), refusal (no), or unclear (unknown).`,
 
         if (!response.ok) throw new Error(`API ${response.status}`);
 
-        const data   = await response.json();
+        const data   = await response.json() as { content?: { text?: string }[] };
         const result = data.content?.[0]?.text?.trim().toLowerCase();
 
         if (result === 'yes' || result === 'no') return result;
@@ -386,7 +386,7 @@ Rules:
 
         if (!response.ok) throw new Error(`API ${response.status}`);
 
-        const data = await response.json();
+        const data = await response.json() as { content?: { text?: string }[] };
         return data.content?.[0]?.text?.trim() ?? 'A member shared feedback about group engagement.';
     } catch (error: any) {
         printLog('error', `[INACTIVE] summarizeFeedback failed: ${error.message}`);
