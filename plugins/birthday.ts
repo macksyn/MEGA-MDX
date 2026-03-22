@@ -82,6 +82,7 @@ const dbRemindersLog = db.table!('reminders_log');
 
 let birthdaySettings: BirthdaySettings = { ...DEFAULT_SETTINGS, loaded: false };
 let schedulerStarted  = false;
+let busListenerRegistered = false;
 const cronJobs        = new Map<string, any>();
 const lastSchedulerRun: Record<string, boolean> = {};
 
@@ -496,25 +497,30 @@ async function onLoad(sock: any): Promise<void> {
   await loadSettings();
   await runMissedTasks(sock);
 
-  bus.on('attendance:birthday', async (payload: any) => {
-    try {
-      const { userId, name, birthdayData } = payload;
-      if (!birthdayData?.displayDate) {
-        printLog('warning', '[BIRTHDAY] Invalid birthday data received from attendance');
-        return;
-      }
-      const success = await saveBirthdayData(userId, name, birthdayData.displayDate);
-      if (success) {
-        printLog('success', `[BIRTHDAY] 🎂 Auto-saved from attendance → ${name} (${birthdayData.displayDate})`);
-      } else {
-        printLog('warning', `[BIRTHDAY] Failed to save birthday from attendance for ${name}`);
-      }
-    } catch (err: any) {
-      printLog('error', `[BIRTHDAY] Event handler error: ${err.message}`);
-    }
-  });
+  // ← WRAP WITH GUARD
+  if (!busListenerRegistered) {
+    busListenerRegistered = true;
 
-  printLog('info', '[BIRTHDAY] ✅ Now listening for attendance:birthday events');
+    bus.on('attendance:birthday', async (payload: any) => {
+      try {
+        const { userId, name, birthdayData } = payload;
+        if (!birthdayData?.displayDate) {
+          printLog('warning', '[BIRTHDAY] Invalid birthday data received from attendance');
+          return;
+        }
+        const success = await saveBirthdayData(userId, name, birthdayData.displayDate);
+        if (success) {
+          printLog('success', `[BIRTHDAY] 🎂 Auto-saved from attendance → ${name} (${birthdayData.displayDate})`);
+        } else {
+          printLog('warning', `[BIRTHDAY] Failed to save birthday from attendance for ${name}`);
+        }
+      } catch (err: any) {
+        printLog('error', `[BIRTHDAY] Event handler error: ${err.message}`);
+      }
+    });
+
+    printLog('info', '[BIRTHDAY] ✅ Now listening for attendance:birthday events');
+  }
 
   try {
     startScheduler(sock);
