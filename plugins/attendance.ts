@@ -754,14 +754,6 @@ const attendancePlugin = {
     console.log('[ATTENDANCE] Plugin loaded.');
   },
 
-  // onMessage kept for forward compatibility if pluginLoader gets wired into
-  // messageHandler.ts in future. Auto-detection currently runs via the direct
-  // handleAutoAttendance import added to messageHandler.ts (see note below).
-  async onMessage(sock: any, message: any, _context: any): Promise<void> {
-    if (!attendanceSettings.autoDetection) return;
-    await handleAutoAttendance(message, sock);
-  },
-
   async handler(sock: any, message: any, args: string[], context: any): Promise<void> {
     const chatId   = context.chatId || message.key.remoteJid;
     const senderId = message.key.participant || message.key.remoteJid;
