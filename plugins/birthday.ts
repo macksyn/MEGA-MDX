@@ -81,9 +81,14 @@ const dbRemindersLog = db.table!('reminders_log');
 // ── State ─────────────────────────────────────────────────────────────────────
 
 let birthdaySettings: BirthdaySettings = { ...DEFAULT_SETTINGS, loaded: false };
-let schedulerStarted  = false;
+let schedulerStarted      = false;
 let busListenerRegistered = false;
-const cronJobs        = new Map<string, any>();
+
+// FIX 1: mutable socket reference so cron closures always use the live socket
+// after any reconnect, instead of capturing the startup socket forever.
+let currentSock: any = null;
+
+const cronJobs             = new Map<string, any>();
 const lastSchedulerRun: Record<string, boolean> = {};
 
 // ── Settings persistence ──────────────────────────────────────────────────────
@@ -206,6 +211,7 @@ async function getTodaysBirthdays(): Promise<BirthdayDoc[]> {
   }
 }
 
+// Used by the reminder/wishes scheduler — exact day match (correct behaviour).
 async function getUpcomingBirthdays(daysAhead: number): Promise<BirthdayDoc[]> {
   try {
     const target    = moment.tz(TIMEZONE).add(daysAhead, 'days');
@@ -215,6 +221,32 @@ async function getUpcomingBirthdays(daysAhead: number): Promise<BirthdayDoc[]> {
   } catch {
     return [];
   }
+}
+
+// FIX 2: range-based count for display purposes (status command).
+// getUpcomingBirthdays() does an exact-day match, so at 10am on the 22nd
+// a birthday on the 26th counts as "4 days away" not "3 days away", causing
+// the status counts to disagree with .birthday upcoming. This helper uses
+// the same range logic as .birthday upcoming so both displays agree.
+function countBirthdaysWithinDays(allBdays: Record<string, BirthdayDoc>, days: number): number {
+  const now = moment.tz(TIMEZONE);
+  return Object.values(allBdays).filter(entry => {
+    const b        = entry.birthday;
+    const nextBday = moment.tz({ year: now.year(), month: b.month - 1, date: b.day }, TIMEZONE);
+    if (nextBday.isBefore(now, 'day')) nextBday.add(1, 'year');
+    const daysUntil = nextBday.diff(now, 'days');
+    return daysUntil >= 0 && daysUntil <= days;
+  }).length;
+}
+
+function countBirthdaysExactDay(allBdays: Record<string, BirthdayDoc>, daysAhead: number): number {
+  const now = moment.tz(TIMEZONE);
+  return Object.values(allBdays).filter(entry => {
+    const b        = entry.birthday;
+    const nextBday = moment.tz({ year: now.year(), month: b.month - 1, date: b.day }, TIMEZONE);
+    if (nextBday.isBefore(now, 'day')) nextBday.add(1, 'year');
+    return nextBday.diff(now, 'days') === daysAhead;
+  }).length;
 }
 
 // ── Wish/reminder log helpers ─────────────────────────────────────────────────
@@ -447,8 +479,14 @@ async function runBirthdayReminders(sock: any, daysAhead: number): Promise<void>
 
 // ── node-cron scheduler ───────────────────────────────────────────────────────
 
+// FIX 1 (continued): startScheduler always updates currentSock so reconnects
+// don't leave cron closures holding a dead socket. Cron jobs are only
+// registered once (schedulerStarted guard), but the live socket reference
+// is refreshed on every call.
 function startScheduler(sock: any): void {
-  if (schedulerStarted) return;
+  currentSock = sock; // always update — handles reconnects
+
+  if (schedulerStarted) return; // register crons only once
   schedulerStarted = true;
 
   const [wishH, wishM] = birthdaySettings.wishTime.split(':').map(Number);
@@ -456,13 +494,13 @@ function startScheduler(sock: any): void {
 
   cronJobs.set('wishes', cron.schedule(
     `${wishM} ${wishH} * * *`,
-    () => runBirthdayWishes(sock),
+    () => runBirthdayWishes(currentSock), // uses live reference, not closed-over sock
     { timezone: TIMEZONE }
   ));
   cronJobs.set('reminders', cron.schedule(
     `${remM} ${remH} * * *`,
     async () => {
-      for (const days of birthdaySettings.reminderDays) await runBirthdayReminders(sock, days);
+      for (const days of birthdaySettings.reminderDays) await runBirthdayReminders(currentSock, days);
     },
     { timezone: TIMEZONE }
   ));
@@ -472,6 +510,8 @@ function startScheduler(sock: any): void {
 }
 
 async function runMissedTasks(sock: any): Promise<void> {
+  currentSock = sock; // keep in sync here too
+
   const today       = moment.tz(TIMEZONE).format('YYYY-MM-DD');
   const currentTime = moment.tz(TIMEZONE).format('HH:mm');
 
@@ -497,7 +537,6 @@ async function onLoad(sock: any): Promise<void> {
   await loadSettings();
   await runMissedTasks(sock);
 
-  // ← WRAP WITH GUARD
   if (!busListenerRegistered) {
     busListenerRegistered = true;
 
@@ -563,8 +602,8 @@ async function handleMyBirthday(sock: any, message: any, senderId: string, chatI
       text: `🎂 *No Birthday Recorded*\n\nYour birthday hasn't been saved yet.\n\n💡 It is saved automatically when you submit an attendance form with your D.O.B.`
     }, { quoted: message });
   }
-  const b       = data.birthday;
-  const now     = moment.tz(TIMEZONE);
+  const b        = data.birthday;
+  const now      = moment.tz(TIMEZONE);
   const nextBday = moment.tz({ year: now.year(), month: b.month - 1, date: b.day }, TIMEZONE);
   if (nextBday.isBefore(now, 'day')) nextBday.add(1, 'year');
   const daysUntil = nextBday.diff(now, 'days');
@@ -572,7 +611,7 @@ async function handleMyBirthday(sock: any, message: any, senderId: string, chatI
   let msg = `🎂 *Your Birthday Information* 🎂\n\n`;
   msg    += `👤 Name: ${data.name}\n`;
   msg    += `📅 Birthday: ${b.displayDate}\n`;
-  if (b.year)     msg += `📊 Year: ${b.year}\n`;
+  if (b.year)        msg += `📊 Year: ${b.year}\n`;
   if (b.age != null) msg += `🎈 Current Age: ${b.age} years old\n`;
   msg    += `💾 Last Updated: ${new Date(data.lastUpdated).toLocaleString('en-NG', { timeZone: TIMEZONE })}\n\n`;
 
@@ -704,18 +743,27 @@ async function handleAll(sock: any, message: any, chatId: string, senderId: stri
   await sock.sendMessage(chatId, { text: msg, mentions }, { quoted: message });
 }
 
+// FIX 2 (continued): status command now uses range-based counts (same logic as
+// .birthday upcoming) so the numbers agree with what the user sees there.
 async function handleBirthdayStatus(sock: any, message: any, chatId: string): Promise<void> {
   await loadSettings();
-  const [todayList, upcoming1, upcoming3, upcoming7, allBdays] = await Promise.all([
-    getTodaysBirthdays(), getUpcomingBirthdays(1), getUpcomingBirthdays(3),
-    getUpcomingBirthdays(7), getAllBirthdays()
-  ]);
-  const now = moment.tz(TIMEZONE);
-  let msg   = `📊 *BIRTHDAY SYSTEM STATUS* 📊\n\n`;
+  const allBdays = await getAllBirthdays();
+  const now      = moment.tz(TIMEZONE);
+
+  const todayKey     = `${String(now.month() + 1).padStart(2, '0')}-${String(now.date()).padStart(2, '0')}`;
+  const todayCount   = Object.values(allBdays).filter(b => b.birthday?.searchKey === todayKey).length;
+  const tomorrowCount = countBirthdaysExactDay(allBdays, 1);
+  const next3Count    = countBirthdaysWithinDays(allBdays, 3);
+  const next7Count    = countBirthdaysWithinDays(allBdays, 7);
+
+  let msg = `📊 *BIRTHDAY SYSTEM STATUS* 📊\n\n`;
   msg += `⏰ Time (WAT): ${now.format('YYYY-MM-DD HH:mm:ss')}\n`;
   msg += `🤖 Scheduler: ${schedulerStarted ? '✅ Running' : '⚠️ Not started'}\n\n`;
   msg += `📊 *Registered:* ${Object.keys(allBdays).length}\n`;
-  msg += `• Today: ${todayList.length}\n• Tomorrow: ${upcoming1.length}\n• Next 3 days: ${upcoming3.length}\n• Next 7 days: ${upcoming7.length}\n\n`;
+  msg += `• Today: ${todayCount}\n`;
+  msg += `• Tomorrow: ${tomorrowCount}\n`;
+  msg += `• Next 3 days: ${next3Count}\n`;
+  msg += `• Next 7 days: ${next7Count}\n\n`;
   msg += `⚙️ *Settings:*\n`;
   msg += `• Auto Wishes: ${birthdaySettings.enableAutoWishes ? '✅' : '❌'} at ${birthdaySettings.wishTime}\n`;
   msg += `• Reminders: ${birthdaySettings.enableReminders ? '✅' : '❌'} at ${birthdaySettings.reminderTime}\n`;
@@ -813,8 +861,8 @@ async function handleForce(sock: any, message: any, chatId: string, senderId: st
 }
 
 async function showSettingsMenu(sock: any, message: any, chatId: string): Promise<void> {
-  const s   = birthdaySettings;
-  let msg   = `⚙️ *BIRTHDAY SETTINGS* ⚙️\n\n`;
+  const s = birthdaySettings;
+  let msg = `⚙️ *BIRTHDAY SETTINGS* ⚙️\n\n`;
   msg += `🔔 Reminders: ${s.enableReminders ? '✅ ON' : '❌ OFF'}\n`;
   msg += `🎉 Auto Wishes: ${s.enableAutoWishes ? '✅ ON' : '❌ OFF'}\n`;
   msg += `👥 Group Reminders: ${s.enableGroupReminders ? '✅ ON' : '❌ OFF'}\n`;
@@ -955,7 +1003,6 @@ async function handleBirthdayCommand(sock: any, message: any, args: string[], co
   if (!birthdaySettings.loaded) await loadSettings();
   startScheduler(sock);
 
-  // Alias routing
   const invokedCmd = (context.userMessage || '').trim().split(/\s+/)[0].replace(/^[.!#\/]/, '');
   if (['mybirthday', 'mybday'].includes(invokedCmd)) {
     return handleMyBirthday(sock, message, senderId, chatId);
@@ -993,7 +1040,6 @@ const birthdayPlugin = {
   category:    'social',
   handler:     handleBirthdayCommand,
   onLoad,
-  // Named utility exports for other plugins
   saveBirthdayData,
   getBirthdayData,
   getAllBirthdays,
