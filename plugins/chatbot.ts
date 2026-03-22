@@ -1,8 +1,5 @@
 import type { BotContext } from '../types.js';
-import fs from 'fs';
-import path from 'path';
 import { dataFile } from '../lib/paths.js';
-import store from '../lib/lightweight_store.js';
 import { createStore } from '../lib/pluginStore.js';
 import {
     detectInsult,
@@ -11,7 +8,6 @@ import {
     clearGrudge,
     getGrudgeClapback,
     getThawMessage,
-    GRUDGE_DURATIONS,
     type GrudgeRecord
 } from '../lib/grudge.js';
 
@@ -20,8 +16,6 @@ const POSTGRES_URL = process.env.POSTGRES_URL;
 const MYSQL_URL    = process.env.MYSQL_URL;
 const SQLITE_URL   = process.env.DB_URL;
 const HAS_DB       = !!(MONGO_URL || POSTGRES_URL || MYSQL_URL || SQLITE_URL);
-
-const USER_GROUP_DATA = dataFile('userGroupData.json');
 
 const db        = createStore('chatbot');
 const dbUsers   = db.table!('users');
@@ -64,29 +58,50 @@ async function saveHistory(senderId: string, messages: string[]): Promise<void> 
 
 const API_ENDPOINTS = [
     {
-        name:  'GPT-5',
-        url:   (text: string) => `https://malvin-api.vercel.app/ai/gpt-5?text=${encodeURIComponent(text)}`,
-        parse: (data: any) => data?.result
+        name:   'GeminiRealtime',
+        method: 'POST' as const,
+        url:    'https://rynekoo-api.hf.space/text.gen/gemini/realtime',
+        body:   (text: string, systemPrompt: string, sessionId?: string) => ({
+            text,
+            systemPrompt,
+            ...(sessionId ? { sessionId } : {})
+        }),
+        parse:  (data: any) => data?.result?.text
+            ? { text: data.result.text, sessionId: data.result.sessionId }
+            : null
     },
     {
-        name:  'Copilot',
-        url:   (text: string) => `https://malvin-api.vercel.app/ai/copilot?text=${encodeURIComponent(text)}`,
-        parse: (data: any) => data?.result
+        name:   'VeniceAI',
+        method: 'POST' as const,
+        url:    'https://rynekoo-api.hf.space/text.gen/venice',
+        body:   (text: string, systemPrompt: string, _sessionId?: string) => ({
+            text: `${systemPrompt}\n\n${text}`
+        }),
+        parse:  (data: any) => typeof data?.result === 'string' && data.result
+            ? { text: data.result }
+            : null
     },
     {
-        name:  'Venice AI',
-        url:   (text: string) => `https://malvin-api.vercel.app/ai/venice?text=${encodeURIComponent(text)}`,
-        parse: (data: any) => data?.result
+        name:   'CopilotAI',
+        method: 'POST' as const,
+        url:    'https://rynekoo-api.hf.space/text.gen/copilot',
+        body:   (text: string, systemPrompt: string, _sessionId?: string) => ({
+            text: `${systemPrompt}\n\n${text}`
+        }),
+        parse:  (data: any) => typeof data?.result?.text === 'string' && data.result.text
+            ? { text: data.result.text }
+            : null
     },
     {
-        name:  'SparkAPI',
-        url:   (text: string) => `https://discardapi.dpdns.org/api/chat/spark?apikey=guru&text=${encodeURIComponent(text)}`,
-        parse: (data: any) => data?.result?.answer
-    },
-    {
-        name:  'LlamaAPI',
-        url:   (text: string) => `https://discardapi.dpdns.org/api/bot/llama?apikey=guru&text=${encodeURIComponent(text)}`,
-        parse: (data: any) => data?.result
+        name:   'FeloAI',
+        method: 'POST' as const,
+        url:    'https://rynekoo-api.hf.space/text.gen/feloai',
+        body:   (text: string, systemPrompt: string, _sessionId?: string) => ({
+            text: `${systemPrompt}\n\n${text}`
+        }),
+        parse:  (data: any) => typeof data?.result?.text === 'string' && data.result.text
+            ? { text: data.result.text }
+            : null
     }
 ];
 
@@ -191,64 +206,72 @@ function requiresLiveData(message: string): boolean {
 
 // ── Prompt builder ────────────────────────────────────────────────────────────
 
-function buildPrompt(userMessage: string, messages: string[], userInfo: Record<string, any>): string {
+function buildPrompt(
+    userMessage: string,
+    userInfo: Record<string, any>
+): { systemPrompt: string } {
     const info = userInfo || {};
 
     const nameLine = info.name
-        ? `The user's name is ${info.name}. Use their name very occasionally — at most once in 3 conversation, only when it flows completely naturally (e.g. a greeting or a moment of surprise). Never force it. If they ask what their name is, answer correctly.`
+        ? `The user's name is ${info.name}. Use their name very occasionally — at most once in 3 conversations, only when it flows completely naturally (e.g. a greeting or a moment of surprise). Never force it. If they ask what their name is, answer correctly.`
         : '';
 
     const extraInfo = [
         info.age      ? `age: ${info.age}`           : '',
         info.location ? `location: ${info.location}` : ''
     ].filter(Boolean).join(', ');
-    
-    // ── Detect if this needs a live web lookup ────────────────────────────────
-    const needsWeb = requiresLiveData(userMessage);
+
+    const needsWeb       = requiresLiveData(userMessage);
     const webInstruction = needsWeb
-        ? 'IMPORTANT: This question requires current real-time information, search the web RIGHT NOW for the answer before responding. Do not guess. '
+        ? 'IMPORTANT: This question requires current real-time information, search the web RIGHT NOW before responding. Do not guess. '
         : '';
 
-    const system =
+    const systemPrompt =
         'You are an intellectual social-savvy human in GHQ WhatsApp group. Name: Groq. 1-4 lines, emojis ok. ' +
         'You live in Lagos, Nigeria. ' +
         'Match the energy of whoever you\'re talking to — chill and warm for greetings, ' +
-        'Sacarstic when they\'re joking, savage when they\'re rude, supportive when they\'re down. ' +
+        'Sarcastic when they\'re joking, savage when they\'re rude, supportive when they\'re down. ' +
         'Never force humour. Never admit being AI or robot. ' +
-        (nameLine ? nameLine + ' ' : '') +
-        (extraInfo ? `Other info: ${extraInfo}.` : '') +
+        (nameLine  ? nameLine  + ' ' : '') +
+        (extraInfo ? `Other info: ${extraInfo}. ` : '') +
         webInstruction;
 
-    const history = messages.slice(-4).join('\n');
-
-    const full = [
-        system,
-        history ? `Conversation so far:\n${history}` : '',
-        `User: ${userMessage}`,
-        'Bot:'
-    ].filter(Boolean).join('\n\n');
-
-    if (full.length > 1300) {
-        return [system, `User: ${userMessage}`, 'Bot:'].join('\n\n');
-    }
-
-    return full;
+    return { systemPrompt };
 }
 
 // ── AI call ───────────────────────────────────────────────────────────────────
 
 async function getAIResponse(
     userMessage: string,
-    userContext: { messages: string[]; userInfo: Record<string, any> }
+    userContext: { messages: string[]; userInfo: Record<string, any> },
+    chatId: string,
+    senderId: string
 ): Promise<string | null> {
-    const prompt = buildPrompt(userMessage, userContext.messages, userContext.userInfo);
+    const { systemPrompt } = buildPrompt(userMessage, userContext.userInfo);
+
+    const history = userContext.messages.slice(-4).join('\n');
+    const textWithHistory = [
+        history ? `Conversation so far:\n${history}` : '',
+        `User: ${userMessage}`,
+        'Reply as Bot (1-4 lines):'
+    ].filter(Boolean).join('\n\n');
 
     for (const api of API_ENDPOINTS) {
         try {
-            console.log(`Trying ${api.name} (prompt: ${prompt.length} chars)...`);
+            console.log(`Trying ${api.name} ...`);
             const controller = new AbortController();
-            const timeoutId  = setTimeout(() => controller.abort(), 10000);
-            const response   = await fetch(api.url(prompt), { method: 'GET', signal: controller.signal });
+            const timeoutId  = setTimeout(() => controller.abort(), 15000);
+
+            const sessionKey = `_sid_${chatId}`;
+            const sessionId  = userContext.userInfo[sessionKey] as string | undefined;
+
+            const response = await fetch(api.url, {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                signal:  controller.signal,
+                body:    JSON.stringify(api.body(textWithHistory, systemPrompt, sessionId))
+            });
+
             clearTimeout(timeoutId);
 
             if (!response.ok) {
@@ -272,7 +295,15 @@ async function getAIResponse(
             apiStats[api.name].lastSuccessAt = Date.now();
             console.log(`${api.name} success`);
 
-            return result.trim()
+            // ── Save updated sessionId if API returned one ────────────────────
+            if (result.sessionId) {
+                const profile = await loadProfile(senderId);
+                profile[`_sid_${chatId}`] = result.sessionId;
+                await saveProfile(senderId, profile);
+            }
+
+            return result.text
+                .trim()
                 .replace(/winks/g,                                '😉')
                 .replace(/eye roll/g,                              '🙄')
                 .replace(/shrug/g,                                 '🤷')
@@ -355,10 +386,10 @@ export async function handleChatbotResponse(
         const allMentioned: string[] = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
         const contacts = (sock as any).store?.contacts || {};
         for (const jid of allMentioned) {
-            const numPart = jid.split('@')[0].split(':')[0];
+            const numPart  = jid.split('@')[0].split(':')[0];
             const isBotJid = botJids.some((b: string) => b.split('@')[0].split(':')[0] === numPart);
             if (isBotJid) continue;
-            const contact = contacts[jid] || contacts[`${numPart}@s.whatsapp.net`] || contacts[`${numPart}@lid`];
+            const contact     = contacts[jid] || contacts[`${numPart}@s.whatsapp.net`] || contacts[`${numPart}@lid`];
             const displayName = contact?.notify || contact?.name || contact?.pushName;
             if (displayName) {
                 cleanedMessage = cleanedMessage.replace(new RegExp(`@${numPart}`, 'g'), `@${displayName}`);
@@ -426,7 +457,7 @@ export async function handleChatbotResponse(
             const response = await getAIResponse(cleanedMessage, {
                 messages,
                 userInfo: profile
-            });
+            }, chatId, senderId);
 
             if (!response) {
                 await showTyping(sock, chatId, 40);
@@ -446,7 +477,6 @@ export async function handleChatbotResponse(
             await sock.sendMessage(chatId, { text: response }, { quoted: message });
 
         } finally {
-            // Always release the lock — whether success, early return, or error
             processingLock.delete(senderId);
         }
 
@@ -483,7 +513,7 @@ export default {
                 text:
                     `*🤖 CHATBOT SETUP*\n\n` +
                     `*Storage:* ${HAS_DB ? 'Database' : 'File System'}\n` +
-                    `*APIs:* ${API_ENDPOINTS.length} endpoints with fallback\n\n` +
+                    `*APIs:* ${API_ENDPOINTS.length} endpoint(s) with fallback\n\n` +
                     `*Commands:*\n` +
                     `• \`.chatbot on\` — Enable chatbot\n` +
                     `• \`.chatbot off\` — Disable chatbot\n` +
