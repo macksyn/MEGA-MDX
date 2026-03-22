@@ -1,5 +1,4 @@
 import type { BotContext } from '../types.js';
-import { dataFile } from '../lib/paths.js';
 import { createStore } from '../lib/pluginStore.js';
 import {
     detectInsult,
@@ -28,9 +27,32 @@ const historyCache = new Map<string, string[]>();
 // ── Per-user processing lock ──────────────────────────────────────────────────
 const processingLock = new Set<string>();
 
+// ── FIX #6: Cache eviction — prune idle entries every 2 hours ────────────────
+const CACHE_TTL_MS      = 2 * 60 * 60 * 1000;
+const cacheLastAccessed = new Map<string, number>();
+
+setInterval(() => {
+    const now   = Date.now();
+    let evicted = 0;
+    for (const [senderId, lastAt] of cacheLastAccessed.entries()) {
+        if (now - lastAt > CACHE_TTL_MS) {
+            // evict profile
+            profileCache.delete(senderId);
+            // evict ALL history entries belonging to this user (keyed as senderId__chatId)
+            for (const hKey of historyCache.keys()) {
+                if (hKey.startsWith(`${senderId}__`)) historyCache.delete(hKey);
+            }
+            cacheLastAccessed.delete(senderId);
+            evicted++;
+        }
+    }
+    if (evicted > 0) console.log(`[CACHE] Evicted ${evicted} idle user(s) from cache`);
+}, CACHE_TTL_MS);
+
 // ── Profile / history helpers ─────────────────────────────────────────────────
 
 async function loadProfile(senderId: string): Promise<Record<string, any>> {
+    cacheLastAccessed.set(senderId, Date.now());
     if (profileCache.has(senderId)) return profileCache.get(senderId)!;
     const stored = await dbUsers.get(senderId) ?? {};
     profileCache.set(senderId, stored);
@@ -38,20 +60,37 @@ async function loadProfile(senderId: string): Promise<Record<string, any>> {
 }
 
 async function saveProfile(senderId: string, profile: Record<string, any>): Promise<void> {
+    cacheLastAccessed.set(senderId, Date.now());
     profileCache.set(senderId, profile);
     await dbUsers.set(senderId, profile);
 }
 
-async function loadHistory(senderId: string): Promise<string[]> {
-    if (historyCache.has(senderId)) return historyCache.get(senderId)!;
-    const stored = await dbHistory.get(senderId) ?? [];
-    historyCache.set(senderId, stored);
+// ── FIX #3: History keyed per user per group — prevents cross-group bleed ─────
+
+function historyKey(senderId: string, chatId: string): string {
+    return `${senderId}__${chatId}`;
+}
+
+async function loadHistory(senderId: string, chatId: string): Promise<string[]> {
+    const key = historyKey(senderId, chatId);
+    cacheLastAccessed.set(senderId, Date.now());
+    if (historyCache.has(key)) return historyCache.get(key)!;
+    const stored = await dbHistory.get(key) ?? [];
+    historyCache.set(key, stored);
     return stored;
 }
 
-async function saveHistory(senderId: string, messages: string[]): Promise<void> {
-    historyCache.set(senderId, messages);
-    await dbHistory.set(senderId, messages);
+async function saveHistory(senderId: string, chatId: string, messages: string[]): Promise<void> {
+    const key = historyKey(senderId, chatId);
+    cacheLastAccessed.set(senderId, Date.now());
+    historyCache.set(key, messages);
+    await dbHistory.set(key, messages);
+}
+
+async function clearHistory(senderId: string, chatId: string): Promise<void> {
+    const key = historyKey(senderId, chatId);
+    historyCache.delete(key);
+    await dbHistory.del(key);
 }
 
 // ── API endpoints ─────────────────────────────────────────────────────────────
@@ -59,7 +98,6 @@ async function saveHistory(senderId: string, messages: string[]): Promise<void> 
 const API_ENDPOINTS = [
     {
         name:   'GeminiRealtime',
-        method: 'POST' as const,
         url:    'https://rynekoo-api.hf.space/text.gen/gemini/realtime',
         body:   (text: string, systemPrompt: string, sessionId?: string) => ({
             text,
@@ -72,7 +110,6 @@ const API_ENDPOINTS = [
     },
     {
         name:   'VeniceAI',
-        method: 'POST' as const,
         url:    'https://rynekoo-api.hf.space/text.gen/venice',
         body:   (text: string, systemPrompt: string, _sessionId?: string) => ({
             text: `${systemPrompt}\n\n${text}`
@@ -83,7 +120,6 @@ const API_ENDPOINTS = [
     },
     {
         name:   'CopilotAI',
-        method: 'POST' as const,
         url:    'https://rynekoo-api.hf.space/text.gen/copilot',
         body:   (text: string, systemPrompt: string, _sessionId?: string) => ({
             text: `${systemPrompt}\n\n${text}`
@@ -94,7 +130,6 @@ const API_ENDPOINTS = [
     },
     {
         name:   'FeloAI',
-        method: 'POST' as const,
         url:    'https://rynekoo-api.hf.space/text.gen/feloai',
         body:   (text: string, systemPrompt: string, _sessionId?: string) => ({
             text: `${systemPrompt}\n\n${text}`
@@ -106,6 +141,7 @@ const API_ENDPOINTS = [
 ];
 
 const API_FAILURE_RESET_MS = 5 * 60 * 1000;
+const API_SKIP_THRESHOLD   = 3;  // skip API once it hits this many recent failures
 
 const apiStats: Record<string, { count: number; lastFailAt: number; lastSuccessAt: number }> = {};
 API_ENDPOINTS.forEach(api => {
@@ -117,19 +153,32 @@ setInterval(() => {
     for (const name of Object.keys(apiStats)) {
         if (apiStats[name].count > 0 && now - apiStats[name].lastFailAt > API_FAILURE_RESET_MS) {
             apiStats[name].count = 0;
+            console.log(`[API] Reset failure count for ${name}`);
         }
     }
 }, API_FAILURE_RESET_MS);
+
+// ── FIX #4/#9: Skip APIs with too many recent failures ───────────────────────
+
+function isApiHealthy(name: string): boolean {
+    const s   = apiStats[name];
+    const now = Date.now();
+    if (s.count >= API_SKIP_THRESHOLD && now - s.lastFailAt < API_FAILURE_RESET_MS) {
+        console.log(`[API] Skipping ${name} — ${s.count} recent failures`);
+        return false;
+    }
+    return true;
+}
 
 // ── Chatbot config storage ────────────────────────────────────────────────────
 
 async function loadUserGroupData() {
     try {
         const enabled = await dbConfig.getAll();
-        return { groups: [], chatbot: enabled };
+        return { chatbot: enabled };  // FIX #7: removed dead groups:[]
     } catch (error: any) {
         console.error('Error loading chatbot config:', error.message);
-        return { groups: [], chatbot: {} };
+        return { chatbot: {} };
     }
 }
 
@@ -149,9 +198,25 @@ async function saveUserGroupData(data: any) {
     }
 }
 
-// ── Typing indicator ──────────────────────────────────────────────────────────
+// ── Typing helpers ────────────────────────────────────────────────────────────
 
-async function showTyping(sock: any, chatId: string, estimatedResponseLength = 80) {
+// FIX #1: startTyping fires BEFORE the API call so users see activity immediately
+async function startTyping(sock: any, chatId: string): Promise<void> {
+    try {
+        await sock.presenceSubscribe(chatId);
+        await sock.sendPresenceUpdate('composing', chatId);
+    } catch (error: any) {
+        console.error('Typing start error:', error.message);
+    }
+}
+
+async function stopTyping(sock: any, chatId: string): Promise<void> {
+    try {
+        await sock.sendPresenceUpdate('paused', chatId);
+    } catch (_) {}
+}
+
+async function showTyping(sock: any, chatId: string, estimatedResponseLength = 80): Promise<void> {
     try {
         const base  = Math.min(Math.max(estimatedResponseLength * 40, 1500), 6000);
         const delay = Math.round(base * (0.7 + Math.random() * 0.6));
@@ -190,15 +255,10 @@ function extractUserInfo(message: string) {
 function requiresLiveData(message: string): boolean {
     const lower = message.toLowerCase();
     const livePatterns = [
-        // Sports
         /\b(playing|match|game|score|fixture|result|vs\.?|versus|kickoff|kick.off|lineup|squad|today.s (game|match|fixture))\b/,
-        // Time-sensitive
         /\b(today|tonight|right now|current(ly)?|live|latest|just now|this (week|month|season))\b/,
-        // News & prices
         /\b(news|headline|price|stock|weather|forecast|transfer|announce(d|ment)?|winner|champion)\b/,
-        // Explicit search cues
         /\b(who is|who are|what is|what are|when is|when did|did .+ (win|lose|score|play))\b/,
-        // Sports entities
         /\b(psg|chelsea|arsenal|barcelona|real madrid|man (city|utd|united)|liverpool|champions league|premier league|laliga|serie a|bundesliga|nba|nfl|nhl|uefa|fifa)\b/i
     ];
     return livePatterns.some(p => p.test(lower));
@@ -213,7 +273,7 @@ function buildPrompt(
     const info = userInfo || {};
 
     const nameLine = info.name
-        ? `The user's name is ${info.name}. Use their name very occasionally — at most once in 3 conversations, only when it flows completely naturally (e.g. a greeting or a moment of surprise). Never force it. If they ask what their name is, answer correctly.`
+        ? `The user's name is ${info.name}. Use their name very occasionally — at most once in 3 conversations, only when it flows completely naturally. Never force it. If they ask what their name is, answer correctly.`
         : '';
 
     const extraInfo = [
@@ -223,20 +283,93 @@ function buildPrompt(
 
     const needsWeb       = requiresLiveData(userMessage);
     const webInstruction = needsWeb
-        ? 'IMPORTANT: This question requires current real-time information, search the web RIGHT NOW before responding. Do not guess. '
+        ? 'IMPORTANT: This question requires current real-time information — search the web before responding. Do not guess. '
         : '';
 
+    // FIX #5: "Always reply in English" prevents FeloAI/others responding in wrong language
+    // FIX #8: "1-4 lines" only stated once here, removed from textWithHistory
     const systemPrompt =
-        'You are an intellectual social-savvy human in GHQ WhatsApp group. Name: Groq. 1-4 lines, emojis ok. ' +
+        'You are an intellectual social-savvy human in GHQ WhatsApp group. Name: Groq. ' +
+        'Keep replies to 1-4 lines max, emojis ok. Always reply in English. ' +
         'You live in Lagos, Nigeria. ' +
         'Match the energy of whoever you\'re talking to — chill and warm for greetings, ' +
-        'Sarcastic when they\'re joking, savage when they\'re rude, supportive when they\'re down. ' +
+        'sarcastic when they\'re joking, savage when they\'re rude, supportive when they\'re down. ' +
         'Never force humour. Never admit being AI or robot. ' +
         (nameLine  ? nameLine  + ' ' : '') +
         (extraInfo ? `Other info: ${extraInfo}. ` : '') +
         webInstruction;
 
     return { systemPrompt };
+}
+
+// ── Single API attempt ────────────────────────────────────────────────────────
+
+async function tryApi(
+    api: typeof API_ENDPOINTS[number],
+    textWithHistory: string,
+    systemPrompt: string,
+    sessionId: string | undefined
+): Promise<{ text: string; sessionId?: string }> {
+    const controller = new AbortController();
+    const timeoutId  = setTimeout(() => controller.abort(), 15000);
+    try {
+        const response = await fetch(api.url, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal:  controller.signal,
+            body:    JSON.stringify(api.body(textWithHistory, systemPrompt, sessionId))
+        });
+        clearTimeout(timeoutId);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data   = await response.json() as any;
+        const result = api.parse(data);
+        if (!result) throw new Error('No result in response');
+        return result;
+    } catch (err) {
+        clearTimeout(timeoutId);
+        throw err;
+    }
+}
+
+// ── Response cleaner ──────────────────────────────────────────────────────────
+
+function cleanResponse(text: string): string {
+    return text
+        .trim()
+        .replace(/winks/g,                             '😉')
+        .replace(/eye roll/g,                           '🙄')
+        .replace(/shrug/g,                              '🤷')
+        .replace(/raises eyebrow/g,                     '🤨')
+        .replace(/smiles/g,                             '😊')
+        .replace(/laughs/g,                             '😂')
+        .replace(/cries/g,                              '😢')
+        .replace(/thinks/g,                             '🤔')
+        .replace(/sleeps/g,                             '😴')
+        .replace(/google/gi,                            'Groq')
+        .replace(/a large language model/gi,            'just a person')
+        .replace(/Remember:.*$/gm,                      '')
+        .replace(/IMPORTANT:.*$/gm,                     '')
+        .replace(/^(Groq|Bot|AI|Assistant)\s*:\s*/gim, '')
+        .replace(/\n{2,}/g,                             '\n')
+        .trim();
+}
+
+// ── Promise.any polyfill (compatible with ES2019 and below) ─────────────────
+
+function promiseAny<T>(promises: Promise<T>[]): Promise<T> {
+    return new Promise((resolve, reject) => {
+        let rejectedCount = 0;
+        const errors: any[] = new Array(promises.length);
+        promises.forEach((p, i) => {
+            p.then(resolve).catch(err => {
+                errors[i] = err;
+                rejectedCount++;
+                if (rejectedCount === promises.length) {
+                    reject(new Error('All promises were rejected'));
+                }
+            });
+        });
+    });
 }
 
 // ── AI call ───────────────────────────────────────────────────────────────────
@@ -250,85 +383,86 @@ async function getAIResponse(
     const { systemPrompt } = buildPrompt(userMessage, userContext.userInfo);
 
     const history = userContext.messages.slice(-4).join('\n');
+    // FIX #8: Removed duplicate "1-4 lines" from here — it's in systemPrompt already
     const textWithHistory = [
         history ? `Conversation so far:\n${history}` : '',
         `User: ${userMessage}`,
-        'Reply as Bot (1-4 lines):'
+        'Reply as Groq:'
     ].filter(Boolean).join('\n\n');
 
-    for (const api of API_ENDPOINTS) {
+    const sessionKey   = `_sid_${chatId}`;
+    const sessionId    = userContext.userInfo[sessionKey] as string | undefined;
+    const healthyApis  = API_ENDPOINTS.filter(api => isApiHealthy(api.name));
+
+    // ── FIX #11: Top 2 healthy APIs race in parallel ──────────────────────────
+    const parallelApis = healthyApis.slice(0, 2);
+    const restApis     = healthyApis.slice(2);
+
+    if (parallelApis.length > 0) {
         try {
-            console.log(`Trying ${api.name} ...`);
-            const controller = new AbortController();
-            const timeoutId  = setTimeout(() => controller.abort(), 15000);
+            const winner = await promiseAny(
+                parallelApis.map(api =>
+                    tryApi(api, textWithHistory, systemPrompt, sessionId)
+                        .then(result => ({ result, api }))
+                )
+            );
 
-            const sessionKey = `_sid_${chatId}`;
-            const sessionId  = userContext.userInfo[sessionKey] as string | undefined;
-
-            const response = await fetch(api.url, {
-                method:  'POST',
-                headers: { 'Content-Type': 'application/json' },
-                signal:  controller.signal,
-                body:    JSON.stringify(api.body(textWithHistory, systemPrompt, sessionId))
-            });
-
-            clearTimeout(timeoutId);
-
-            if (!response.ok) {
-                apiStats[api.name].count++;
-                apiStats[api.name].lastFailAt = Date.now();
-                console.log(`${api.name} failed: HTTP ${response.status}`);
-                continue;
+            apiStats[winner.api.name].count         = 0;
+            apiStats[winner.api.name].lastSuccessAt = Date.now();
+            console.log(`[API] ${winner.api.name} won parallel race`);
+            // Track failures for any parallel API that lost (may have failed silently)
+            for (const api of parallelApis) {
+                if (api.name !== winner.api.name && apiStats[api.name].lastSuccessAt < apiStats[api.name].lastFailAt) {
+                    apiStats[api.name].count++;
+                    apiStats[api.name].lastFailAt = Date.now();
+                    console.log(`[API] ${api.name} lost parallel race (failure recorded)`);
+                }
             }
 
-            const data   = await response.json() as any;
-            const result = api.parse(data);
+            if (winner.result.sessionId) {
+                const profile = await loadProfile(senderId);
+                profile[`_sid_${chatId}`] = winner.result.sessionId;
+                await saveProfile(senderId, profile);
+            }
 
-            if (!result) {
+            return cleanResponse(winner.result.text);
+
+        } catch (parallelErr: any) {
+            // All parallel attempts failed — penalise and fall through to sequential
+            for (const api of parallelApis) {
                 apiStats[api.name].count++;
                 apiStats[api.name].lastFailAt = Date.now();
-                console.log(`${api.name} returned no result`);
-                continue;
+                console.log(`[API] ${api.name} failed in parallel attempt`);
             }
+        }
+    }
+
+    // ── Sequential fallback for remaining APIs ────────────────────────────────
+    for (const api of restApis) {
+        try {
+            console.log(`[API] Trying ${api.name} (sequential fallback)...`);
+            const result = await tryApi(api, textWithHistory, systemPrompt, sessionId);
 
             apiStats[api.name].count         = 0;
             apiStats[api.name].lastSuccessAt = Date.now();
-            console.log(`${api.name} success`);
+            console.log(`[API] ${api.name} success`);
 
-            // ── Save updated sessionId if API returned one ────────────────────
             if (result.sessionId) {
                 const profile = await loadProfile(senderId);
                 profile[`_sid_${chatId}`] = result.sessionId;
                 await saveProfile(senderId, profile);
             }
 
-            return result.text
-                .trim()
-                .replace(/winks/g,                                '😉')
-                .replace(/eye roll/g,                              '🙄')
-                .replace(/shrug/g,                                 '🤷')
-                .replace(/raises eyebrow/g,                        '🤨')
-                .replace(/smiles/g,                                '😊')
-                .replace(/laughs/g,                                '😂')
-                .replace(/cries/g,                                 '😢')
-                .replace(/thinks/g,                                '🤔')
-                .replace(/sleeps/g,                                '😴')
-                .replace(/google/gi,                               'Groq')
-                .replace(/a large language model/gi,               'just a person')
-                .replace(/Remember:.*$/gm,                         '')
-                .replace(/IMPORTANT:.*$/gm,                        '')
-                .replace(/^(Groq|Bot|AI|Assistant)\s*:\s*/gim,    '')
-                .replace(/\n{2,}/g,                                '\n')
-                .trim();
+            return cleanResponse(result.text);
 
         } catch (error: any) {
             apiStats[api.name].count++;
             apiStats[api.name].lastFailAt = Date.now();
-            console.log(`${api.name} error: ${error.message}`);
+            console.log(`[API] ${api.name} error: ${error.message}`);
         }
     }
 
-    console.error('All AI APIs failed');
+    console.error('[API] All APIs failed');
     return null;
 }
 
@@ -408,7 +542,6 @@ export async function handleChatbotResponse(
         processingLock.add(senderId);
 
         try {
-
             // ── INSULT DETECTION ──────────────────────────────────────────────
             const insult = detectInsult(cleanedMessage);
 
@@ -437,7 +570,7 @@ export async function handleChatbotResponse(
             }
 
             // ── NORMAL FLOW ───────────────────────────────────────────────────
-            const messages = await loadHistory(senderId);
+            const messages = await loadHistory(senderId, chatId);  // FIX #3
 
             const pushName: string | undefined = message.pushName;
             if (pushName && !profile.name) {
@@ -454,10 +587,15 @@ export async function handleChatbotResponse(
 
             await saveProfile(senderId, profile);
 
+            // ── FIX #1: Typing starts BEFORE the API call ─────────────────────
+            await startTyping(sock, chatId);
+
             const response = await getAIResponse(cleanedMessage, {
                 messages,
                 userInfo: profile
             }, chatId, senderId);
+
+            await stopTyping(sock, chatId);
 
             if (!response) {
                 await showTyping(sock, chatId, 40);
@@ -471,7 +609,7 @@ export async function handleChatbotResponse(
             const botTurn  = `Bot: ${response.length > 120 ? response.slice(0, 120) + '...' : response}`;
             messages.push(userTurn, botTurn);
             while (messages.length > 6) messages.shift();
-            await saveHistory(senderId, messages);
+            await saveHistory(senderId, chatId, messages);  // FIX #3
 
             await showTyping(sock, chatId, response.length);
             await sock.sendMessage(chatId, { text: response }, { quoted: message });
@@ -500,7 +638,7 @@ export default {
     aliases:     ['bot', 'ai', 'achat'],
     category:    'admin',
     description: 'Enable or disable AI chatbot for the group',
-    usage:       '.chatbot <on|off|stats|pardon|grudges>',
+    usage:       '.chatbot <on|off|stats|pardon|grudges|reset|history>',
     groupOnly:   true,
     adminOnly:   true,
 
@@ -513,15 +651,19 @@ export default {
                 text:
                     `*🤖 CHATBOT SETUP*\n\n` +
                     `*Storage:* ${HAS_DB ? 'Database' : 'File System'}\n` +
-                    `*APIs:* ${API_ENDPOINTS.length} endpoint(s) with fallback\n\n` +
+                    `*APIs:* ${API_ENDPOINTS.length} endpoints with parallel + fallback\n\n` +
                     `*Commands:*\n` +
                     `• \`.chatbot on\` — Enable chatbot\n` +
                     `• \`.chatbot off\` — Disable chatbot\n` +
                     `• \`.chatbot stats\` — API health & memory stats\n` +
                     `• \`.chatbot pardon @user\` — Lift a grudge early\n` +
-                    `• \`.chatbot grudges\` — List active grudges in this group\n\n` +
+                    `• \`.chatbot grudges\` — List active grudges in this group\n` +
+                    `• \`.chatbot reset @user\` — Clear a user's conversation history\n` +
+                    `• \`.chatbot history @user\` — View a user's stored context\n\n` +
                     `*How it works:*\n` +
                     `When enabled, bot responds when mentioned or replied to.\n` +
+                    `Top 2 APIs run in parallel — fastest wins. Others are sequential fallback.\n` +
+                    `Failing APIs are skipped automatically after ${API_SKIP_THRESHOLD} failures.\n` +
                     `Insult the bot → it claps back once then ignores you for hours.\n\n` +
                     `*Grudge tiers:*\n` +
                     `• Mild insult → 2 hours silent treatment\n` +
@@ -577,6 +719,43 @@ export default {
             }, { quoted: message });
         }
 
+        // ── FIX #10: reset @user ──────────────────────────────────────────────
+        if (match.startsWith('reset')) {
+            const mentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+            if (!mentioned) {
+                return sock.sendMessage(chatId, {
+                    text: '❌ Mention the user to reset. Example: `.chatbot reset @username`'
+                }, { quoted: message });
+            }
+            await clearHistory(mentioned, chatId);
+            const tag = `@${mentioned.split('@')[0]}`;
+            return sock.sendMessage(chatId, {
+                text: `✅ Conversation history cleared for ${tag}. Fresh start 🧹`,
+                mentions: [mentioned]
+            }, { quoted: message });
+        }
+
+        // ── FIX #13: history @user ────────────────────────────────────────────
+        if (match.startsWith('history')) {
+            const mentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+            if (!mentioned) {
+                return sock.sendMessage(chatId, {
+                    text: '❌ Mention the user to inspect. Example: `.chatbot history @username`'
+                }, { quoted: message });
+            }
+            const hist = await loadHistory(mentioned, chatId);
+            if (hist.length === 0) {
+                return sock.sendMessage(chatId, {
+                    text: `📭 No conversation history stored for @${mentioned.split('@')[0]}`,
+                    mentions: [mentioned]
+                }, { quoted: message });
+            }
+            return sock.sendMessage(chatId, {
+                text: `*📜 HISTORY FOR @${mentioned.split('@')[0]}*\n\n${hist.join('\n')}\n\n_(${hist.length} entries)_`,
+                mentions: [mentioned]
+            }, { quoted: message });
+        }
+
         // ── grudges ───────────────────────────────────────────────────────────
         if (match === 'grudges') {
             const now     = Date.now();
@@ -605,16 +784,18 @@ export default {
         // ── stats ─────────────────────────────────────────────────────────────
         if (match === 'stats') {
             const now      = Date.now();
-            const apiLines = API_ENDPOINTS.map(api => {
-                const s        = apiStats[api.name];
-                const icon     = s.count === 0 ? '✅' : s.count < 3 ? '⚠️' : '❌';
+            const apiLines = API_ENDPOINTS.map((api, i) => {
+                const s       = apiStats[api.name];
+                const icon    = s.count === 0 ? '✅' : s.count < API_SKIP_THRESHOLD ? '⚠️' : '❌';
+                const skipped = !isApiHealthy(api.name) ? ' [SKIPPED]' : '';
+                const role    = i < 2 ? ' (parallel)' : ' (fallback)';
                 const lastFail = s.lastFailAt
                     ? `last fail ${Math.round((now - s.lastFailAt) / 60000)}m ago`
                     : 'no failures recorded';
-                const lastOk   = s.lastSuccessAt
+                const lastOk = s.lastSuccessAt
                     ? `last ok ${Math.round((now - s.lastSuccessAt) / 60000)}m ago`
                     : 'never succeeded this session';
-                return `${icon} *${api.name}*: ${s.count} failure(s)\n   ${lastFail} · ${lastOk}`;
+                return `${icon} *${api.name}*${role}${skipped}: ${s.count} failure(s)\n   ${lastFail} · ${lastOk}`;
             }).join('\n');
 
             let totalGrudges = 0;
@@ -627,16 +808,18 @@ export default {
             return sock.sendMessage(chatId, {
                 text:
                     `*📊 CHATBOT STATS*\n\n` +
-                    `*Users cached in memory:* ${profileCache.size}\n` +
+                    `*Storage:* ${HAS_DB ? 'Database' : 'File System'}\n` +
+                    `*Users cached:* ${profileCache.size}\n` +
                     `*History entries cached:* ${historyCache.size}\n` +
                     `*Active grudges (all groups):* ${totalGrudges}\n` +
-                    `*Failure auto-reset:* every ${API_FAILURE_RESET_MS / 60000}m\n\n` +
+                    `*Failure reset interval:* every ${API_FAILURE_RESET_MS / 60000}m\n` +
+                    `*API skip threshold:* ${API_SKIP_THRESHOLD} failures\n\n` +
                     `*API Health:*\n${apiLines}`
             }, { quoted: message });
         }
 
         return sock.sendMessage(chatId, {
-            text: '❌ *Invalid command*\n\nUse: `.chatbot on/off/stats/pardon/grudges`'
+            text: '❌ *Invalid command*\n\nUse: `.chatbot on/off/stats/pardon/grudges/reset/history`'
         }, { quoted: message });
     },
 
