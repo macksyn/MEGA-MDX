@@ -351,11 +351,10 @@ function cleanResponse(text: string): string {
         .replace(/IMPORTANT:.*$/gm,                     '')
         .replace(/^(Groq|Bot|AI|Assistant)\s*:\s*/gim, '')
         // Strip Gemini promo leak — ordered safest to broadest
-        .replace(/\[Gemini Apps Activity\]\(https?:\/\/[^)]+\)/gi,               '')  // exact markdown link
-        .replace(/https?:\/\/myactivity\.\S+\/product\/gemini\S*/gi,             '')  // raw URL
-        .replace(/\.?\s*to unlock[^.]*?gemini apps activity[^.\n]*/gi,           '')  // "to unlock..." sentence only
-        .replace(/\.?\s*By the way[^.]*?\[Gemini Apps Activity\][^.\n]*/gi,      '')  // only if link is present on same sentence
-        .replace(/\n{2,}/g,                             '\n')
+        .replace(/By the way, to unlock the full functionality of all Apps, enable\s*\[?Gemini Apps Activity\]?[^\n]*/gi, '')
+        .replace(/\[Gemini Apps Activity\]\(https?:\/\/[^)]+\)/gi, '')
+        .replace(/https?:\/\/myactivity\.\S+\/product\/gemini\S*/gi, '')
+        .replace(/\n{2,}/g,  '\n')
         .trim();
 }
 
