@@ -3,11 +3,11 @@
 import cron   from 'node-cron';
 import moment from 'moment-timezone';
 
-import { printLog }   from '../lib/print.js';
-import isOwnerOrSudo  from '../lib/isOwner.js';
-import isAdmin        from '../lib/isAdmin.js';
+import { printLog }    from '../lib/print.js';
+import isOwnerOrSudo   from '../lib/isOwner.js';
+import isAdmin         from '../lib/isAdmin.js';
 import { createStore } from '../lib/pluginStore.js';
-import bus            from '../lib/pluginBus.js';
+import bus             from '../lib/pluginBus.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -63,11 +63,13 @@ interface ParsedBirthday {
 }
 
 interface BirthdayDoc {
-  userId:         string;
-  name:           string;
-  birthday:       ParsedBirthday;
-  lastUpdated:    string;
-  updateHistory:  any[];
+  userId:            string;
+  name:              string;
+  birthday:          ParsedBirthday;
+  lastUpdated:       string;
+  updateHistory:     any[];
+  birthdayImageUrl?: string;
+  imageSetAt?:       string;
 }
 
 // ── Storage ───────────────────────────────────────────────────────────────────
@@ -77,6 +79,7 @@ const dbBirthdays    = db;
 const dbSettings     = db.table!('settings');
 const dbWishesLog    = db.table!('wishes_log');
 const dbRemindersLog = db.table!('reminders_log');
+const dbAdminGroup   = db.table!('admin_group');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -84,8 +87,8 @@ let birthdaySettings: BirthdaySettings = { ...DEFAULT_SETTINGS, loaded: false };
 let schedulerStarted      = false;
 let busListenerRegistered = false;
 
-// FIX 1: mutable socket reference so cron closures always use the live socket
-// after any reconnect, instead of capturing the startup socket forever.
+// Mutable socket reference — cron closures always use the live socket
+// so reconnects don't leave jobs holding a dead connection.
 let currentSock: any = null;
 
 const cronJobs             = new Map<string, any>();
@@ -115,6 +118,33 @@ async function saveSettings(): Promise<void> {
   } catch (e: any) {
     printLog('error', `[BIRTHDAY] saveSettings error: ${e.message}`);
   }
+}
+
+// ── Admin group helpers ───────────────────────────────────────────────────────
+
+async function getAdminGroupId(): Promise<string | null> {
+  try {
+    const record = await dbAdminGroup.get('config');
+    return (record as any)?.groupId || null;
+  } catch (e: any) {
+    printLog('error', `[BIRTHDAY] getAdminGroupId error: ${e.message}`);
+    return null;
+  }
+}
+
+async function setAdminGroupId(groupId: string): Promise<void> {
+  try {
+    await dbAdminGroup.set('config', { groupId, setAt: new Date().toISOString() });
+    printLog('success', `[BIRTHDAY] Admin hub registered: ${groupId.split('@')[0]}`);
+  } catch (e: any) {
+    printLog('error', `[BIRTHDAY] setAdminGroupId error: ${e.message}`);
+  }
+}
+
+async function isFromAdminGroup(chatId: string): Promise<boolean> {
+  const adminGroupId = await getAdminGroupId();
+  if (!adminGroupId) return false;
+  return chatId === adminGroupId;
 }
 
 // ── Birthday CRUD ─────────────────────────────────────────────────────────────
@@ -179,10 +209,14 @@ async function saveBirthdayData(
       : [historyEntry];
 
     const doc: BirthdayDoc = {
-      userId, name,
+      userId,
+      name,
       birthday:      parsed,
       lastUpdated:   now,
-      updateHistory
+      updateHistory,
+      // Preserve existing photo if set — updating name/dob must not wipe it
+      ...(existing?.birthdayImageUrl ? { birthdayImageUrl: existing.birthdayImageUrl } : {}),
+      ...(existing?.imageSetAt       ? { imageSetAt:       existing.imageSetAt       } : {}),
     };
 
     await dbBirthdays.set(userId, doc);
@@ -194,6 +228,56 @@ async function saveBirthdayData(
     return true;
   } catch (e: any) {
     printLog('error', `[BIRTHDAY] saveBirthdayData error: ${e.message}`);
+    return false;
+  }
+}
+
+// ── Photo helpers ─────────────────────────────────────────────────────────────
+
+async function findByPhone(phone: string): Promise<BirthdayDoc | null> {
+  try {
+    const clean = phone.replace(/\D/g, '');
+    if (!clean) return null;
+    const birthdays = await getAllBirthdays();
+    const entry = Object.values(birthdays).find(b =>
+      b.userId.replace('@s.whatsapp.net', '').replace(/\D/g, '') === clean
+    );
+    return entry || null;
+  } catch (e: any) {
+    printLog('error', `[BIRTHDAY] findByPhone error: ${e.message}`);
+    return null;
+  }
+}
+
+async function setPhoto(userId: string, url: string): Promise<boolean> {
+  try {
+    const existing = await dbBirthdays.get(userId) as BirthdayDoc | null;
+    if (!existing) return false;
+    await dbBirthdays.set(userId, {
+      ...existing,
+      birthdayImageUrl: url,
+      imageSetAt:       new Date().toISOString()
+    });
+    printLog('success', `[BIRTHDAY] 🖼️ Photo saved for ${existing.name}`);
+    return true;
+  } catch (e: any) {
+    printLog('error', `[BIRTHDAY] setPhoto error: ${e.message}`);
+    return false;
+  }
+}
+
+async function removePhoto(userId: string): Promise<boolean> {
+  try {
+    const existing = await dbBirthdays.get(userId) as BirthdayDoc | null;
+    if (!existing) return false;
+    const updated: BirthdayDoc = { ...existing };
+    delete updated.birthdayImageUrl;
+    delete updated.imageSetAt;
+    await dbBirthdays.set(userId, updated);
+    printLog('success', `[BIRTHDAY] 🗑️ Photo removed for ${existing.name}`);
+    return true;
+  } catch (e: any) {
+    printLog('error', `[BIRTHDAY] removePhoto error: ${e.message}`);
     return false;
   }
 }
@@ -211,7 +295,7 @@ async function getTodaysBirthdays(): Promise<BirthdayDoc[]> {
   }
 }
 
-// Used by the reminder/wishes scheduler — exact day match (correct behaviour).
+// Exact-day match — used by the reminder/wish scheduler.
 async function getUpcomingBirthdays(daysAhead: number): Promise<BirthdayDoc[]> {
   try {
     const target    = moment.tz(TIMEZONE).add(daysAhead, 'days');
@@ -223,11 +307,7 @@ async function getUpcomingBirthdays(daysAhead: number): Promise<BirthdayDoc[]> {
   }
 }
 
-// FIX 2: range-based count for display purposes (status command).
-// getUpcomingBirthdays() does an exact-day match, so at 10am on the 22nd
-// a birthday on the 26th counts as "4 days away" not "3 days away", causing
-// the status counts to disagree with .birthday upcoming. This helper uses
-// the same range logic as .birthday upcoming so both displays agree.
+// Range-based count — used by status display so numbers match .birthday upcoming.
 function countBirthdaysWithinDays(allBdays: Record<string, BirthdayDoc>, days: number): number {
   const now = moment.tz(TIMEZONE);
   return Object.values(allBdays).filter(entry => {
@@ -249,13 +329,13 @@ function countBirthdaysExactDay(allBdays: Record<string, BirthdayDoc>, daysAhead
   }).length;
 }
 
-// ── Wish/reminder log helpers ─────────────────────────────────────────────────
+// ── Wish / reminder log helpers ───────────────────────────────────────────────
 
 async function hasWishedToday(userId: string): Promise<boolean> {
   try {
     const today = moment.tz(TIMEZONE).format('YYYY-MM-DD');
     const log   = await dbWishesLog.get('log') || {};
-    return !!(log[today]?.[userId]);
+    return !!((log as any)[today]?.[userId]);
   } catch {
     return false;
   }
@@ -263,8 +343,8 @@ async function hasWishedToday(userId: string): Promise<boolean> {
 
 async function markWishedToday(userId: string, name: string, successfulSends: number): Promise<void> {
   try {
-    const today = moment.tz(TIMEZONE).format('YYYY-MM-DD');
-    const log   = await dbWishesLog.get('log') || {};
+    const today  = moment.tz(TIMEZONE).format('YYYY-MM-DD');
+    const log    = (await dbWishesLog.get('log') || {}) as any;
     if (!log[today]) log[today] = {};
     log[today][userId] = { name, timestamp: new Date().toISOString(), successfulSends };
     await dbWishesLog.set('log', log);
@@ -273,7 +353,7 @@ async function markWishedToday(userId: string, name: string, successfulSends: nu
 
 async function hasReminderSent(reminderKey: string): Promise<boolean> {
   try {
-    const log = await dbRemindersLog.get('log') || {};
+    const log = (await dbRemindersLog.get('log') || {}) as any;
     return !!log[reminderKey];
   } catch {
     return false;
@@ -282,7 +362,7 @@ async function hasReminderSent(reminderKey: string): Promise<boolean> {
 
 async function markReminderSent(reminderKey: string, userId: string, daysAhead: number): Promise<void> {
   try {
-    const log        = await dbRemindersLog.get('log') || {};
+    const log        = (await dbRemindersLog.get('log') || {}) as any;
     log[reminderKey] = { userId, daysAhead, timestamp: new Date().toISOString() };
     await dbRemindersLog.set('log', log);
   } catch {}
@@ -292,8 +372,8 @@ async function runCleanup(): Promise<void> {
   try {
     const cutoff = moment.tz(TIMEZONE).subtract(365, 'days');
 
-    const wishLog   = await dbWishesLog.get('log') || {};
-    let wishCleaned = 0;
+    const wishLog    = (await dbWishesLog.get('log') || {}) as any;
+    let wishCleaned  = 0;
     for (const date of Object.keys(wishLog)) {
       if (moment.tz(date, TIMEZONE).isBefore(cutoff)) {
         delete wishLog[date];
@@ -302,8 +382,8 @@ async function runCleanup(): Promise<void> {
     }
     if (wishCleaned > 0) await dbWishesLog.set('log', wishLog);
 
-    const remLog   = await dbRemindersLog.get('log') || {};
-    let remCleaned = 0;
+    const remLog    = (await dbRemindersLog.get('log') || {}) as any;
+    let remCleaned  = 0;
     for (const key of Object.keys(remLog)) {
       const dateMatch = key.match(/^(\d{4}-\d{2}-\d{2})/);
       if (dateMatch && moment.tz(dateMatch[1], TIMEZONE).isBefore(cutoff)) {
@@ -340,10 +420,10 @@ function parseDOB(dobString: string): ParsedBirthday | null {
       const a = parseInt(numericMatch[1]);
       const b = parseInt(numericMatch[2]);
       const c = numericMatch[3] ? parseInt(numericMatch[3]) : null;
-      if      (a > 31)         { year = a; month = b; day = c ?? undefined; }
-      else if (c && c > 31)    { day = a; month = b; year = c; }
-      else if (!c)             { day = a; month = b; year = null; }
-      else                     { day = a; month = b; year = c < 100 ? 2000 + c : c; }
+      if      (a > 31)      { year = a; month = b; day = c ?? undefined; }
+      else if (c && c > 31) { day = a; month = b; year = c; }
+      else if (!c)          { day = a; month = b; year = null; }
+      else                  { day = a; month = b; year = c < 100 ? 2000 + c : c; }
     }
   }
 
@@ -424,9 +504,17 @@ async function runBirthdayWishes(sock: any): Promise<void> {
       let sent = 0;
 
       if (birthdaySettings.enablePrivateReminders) {
-        const ok = await safeSend(sock, person.userId, {
-          text: `🎉 *HAPPY BIRTHDAY ${person.name}!* 🎉\n\nToday is your special day! 🎂\n\nWishing you all the happiness in the world! ✨🎈\n\n👏 From all of us at GIST HQ!`
-        });
+        const privateWishText =
+          `🎉 *HAPPY BIRTHDAY ${person.name}!* 🎉\n\n` +
+          `Today is your special day! 🎂\n\n` +
+          `Wishing you all the happiness in the world! ✨🎈\n\n` +
+          `👏 From all of us at GIST HQ!`;
+
+        const privateMsg: any = person.birthdayImageUrl
+          ? { image: { url: person.birthdayImageUrl }, caption: privateWishText }
+          : { text: privateWishText };
+
+        const ok = await safeSend(sock, person.userId, privateMsg);
         if (ok) sent++;
         await new Promise(r => setTimeout(r, 3000));
       }
@@ -436,7 +524,12 @@ async function runBirthdayWishes(sock: any): Promise<void> {
         for (const groupId of birthdaySettings.reminderGroups) {
           const participants = await getGroupParticipants(sock, groupId);
           const mentions     = [...new Set([person.userId, ...participants])];
-          const ok           = await safeSend(sock, groupId, { text: wishMsg, mentions });
+
+          const groupMsg: any = person.birthdayImageUrl
+            ? { image: { url: person.birthdayImageUrl }, caption: wishMsg, mentions }
+            : { text: wishMsg, mentions };
+
+          const ok = await safeSend(sock, groupId, groupMsg);
           if (ok) sent++;
           await new Promise(r => setTimeout(r, 5000));
         }
@@ -479,14 +572,10 @@ async function runBirthdayReminders(sock: any, daysAhead: number): Promise<void>
 
 // ── node-cron scheduler ───────────────────────────────────────────────────────
 
-// FIX 1 (continued): startScheduler always updates currentSock so reconnects
-// don't leave cron closures holding a dead socket. Cron jobs are only
-// registered once (schedulerStarted guard), but the live socket reference
-// is refreshed on every call.
 function startScheduler(sock: any): void {
-  currentSock = sock; // always update — handles reconnects
+  currentSock = sock; // always refresh — handles reconnects
 
-  if (schedulerStarted) return; // register crons only once
+  if (schedulerStarted) return; // register cron jobs only once
   schedulerStarted = true;
 
   const [wishH, wishM] = birthdaySettings.wishTime.split(':').map(Number);
@@ -494,23 +583,27 @@ function startScheduler(sock: any): void {
 
   cronJobs.set('wishes', cron.schedule(
     `${wishM} ${wishH} * * *`,
-    () => runBirthdayWishes(currentSock), // uses live reference, not closed-over sock
+    () => runBirthdayWishes(currentSock),
     { timezone: TIMEZONE }
   ));
+
   cronJobs.set('reminders', cron.schedule(
     `${remM} ${remH} * * *`,
     async () => {
-      for (const days of birthdaySettings.reminderDays) await runBirthdayReminders(currentSock, days);
+      for (const days of birthdaySettings.reminderDays) {
+        await runBirthdayReminders(currentSock, days);
+      }
     },
     { timezone: TIMEZONE }
   ));
+
   cronJobs.set('cleanup', cron.schedule('0 2 * * 0', runCleanup, { timezone: TIMEZONE }));
 
   printLog('info', '[BIRTHDAY] node-cron scheduler started');
 }
 
 async function runMissedTasks(sock: any): Promise<void> {
-  currentSock = sock; // keep in sync here too
+  currentSock = sock;
 
   const today       = moment.tz(TIMEZONE).format('YYYY-MM-DD');
   const currentTime = moment.tz(TIMEZONE).format('HH:mm');
@@ -531,7 +624,7 @@ async function runMissedTasks(sock: any): Promise<void> {
   }
 }
 
-// ── onLoad — bus listener + scheduler ────────────────────────────────────────
+// ── onLoad ────────────────────────────────────────────────────────────────────
 
 async function onLoad(sock: any): Promise<void> {
   await loadSettings();
@@ -571,12 +664,15 @@ async function onLoad(sock: any): Promise<void> {
 
 // ── Sub-command handlers ──────────────────────────────────────────────────────
 
-async function showBirthdayMenu(sock: any, message: any, chatId: string, channelInfo: any): Promise<void> {
-  const menu =
+async function showBirthdayMenu(sock: any, message: any, chatId: string, _channelInfo: any): Promise<void> {
+  const adminGroupId = await getAdminGroupId();
+  const isAdminHub   = chatId === adminGroupId;
+
+  let menu =
     `🎂 *BIRTHDAY SYSTEM* 🎂\n\n` +
     `📅 *View Commands:*\n` +
     `• *.birthday today* — Today's birthdays\n` +
-    `• *.birthday upcoming [days]* — Upcoming birthdays (default 7)\n` +
+    `• *.birthday upcoming [days]* — Upcoming (default 7 days)\n` +
     `• *.birthday thismonth* — This month's birthdays\n` +
     `• *.birthday status* — System status\n` +
     `• *.mybirthday* — View your birthday info\n\n` +
@@ -586,12 +682,24 @@ async function showBirthdayMenu(sock: any, message: any, chatId: string, channel
     `• *.birthday groups* — Manage reminder groups\n` +
     `• *.birthday force wishes* — Force today's wishes\n` +
     `• *.birthday force reminders [days]* — Force reminders\n` +
-    `• *.birthday test [@user]* — Test birthday wish\n\n` +
+    `• *.birthday test [@user]* — Test birthday wish\n\n`;
+
+  if (isAdminHub) {
+    menu +=
+      `🔐 *Admin Hub (this group only):*\n` +
+      `• *.birthday setphoto [number] [url]* — Attach birthday photo\n` +
+      `• *.birthday removeimage [number]* — Remove photo\n` +
+      `• *.birthday preview [number]* — Preview exact wish\n` +
+      `• *.birthday listimages* — Photo status for all members\n\n`;
+  }
+
+  menu +=
     `🤖 *Auto Features:*\n` +
     `• Birthdays auto-saved from attendance forms\n` +
     `• Scheduled wishes at midnight (WAT)\n` +
     `• Advance reminders 7, 3 & 1 day(s) before\n\n` +
     `🌍 Timezone: Africa/Lagos (WAT)`;
+
   await sock.sendMessage(chatId, { text: menu }, { quoted: message });
 }
 
@@ -599,21 +707,25 @@ async function handleMyBirthday(sock: any, message: any, senderId: string, chatI
   const data = await getBirthdayData(senderId);
   if (!data) {
     return sock.sendMessage(chatId, {
-      text: `🎂 *No Birthday Recorded*\n\nYour birthday hasn't been saved yet.\n\n💡 It is saved automatically when you submit an attendance form with your D.O.B.`
+      text:
+        `🎂 *No Birthday Recorded*\n\n` +
+        `Your birthday hasn't been saved yet.\n\n` +
+        `💡 It is saved automatically when you submit an attendance form with your D.O.B.`
     }, { quoted: message });
   }
+
   const b        = data.birthday;
   const now      = moment.tz(TIMEZONE);
   const nextBday = moment.tz({ year: now.year(), month: b.month - 1, date: b.day }, TIMEZONE);
   if (nextBday.isBefore(now, 'day')) nextBday.add(1, 'year');
   const daysUntil = nextBday.diff(now, 'days');
 
-  let msg = `🎂 *Your Birthday Information* 🎂\n\n`;
-  msg    += `👤 Name: ${data.name}\n`;
-  msg    += `📅 Birthday: ${b.displayDate}\n`;
+  let msg  = `🎂 *Your Birthday Information* 🎂\n\n`;
+  msg     += `👤 Name: ${data.name}\n`;
+  msg     += `📅 Birthday: ${b.displayDate}\n`;
   if (b.year)        msg += `📊 Year: ${b.year}\n`;
   if (b.age != null) msg += `🎈 Current Age: ${b.age} years old\n`;
-  msg    += `💾 Last Updated: ${new Date(data.lastUpdated).toLocaleString('en-NG', { timeZone: TIMEZONE })}\n\n`;
+  msg     += `💾 Last Updated: ${new Date(data.lastUpdated).toLocaleString('en-NG', { timeZone: TIMEZONE })}\n\n`;
 
   if      (daysUntil === 0) msg += `🎉 *IT'S YOUR BIRTHDAY TODAY!* 🎉\n🎊 *HAPPY BIRTHDAY!* 🎊`;
   else if (daysUntil === 1) msg += `🎂 *Your birthday is TOMORROW!* 🎂`;
@@ -630,6 +742,7 @@ async function handleToday(sock: any, message: any, chatId: string): Promise<voi
       text: `🎂 *No birthdays today*\n\n📅 Check upcoming: *.birthday upcoming*`
     }, { quoted: message });
   }
+
   let msg = `🎉 *TODAY'S BIRTHDAYS* 🎉\n\n`;
   const mentions: string[] = [];
   list.forEach(p => {
@@ -647,27 +760,29 @@ async function handleUpcoming(sock: any, message: any, chatId: string, args: str
   if (isNaN(days) || days < 1 || days > 365) {
     return sock.sendMessage(chatId, { text: '⚠️ Please provide a valid number of days (1-365)' }, { quoted: message });
   }
+
   const birthdays = await getAllBirthdays();
   const now       = moment.tz(TIMEZONE);
-  const upcomingList: (BirthdayDoc & { daysUntil: number })[] = [];
+  const upcoming: (BirthdayDoc & { daysUntil: number })[] = [];
 
   Object.values(birthdays).forEach(entry => {
     const b        = entry.birthday;
     const nextBday = moment.tz({ year: now.year(), month: b.month - 1, date: b.day }, TIMEZONE);
     if (nextBday.isBefore(now, 'day')) nextBday.add(1, 'year');
     const daysUntil = nextBday.diff(now, 'days');
-    if (daysUntil >= 0 && daysUntil <= days) upcomingList.push({ ...entry, daysUntil });
+    if (daysUntil >= 0 && daysUntil <= days) upcoming.push({ ...entry, daysUntil });
   });
 
-  if (upcomingList.length === 0) {
+  if (upcoming.length === 0) {
     return sock.sendMessage(chatId, { text: `📅 *No birthdays in the next ${days} days*` }, { quoted: message });
   }
 
-  upcomingList.sort((a, b) => a.daysUntil - b.daysUntil);
+  upcoming.sort((a, b) => a.daysUntil - b.daysUntil);
+
   let msg = `📅 *UPCOMING BIRTHDAYS (Next ${days} days)* 📅\n\n`;
   const mentions: string[] = [];
 
-  upcomingList.forEach(u => {
+  upcoming.forEach(u => {
     mentions.push(u.userId);
     if      (u.daysUntil === 0) msg += `🎊 @${u.userId.split('@')[0]} — *TODAY!* 🎊\n`;
     else if (u.daysUntil === 1) msg += `🎂 @${u.userId.split('@')[0]} — Tomorrow\n`;
@@ -677,6 +792,7 @@ async function handleUpcoming(sock: any, message: any, chatId: string, args: str
       msg += `   🎈 ${u.daysUntil === 0 ? 'Turned' : 'Turning'} ${age}\n`;
     }
   });
+
   await sock.sendMessage(chatId, { text: msg, mentions }, { quoted: message });
 }
 
@@ -730,6 +846,7 @@ async function handleAll(sock: any, message: any, chatId: string, senderId: stri
   let msg = `🎂 *ALL BIRTHDAYS* 🎂\n\n📊 Total: *${list.length} members*\n`;
   const mentions: string[] = [];
   let currentMonth: number | null = null;
+
   list.forEach(p => {
     mentions.push(p.userId);
     if (currentMonth !== p.birthday.month) {
@@ -740,37 +857,41 @@ async function handleAll(sock: any, message: any, chatId: string, senderId: stri
     if (p.birthday.age != null) msg += ` (${p.birthday.age} yrs)`;
     msg += '\n';
   });
+
   await sock.sendMessage(chatId, { text: msg, mentions }, { quoted: message });
 }
 
-// FIX 2 (continued): status command now uses range-based counts (same logic as
-// .birthday upcoming) so the numbers agree with what the user sees there.
 async function handleBirthdayStatus(sock: any, message: any, chatId: string): Promise<void> {
   await loadSettings();
   const allBdays = await getAllBirthdays();
   const now      = moment.tz(TIMEZONE);
 
-  const todayKey     = `${String(now.month() + 1).padStart(2, '0')}-${String(now.date()).padStart(2, '0')}`;
-  const todayCount   = Object.values(allBdays).filter(b => b.birthday?.searchKey === todayKey).length;
+  const todayKey      = `${String(now.month() + 1).padStart(2, '0')}-${String(now.date()).padStart(2, '0')}`;
+  const todayCount    = Object.values(allBdays).filter(b => b.birthday?.searchKey === todayKey).length;
   const tomorrowCount = countBirthdaysExactDay(allBdays, 1);
   const next3Count    = countBirthdaysWithinDays(allBdays, 3);
   const next7Count    = countBirthdaysWithinDays(allBdays, 7);
+  const withPhoto     = Object.values(allBdays).filter(b => b.birthdayImageUrl).length;
+  const adminGroupId  = await getAdminGroupId();
 
-  let msg = `📊 *BIRTHDAY SYSTEM STATUS* 📊\n\n`;
-  msg += `⏰ Time (WAT): ${now.format('YYYY-MM-DD HH:mm:ss')}\n`;
-  msg += `🤖 Scheduler: ${schedulerStarted ? '✅ Running' : '⚠️ Not started'}\n\n`;
-  msg += `📊 *Registered:* ${Object.keys(allBdays).length}\n`;
-  msg += `• Today: ${todayCount}\n`;
-  msg += `• Tomorrow: ${tomorrowCount}\n`;
-  msg += `• Next 3 days: ${next3Count}\n`;
-  msg += `• Next 7 days: ${next7Count}\n\n`;
-  msg += `⚙️ *Settings:*\n`;
-  msg += `• Auto Wishes: ${birthdaySettings.enableAutoWishes ? '✅' : '❌'} at ${birthdaySettings.wishTime}\n`;
-  msg += `• Reminders: ${birthdaySettings.enableReminders ? '✅' : '❌'} at ${birthdaySettings.reminderTime}\n`;
-  msg += `• Group Reminders: ${birthdaySettings.enableGroupReminders ? '✅' : '❌'}\n`;
-  msg += `• Private Wishes: ${birthdaySettings.enablePrivateReminders ? '✅' : '❌'}\n`;
-  msg += `• Reminder Days: ${birthdaySettings.reminderDays.join(', ')}\n`;
-  msg += `• Groups: ${birthdaySettings.reminderGroups.length}`;
+  let msg  = `📊 *BIRTHDAY SYSTEM STATUS* 📊\n\n`;
+  msg     += `⏰ Time (WAT): ${now.format('YYYY-MM-DD HH:mm:ss')}\n`;
+  msg     += `🤖 Scheduler: ${schedulerStarted ? '✅ Running' : '⚠️ Not started'}\n\n`;
+  msg     += `📊 *Registered:* ${Object.keys(allBdays).length}\n`;
+  msg     += `• Today: ${todayCount}\n`;
+  msg     += `• Tomorrow: ${tomorrowCount}\n`;
+  msg     += `• Next 3 days: ${next3Count}\n`;
+  msg     += `• Next 7 days: ${next7Count}\n`;
+  msg     += `• With photo: ${withPhoto} 🖼️\n\n`;
+  msg     += `⚙️ *Settings:*\n`;
+  msg     += `• Auto Wishes: ${birthdaySettings.enableAutoWishes ? '✅' : '❌'} at ${birthdaySettings.wishTime}\n`;
+  msg     += `• Reminders: ${birthdaySettings.enableReminders ? '✅' : '❌'} at ${birthdaySettings.reminderTime}\n`;
+  msg     += `• Group Reminders: ${birthdaySettings.enableGroupReminders ? '✅' : '❌'}\n`;
+  msg     += `• Private Wishes: ${birthdaySettings.enablePrivateReminders ? '✅' : '❌'}\n`;
+  msg     += `• Reminder Days: ${birthdaySettings.reminderDays.join(', ')}\n`;
+  msg     += `• Groups: ${birthdaySettings.reminderGroups.length}\n`;
+  msg     += `• Admin Hub: ${adminGroupId ? `✅ ${adminGroupId.split('@')[0]}` : '❌ Not set'}`;
+
   await sock.sendMessage(chatId, { text: msg }, { quoted: message });
 }
 
@@ -831,7 +952,12 @@ async function handleForce(sock: any, message: any, chatId: string, senderId: st
 
   if (!args[0]) {
     return sock.sendMessage(chatId, {
-      text: `🔧 *FORCE COMMANDS*\n\n• *wishes* - Force today's birthday wishes\n• *reminders [days]* - Force reminders\n• *cleanup* - Force cleanup\n\nUsage: *.birthday force [command]*`
+      text:
+        `🔧 *FORCE COMMANDS*\n\n` +
+        `• *wishes* — Force today's birthday wishes\n` +
+        `• *reminders [days]* — Force reminders\n` +
+        `• *cleanup* — Force cleanup\n\n` +
+        `Usage: *.birthday force [command]*`
     }, { quoted: message });
   }
 
@@ -861,21 +987,25 @@ async function handleForce(sock: any, message: any, chatId: string, senderId: st
 }
 
 async function showSettingsMenu(sock: any, message: any, chatId: string): Promise<void> {
-  const s = birthdaySettings;
-  let msg = `⚙️ *BIRTHDAY SETTINGS* ⚙️\n\n`;
-  msg += `🔔 Reminders: ${s.enableReminders ? '✅ ON' : '❌ OFF'}\n`;
-  msg += `🎉 Auto Wishes: ${s.enableAutoWishes ? '✅ ON' : '❌ OFF'}\n`;
-  msg += `👥 Group Reminders: ${s.enableGroupReminders ? '✅ ON' : '❌ OFF'}\n`;
-  msg += `💬 Private Reminders: ${s.enablePrivateReminders ? '✅ ON' : '❌ OFF'}\n`;
-  msg += `⏰ Wish Time (WAT): ${s.wishTime}\n`;
-  msg += `🔔 Reminder Time (WAT): ${s.reminderTime}\n`;
-  msg += `📅 Reminder Days: ${s.reminderDays.join(', ')} days before\n`;
-  msg += `👥 Groups: ${s.reminderGroups.length}\n\n`;
-  msg += `🔧 *Change Settings:*\n`;
-  msg += `• *.birthday settings reminders on/off*\n• *.birthday settings wishes on/off*\n`;
-  msg += `• *.birthday settings groupreminders on/off*\n• *.birthday settings privatereminders on/off*\n`;
-  msg += `• *.birthday settings wishtime HH:MM*\n• *.birthday settings remindertime HH:MM*\n`;
-  msg += `• *.birthday settings reminderdays 7,3,1*\n• *.birthday settings reload*`;
+  const s   = birthdaySettings;
+  let msg   = `⚙️ *BIRTHDAY SETTINGS* ⚙️\n\n`;
+  msg      += `🔔 Reminders: ${s.enableReminders ? '✅ ON' : '❌ OFF'}\n`;
+  msg      += `🎉 Auto Wishes: ${s.enableAutoWishes ? '✅ ON' : '❌ OFF'}\n`;
+  msg      += `👥 Group Reminders: ${s.enableGroupReminders ? '✅ ON' : '❌ OFF'}\n`;
+  msg      += `💬 Private Reminders: ${s.enablePrivateReminders ? '✅ ON' : '❌ OFF'}\n`;
+  msg      += `⏰ Wish Time (WAT): ${s.wishTime}\n`;
+  msg      += `🔔 Reminder Time (WAT): ${s.reminderTime}\n`;
+  msg      += `📅 Reminder Days: ${s.reminderDays.join(', ')} days before\n`;
+  msg      += `👥 Groups: ${s.reminderGroups.length}\n\n`;
+  msg      += `🔧 *Change Settings:*\n`;
+  msg      += `• *.birthday settings reminders on/off*\n`;
+  msg      += `• *.birthday settings wishes on/off*\n`;
+  msg      += `• *.birthday settings groupreminders on/off*\n`;
+  msg      += `• *.birthday settings privatereminders on/off*\n`;
+  msg      += `• *.birthday settings wishtime HH:MM*\n`;
+  msg      += `• *.birthday settings remindertime HH:MM*\n`;
+  msg      += `• *.birthday settings reminderdays 7,3,1*\n`;
+  msg      += `• *.birthday settings reload*`;
   await sock.sendMessage(chatId, { text: msg }, { quoted: message });
 }
 
@@ -993,6 +1123,193 @@ async function handleGroups(sock: any, message: any, chatId: string, senderId: s
   return showGroups(sock, message, chatId);
 }
 
+// ── Admin Hub handlers (admin group only) ─────────────────────────────────────
+
+async function handleSetAdminGroup(sock: any, message: any, chatId: string, senderId: string): Promise<void> {
+  const isOwner = await isOwnerOrSudo(senderId, sock, chatId);
+  if (!isOwner) {
+    return sock.sendMessage(chatId, { text: '🚫 Only the bot owner can register the admin hub.' }, { quoted: message });
+  }
+  if (!chatId.endsWith('@g.us')) {
+    return sock.sendMessage(chatId, { text: '⚠️ This command must be run inside a group.' }, { quoted: message });
+  }
+  await setAdminGroupId(chatId);
+  return sock.sendMessage(chatId, {
+    text:
+      `✅ *Birthday Admin Hub registered!*\n\n` +
+      `This group is now the private control centre for birthday photo management.\n\n` +
+      `🔐 *Available here:*\n` +
+      `• *.birthday setphoto [number] [url]*\n` +
+      `• *.birthday removeimage [number]*\n` +
+      `• *.birthday preview [number]*\n` +
+      `• *.birthday listimages*`
+  }, { quoted: message });
+}
+
+async function handleSetPhoto(sock: any, message: any, chatId: string, args: string[]): Promise<void> {
+  // Silent rejection outside admin hub — no hint to other groups that this exists
+  if (!await isFromAdminGroup(chatId)) return;
+
+  if (args.length < 1) {
+    return sock.sendMessage(chatId, {
+      text:
+        `⚠️ *Usage:*\n` +
+        `*.birthday setphoto [number] [url]*\n\n` +
+        `Or reply to a *.tourl* result:\n` +
+        `*.birthday setphoto [number]*`
+    }, { quoted: message });
+  }
+
+  const phone = args[0].replace(/\D/g, '');
+  if (!phone || phone.length < 7) {
+    return sock.sendMessage(chatId, {
+      text: '⚠️ Please provide a valid phone number.\n\nExample: *.birthday setphoto 2348012345678 https://...*'
+    }, { quoted: message });
+  }
+
+  // URL from inline arg, or extracted from a quoted .tourl reply
+  let url: string | null = args[1] || null;
+
+  if (!url) {
+    const quotedText: string =
+      message.message?.extendedTextMessage?.contextInfo?.quotedMessage?.conversation ||
+      message.message?.extendedTextMessage?.contextInfo?.quotedMessage?.extendedTextMessage?.text ||
+      '';
+    const match = quotedText.match(/https:\/\/\S+/);
+    if (match) url = match[0];
+  }
+
+  if (!url || !url.startsWith('https://')) {
+    return sock.sendMessage(chatId, {
+      text:
+        '⚠️ No valid URL found.\n\n' +
+        'Provide it directly: *.birthday setphoto [number] [url]*\n' +
+        'Or reply to a *.tourl* result.'
+    }, { quoted: message });
+  }
+
+  const person = await findByPhone(phone);
+  if (!person) {
+    return sock.sendMessage(chatId, {
+      text: `❌ No birthday record found for *${phone}*.\n\nMake sure they have submitted an attendance form first.`
+    }, { quoted: message });
+  }
+
+  const success = await setPhoto(person.userId, url);
+  if (success) {
+    return sock.sendMessage(chatId, {
+      text:
+        `✅ Birthday photo saved for *${person.name}*!\n\n` +
+        `🔗 ${url}\n\n` +
+        `🎂 Their wish on *${person.birthday.displayDate}* will include this photo.\n\n` +
+        `💡 Use *.birthday preview ${phone}* to see exactly how it will look.`
+    }, { quoted: message });
+  }
+  return sock.sendMessage(chatId, { text: `❌ Failed to save photo for *${person.name}*.` }, { quoted: message });
+}
+
+async function handleRemoveImage(sock: any, message: any, chatId: string, args: string[]): Promise<void> {
+  if (!await isFromAdminGroup(chatId)) return;
+
+  if (!args[0]) {
+    return sock.sendMessage(chatId, { text: '⚠️ Usage: *.birthday removeimage [number]*' }, { quoted: message });
+  }
+
+  const phone  = args[0].replace(/\D/g, '');
+  const person = await findByPhone(phone);
+  if (!person) {
+    return sock.sendMessage(chatId, { text: `❌ No birthday record found for *${phone}*.` }, { quoted: message });
+  }
+  if (!person.birthdayImageUrl) {
+    return sock.sendMessage(chatId, { text: `⚠️ *${person.name}* doesn't have a photo set.` }, { quoted: message });
+  }
+
+  const success = await removePhoto(person.userId);
+  if (success) {
+    return sock.sendMessage(chatId, {
+      text: `✅ Photo removed for *${person.name}*. Their wish will be text-only.`
+    }, { quoted: message });
+  }
+  return sock.sendMessage(chatId, { text: `❌ Failed to remove photo for *${person.name}*.` }, { quoted: message });
+}
+
+async function handlePreview(sock: any, message: any, chatId: string, args: string[]): Promise<void> {
+  if (!await isFromAdminGroup(chatId)) return;
+
+  if (!args[0]) {
+    return sock.sendMessage(chatId, { text: '⚠️ Usage: *.birthday preview [number]*' }, { quoted: message });
+  }
+
+  const phone  = args[0].replace(/\D/g, '');
+  const person = await findByPhone(phone);
+  if (!person) {
+    return sock.sendMessage(chatId, { text: `❌ No birthday record found for *${phone}*.` }, { quoted: message });
+  }
+
+  const wishText = getBirthdayWishMessage(person);
+
+  // Metadata header
+  await sock.sendMessage(chatId, {
+    text:
+      `🔍 *PREVIEW — ${person.name}*\n\n` +
+      `📅 Birthday: ${person.birthday.displayDate}\n` +
+      `🖼️ Photo: ${person.birthdayImageUrl ? '✅ Set' : '❌ Not set (will send as text)'}\n` +
+      `${person.birthdayImageUrl ? `🔗 ${person.birthdayImageUrl}\n` : ''}` +
+      `─────────────────`
+  }, { quoted: message });
+
+  await new Promise(r => setTimeout(r, 1000));
+
+  // Actual wish preview
+  if (person.birthdayImageUrl) {
+    await sock.sendMessage(chatId, {
+      image:   { url: person.birthdayImageUrl },
+      caption: wishText
+    });
+  } else {
+    await sock.sendMessage(chatId, { text: wishText });
+  }
+}
+
+async function handleListImages(sock: any, message: any, chatId: string): Promise<void> {
+  if (!await isFromAdminGroup(chatId)) return;
+
+  const birthdays = await getAllBirthdays();
+  const list      = Object.values(birthdays).sort((a, b) => {
+    if (a.birthday.month !== b.birthday.month) return a.birthday.month - b.birthday.month;
+    return a.birthday.day - b.birthday.day;
+  });
+
+  if (list.length === 0) {
+    return sock.sendMessage(chatId, { text: '📋 No birthday records found.' }, { quoted: message });
+  }
+
+  const withPhoto    = list.filter(b => b.birthdayImageUrl);
+  const withoutPhoto = list.filter(b => !b.birthdayImageUrl);
+
+  let msg  = `🖼️ *BIRTHDAY PHOTO STATUS*\n\n`;
+  msg     += `✅ Ready: ${withPhoto.length}\n`;
+  msg     += `❌ Needs photo: ${withoutPhoto.length}\n`;
+  msg     += `📊 Total: ${list.length}\n\n`;
+
+  if (withPhoto.length > 0) {
+    msg += `*✅ READY:*\n`;
+    withPhoto.forEach(p => {
+      msg += `• ${p.name} — ${p.birthday.displayDate}\n`;
+    });
+    msg += '\n';
+  }
+
+  if (withoutPhoto.length > 0) {
+    msg += `*❌ NEEDS PHOTO:*\n`;
+    withoutPhoto.forEach(p => {
+      msg += `• ${p.name} — ${p.birthday.displayDate} _(${p.userId.split('@')[0]})_\n`;
+    });
+  }
+
+  await sock.sendMessage(chatId, { text: msg }, { quoted: message });
+}
+
 // ── Main command handler ──────────────────────────────────────────────────────
 
 async function handleBirthdayCommand(sock: any, message: any, args: string[], context: any): Promise<void> {
@@ -1014,16 +1331,21 @@ async function handleBirthdayCommand(sock: any, message: any, args: string[], co
   const subArgs = args.slice(1);
 
   switch (sub) {
-    case 'today':     return handleToday(sock, message, chatId);
-    case 'upcoming':  return handleUpcoming(sock, message, chatId, subArgs);
-    case 'thismonth': return handleThisMonth(sock, message, chatId);
-    case 'status':    return handleBirthdayStatus(sock, message, chatId);
-    case 'all':       return handleAll(sock, message, chatId, senderId);
-    case 'test':      return handleTest(sock, message, chatId, senderId, isGroup);
-    case 'settings':  return handleSettingsCmd(sock, message, chatId, senderId, subArgs);
-    case 'groups':    return handleGroups(sock, message, chatId, senderId, isGroup, subArgs);
-    case 'force':     return handleForce(sock, message, chatId, senderId, subArgs);
-    case 'help':      return showBirthdayMenu(sock, message, chatId, context.channelInfo || {});
+    case 'today':          return handleToday(sock, message, chatId);
+    case 'upcoming':       return handleUpcoming(sock, message, chatId, subArgs);
+    case 'thismonth':      return handleThisMonth(sock, message, chatId);
+    case 'status':         return handleBirthdayStatus(sock, message, chatId);
+    case 'all':            return handleAll(sock, message, chatId, senderId);
+    case 'test':           return handleTest(sock, message, chatId, senderId, isGroup);
+    case 'settings':       return handleSettingsCmd(sock, message, chatId, senderId, subArgs);
+    case 'groups':         return handleGroups(sock, message, chatId, senderId, isGroup, subArgs);
+    case 'force':          return handleForce(sock, message, chatId, senderId, subArgs);
+    case 'setadmingroup':  return handleSetAdminGroup(sock, message, chatId, senderId);
+    case 'setphoto':       return handleSetPhoto(sock, message, chatId, subArgs);
+    case 'removeimage':    return handleRemoveImage(sock, message, chatId, subArgs);
+    case 'preview':        return handlePreview(sock, message, chatId, subArgs);
+    case 'listimages':     return handleListImages(sock, message, chatId);
+    case 'help':           return showBirthdayMenu(sock, message, chatId, context.channelInfo || {});
     default:
       return sock.sendMessage(chatId, {
         text: `❓ Unknown birthday command: *${sub}*\n\nUse *.birthday help* to see available commands.`
@@ -1036,7 +1358,7 @@ async function handleBirthdayCommand(sock: any, message: any, args: string[], co
 const birthdayPlugin = {
   command:     'birthday',
   aliases:     ['bday', 'birthdays', 'mybirthday', 'mybday'],
-  description: 'Birthday system — auto wishes, reminders, and tracking',
+  description: 'Birthday system — auto wishes, reminders, photo management, and tracking',
   category:    'social',
   handler:     handleBirthdayCommand,
   onLoad,
