@@ -31,6 +31,7 @@ import { writeErrorLog } from './logger.js';
 
 import { channelInfo } from './messageConfig.js';
 import { handleAutoAttendance } from '../plugins/attendance.js';
+import { handleGroupAutoDownload } from '../plugins/group-autodownload.js';
 
 const MONGO_URL = process.env.MONGO_URL;
 const POSTGRES_URL = process.env.POSTGRES_URL;
@@ -351,6 +352,17 @@ async function handleMessages(sock: any, messageUpdate: any) {
             }
             return;
         }
+        
+        // ── Download-group auto-downloader ─────────────────────────
+if (isGroup && !message.key.fromMe) {
+    const autoHandled = await handleGroupAutoDownload(sock, message, {
+        chatId, senderId, isGroup, config, channelInfo,
+        rawText, userMessage, messageText,
+        isSenderAdmin: false, isBotAdmin: false,
+        senderIsOwnerOrSudo: false, isOwnerOrSudoCheck: false,
+    });
+    if (autoHandled) return;
+}
 
         if (/^[1-9]$/.test(userMessage) || userMessage === 'surrender') {
             await handleTicTacToeMove(sock, chatId, senderId, userMessage);
