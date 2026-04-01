@@ -32,7 +32,7 @@ import { writeErrorLog } from './logger.js';
 import { channelInfo } from './messageConfig.js';
 import { handleAutoAttendance } from '../plugins/attendance.js';
 import { handleGroupAutoDownload } from '../plugins/group-autodownload.js';
-import { wcgOnMessage } from '../plugins/wcg.js';
+import { wcgOnMessage } from '../plugins/wrg.js';
 
 const MONGO_URL = process.env.MONGO_URL;
 const POSTGRES_URL = process.env.POSTGRES_URL;
