@@ -370,6 +370,24 @@ if (isGroup && !message.key.fromMe) {
             return;
         }
 
+        // ── WCG prefixless hook — must run before command routing ──────────
+        const wcgHandled = await wcgOnMessage(sock, message, {
+            chatId,
+            senderId,
+            isGroup,
+            channelInfo,
+            userMessage,
+            messageText,
+            rawText,
+            config,
+            isSenderAdmin: false,
+            isBotAdmin: false,
+            senderIsOwnerOrSudo: false,
+            isOwnerOrSudoCheck: false,
+        });
+        if (wcgHandled) return;
+        // ───────────────────────────────────────────────────────────────────
+
         if (!message.key.fromMe) {
             await store.incrementMessageCount(chatId, senderId, message.pushName);
         } else {
@@ -568,9 +586,6 @@ if (isGroup && !message.key.fromMe) {
             messageText,
             config
         };
-        
-        const wcgHandled = await wcgOnMessage(sock, message, context);
-if (wcgHandled) return;
 
         try {
             await command.handler(sock, message, args, context);
