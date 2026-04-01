@@ -369,9 +369,6 @@ if (isGroup && !message.key.fromMe) {
             await handleTicTacToeMove(sock, chatId, senderId, userMessage);
             return;
         }
-        
-        const wcgHandled = await wcgOnMessage(sock, message, context);
-if (wcgHandled) return;
 
         if (!message.key.fromMe) {
             await store.incrementMessageCount(chatId, senderId, message.pushName);
@@ -571,6 +568,9 @@ if (wcgHandled) return;
             messageText,
             config
         };
+        
+        const wcgHandled = await wcgOnMessage(sock, message, context);
+if (wcgHandled) return;
 
         try {
             await command.handler(sock, message, args, context);
