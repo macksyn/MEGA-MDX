@@ -1,71 +1,97 @@
 // ============================================================
-//  Word Challenge Game (wcg)
-//  WhatsApp Bot Command — Baileys-compatible
+//  Word Challenge Game — wcg.ts
+//  Plugin for MEGA-MD / Baileys bot
+//
+//  INTEGRATION (two steps, both required):
+//
+//  STEP 1 — This file goes in:  plugins/wcg.ts
+//
+//  STEP 2 — In lib/messageHandler.ts, add these two lines:
+//
+//    Import at the top of the file (with the other imports):
+//      import { wcgOnMessage } from '../plugins/wcg.js';
+//
+//    Inside handleMessages(), right after the TicTacToe block:
+//      const wcgHandled = await wcgOnMessage(sock, message, context);
+//      if (wcgHandled) return;
+//
+//  That's it. The command trigger (.wcg / wcg) is handled
+//  automatically by the command system. The onMessage export
+//  handles prefixless gameplay (join, words, endgame).
 // ============================================================
 
-import fs from "fs";
-import path from "path";
+import fs   from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-// ── Types ─────────────────────────────────────────────────────
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
+
+// ── Types ──────────────────────────────────────────────────────────────────────
 
 interface Player {
-    jid: string;
+    jid:   string;
     score: number;
 }
 
 interface GameState {
-    phase: "joining" | "active" | "ended";
-    players: Map<string, Player>;   // jid → Player
-    turnOrder: string[];            // shuffled jid list
-    turnIndex: number;              // pointer into turnOrder
-    round: number;
-    letter: string;
+    phase:     'joining' | 'active' | 'ended';
+    players:   Map<string, Player>;  // jid → Player
+    turnOrder: string[];             // shuffled jid list
+    turnIndex: number;
+    round:     number;
+    letter:    string;
     minLength: number;
     usedWords: Set<string>;
-    timer: ReturnType<typeof setTimeout> | null;
-    hostJid: string;
+    hostJid:   string;
     startedAt: number;
+    // All timers stored so cleanupGame() can clear every one
+    joinTimer:   ReturnType<typeof setTimeout> | null;
+    reminder30:  ReturnType<typeof setTimeout> | null;
+    reminder15:  ReturnType<typeof setTimeout> | null;
+    turnTimer:   ReturnType<typeof setTimeout> | null;
 }
 
-// ── Constants ──────────────────────────────────────────────────
+// ── Constants ──────────────────────────────────────────────────────────────────
 
 const MAX_PLAYERS  = 10;
 const MIN_PLAYERS  = 2;
-const JOIN_WINDOW  = 60_000;       // 60s lobby
-const MAX_GAME_AGE = 30 * 60_000;  // 30min hard cap
+const JOIN_WINDOW  = 60_000;        // 60 s lobby
+const MAX_GAME_AGE = 30 * 60_000;   // 30 min hard cap
 
-// ── Word List ──────────────────────────────────────────────────
-
-// Expects a JSON file at ./words.json shaped as a flat array:
-//   ["apple", "banana", "crate", ...]
+// ── Word list ──────────────────────────────────────────────────────────────────
 //
-// Recommended source:
-//   https://github.com/dwyl/english-words  →  words_alpha.txt → JSON
+//  Place words.json next to this file (or adjust the path below).
+//  Shape: a flat JSON array of lowercase strings — ["apple","banana",...]
 //
-// Tip: pre-filter the list to words >= 3 letters to keep the Set lean.
+//  Recommended source: https://github.com/dwyl/english-words
+//  Convert words_alpha.txt to JSON with:
+//
+//    node -e "
+//      const w = require('fs').readFileSync('words_alpha.txt','utf8')
+//        .split('\n').map(s=>s.trim().toLowerCase()).filter(s=>s.length>=3);
+//      require('fs').writeFileSync('words.json', JSON.stringify(w));
+//    "
 
 let wordSet: Set<string> = new Set();
 
-function loadWordList(): void {
+(function loadWordList() {
     try {
-        const filePath = path.resolve(__dirname, "words.json");
-        const raw      = fs.readFileSync(filePath, "utf-8");
-        const list     = JSON.parse(raw) as string[];
-        wordSet        = new Set(list.map(w => w.toLowerCase().trim()));
-        console.log(`[wcg] Loaded ${wordSet.size.toLocaleString()} words.`);
-    } catch (err) {
-        console.error("[wcg] words.json not found — word validation disabled.", err);
+        const fp   = path.resolve(__dirname, 'words.json');
+        const list = JSON.parse(fs.readFileSync(fp, 'utf-8')) as string[];
+        wordSet    = new Set(list.map(w => w.toLowerCase().trim()));
+        console.log(`[wcg] ✅ Loaded ${wordSet.size.toLocaleString()} words.`);
+    } catch {
+        console.warn('[wcg] ⚠️  words.json not found — word validation disabled (accepts everything).');
     }
-}
-
-loadWordList();
+})();
 
 function isValidWord(word: string): boolean {
-    if (wordSet.size === 0) return true; // graceful degradation if file missing
+    if (wordSet.size === 0) return true; // graceful degradation
     return wordSet.has(word);
 }
 
-// ── Store ──────────────────────────────────────────────────────
+// ── Game store ─────────────────────────────────────────────────────────────────
 
 const games = new Map<string, GameState>();
 
@@ -79,7 +105,7 @@ setInterval(() => {
     }
 }, 10 * 60_000);
 
-// ── Difficulty ─────────────────────────────────────────────────
+// ── Difficulty ─────────────────────────────────────────────────────────────────
 
 function getDifficulty(round: number): { time: number; minLength: number } {
     return {
@@ -88,18 +114,18 @@ function getDifficulty(round: number): { time: number; minLength: number } {
     };
 }
 
-// ── Helpers ────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
+/** Skews away from rare letters (q, x, z) for fairness */
 function randomLetter(): string {
-    // Skews away from rare letters (q, x, z) for fairness
-    const pool = "aaabbbcccdddeeefffggghhh" +
-                 "iiijjjkkkllllmmmnnnoooppp" +
-                 "rrrssssttttuuuvvvwwwyyyy";
+    const pool = 'aaabbbcccdddeeefffggghhh' +
+                 'iiijjjkkkllllmmmnnnoooppp' +
+                 'rrrssssttttuuuvvvwwwyyyy';
     return pool[Math.floor(Math.random() * pool.length)];
 }
 
 function mention(jid: string): string {
-    return `@${jid.split("@")[0]}`;
+    return `@${jid.split('@')[0]}`;
 }
 
 function currentPlayer(game: GameState): string {
@@ -114,21 +140,21 @@ function advanceTurn(game: GameState): void {
 function cleanupGame(chatId: string): void {
     const game = games.get(chatId);
     if (!game) return;
-    if (game.timer) clearTimeout(game.timer);
+    clearTimeout(game.joinTimer  ?? undefined);
+    clearTimeout(game.reminder30 ?? undefined);
+    clearTimeout(game.reminder15 ?? undefined);
+    clearTimeout(game.turnTimer  ?? undefined);
     games.delete(chatId);
 }
 
-// ── Turn Orchestration ─────────────────────────────────────────
+// ── Turn orchestration ─────────────────────────────────────────────────────────
 
-async function startTurn(
-    sock: any,
-    chatId: string,
-    channelInfo: any
-): Promise<void> {
+async function startTurn(sock: any, chatId: string, channelInfo: any): Promise<void> {
     const game = games.get(chatId);
-    if (!game || game.phase !== "active") return;
+    if (!game || game.phase !== 'active') return;
 
-    if (game.timer) clearTimeout(game.timer);
+    // Always clear any running turn timer before setting a new one
+    if (game.turnTimer) clearTimeout(game.turnTimer);
 
     const { time, minLength } = getDifficulty(game.round);
     const letter              = randomLetter();
@@ -149,34 +175,32 @@ async function startTurn(
         ...channelInfo,
     });
 
-    // Only a timeout eliminates — wrong answers just prompt a retry
-    game.timer = setTimeout(async () => {
-        await eliminatePlayer(sock, chatId, turnJid, "⏱️ Time's up!", channelInfo);
+    // Only timeout eliminates — wrong answers just prompt retries
+    game.turnTimer = setTimeout(async () => {
+        await eliminatePlayer(sock, chatId, turnJid, '⏱️ Time\'s up!', channelInfo);
     }, time);
 }
 
-// ── Elimination (timeout only) ─────────────────────────────────
+// ── Elimination ────────────────────────────────────────────────────────────────
 
 async function eliminatePlayer(
     sock: any,
     chatId: string,
     loserJid: string,
     reason: string,
-    channelInfo: any
+    channelInfo: any,
 ): Promise<void> {
     const game = games.get(chatId);
-    if (!game || game.phase !== "active") return;
+    if (!game || game.phase !== 'active') return;
 
-    if (game.timer) clearTimeout(game.timer);
-    game.timer = null;
+    if (game.turnTimer) clearTimeout(game.turnTimer);
+    game.turnTimer = null;
 
     const idx = game.turnOrder.indexOf(loserJid);
     if (idx !== -1) game.turnOrder.splice(idx, 1);
 
-    // Keep index in bounds after the splice
-    if (game.turnIndex >= game.turnOrder.length) {
-        game.turnIndex = 0;
-    }
+    // Keep index in bounds after splice
+    if (game.turnIndex >= game.turnOrder.length) game.turnIndex = 0;
 
     await sock.sendMessage(chatId, {
         text:
@@ -194,34 +218,35 @@ async function eliminatePlayer(
 
     if (game.turnOrder.length === 0) {
         cleanupGame(chatId);
-        return sock.sendMessage(chatId, {
-            text: "🤝 It's a draw — everyone ran out of time!",
+        await sock.sendMessage(chatId, {
+            text: '🤝 It\'s a draw — everyone ran out of time!',
             ...channelInfo,
         });
+        return;
     }
 
     await startTurn(sock, chatId, channelInfo);
 }
 
-// ── End Game ───────────────────────────────────────────────────
+// ── End game ───────────────────────────────────────────────────────────────────
 
 async function endGame(
     sock: any,
     chatId: string,
     winnerJid: string,
-    channelInfo: any
+    channelInfo: any,
 ): Promise<void> {
     const game = games.get(chatId);
     if (!game) return;
 
-    game.phase = "ended";
-    if (game.timer) clearTimeout(game.timer);
+    game.phase = 'ended';
+    if (game.turnTimer) clearTimeout(game.turnTimer);
 
-    const medals = ["🥇", "🥈", "🥉"];
+    const medals = ['🥇', '🥈', '🥉'];
     const board  = [...game.players.values()]
         .sort((a, b) => b.score - a.score)
-        .map((p, i) => `${medals[i] ?? "▪️"} ${mention(p.jid)} — ${p.score} pts`)
-        .join("\n");
+        .map((p, i) => `${medals[i] ?? '▪️'} ${mention(p.jid)} — ${p.score} pts`)
+        .join('\n');
 
     await sock.sendMessage(chatId, {
         text:
@@ -235,14 +260,142 @@ async function endGame(
     cleanupGame(chatId);
 }
 
-// ── Main Handler ───────────────────────────────────────────────
+// ── Prefixless message hook ────────────────────────────────────────────────────
+//
+//  Called from messageHandler.ts on every group message.
+//  Returns true if the message was consumed (so the caller can return early).
+
+export async function wcgOnMessage(
+    sock: any,
+    message: any,
+    context: any = {},
+): Promise<boolean> {
+    const { chatId, senderId, userMessage, channelInfo } = context;
+
+    const game = games.get(chatId);
+    if (!game) return false;   // no active game → not our message
+
+    const msg = (userMessage as string).trim().toLowerCase();
+
+    // ── Join (lobby phase) ──────────────────────────────────────────────────
+    if (game.phase === 'joining' && msg === 'join') {
+        if (game.players.has(senderId)) {
+            await sock.sendMessage(chatId, {
+                text: `⚠️ ${mention(senderId)} you're already in!`,
+                mentions: [senderId],
+                ...channelInfo,
+            });
+            return true;
+        }
+        if (game.players.size >= MAX_PLAYERS) {
+            await sock.sendMessage(chatId, {
+                text: `⛔ Game is full! (max ${MAX_PLAYERS} players)`,
+                ...channelInfo,
+            });
+            return true;
+        }
+
+        game.players.set(senderId, { jid: senderId, score: 0 });
+        await sock.sendMessage(chatId, {
+            text: `✅ ${mention(senderId)} joined! (${game.players.size}/${MAX_PLAYERS})`,
+            mentions: [senderId],
+            ...channelInfo,
+        });
+        return true;
+    }
+
+    // ── Force-end (host only, any phase) ───────────────────────────────────
+    if (msg === 'endgame' && senderId === game.hostJid) {
+        cleanupGame(chatId);
+        await sock.sendMessage(chatId, {
+            text: '🛑 Game ended by host.',
+            ...channelInfo,
+        });
+        return true;
+    }
+
+    // ── Gameplay ────────────────────────────────────────────────────────────
+    if (game.phase !== 'active') return false;
+    if (currentPlayer(game) !== senderId) return false;  // not your turn — don't consume
+
+    const word = msg;
+
+    // Format check — feedback but timer keeps running
+    if (!/^[a-z]+$/.test(word)) {
+        await sock.sendMessage(chatId, {
+            text: '❌ Letters only — no spaces or special characters. Try again!',
+            ...channelInfo,
+        });
+        return true;
+    }
+
+    if (word[0] !== game.letter) {
+        await sock.sendMessage(chatId, {
+            text: `❌ Must start with *${game.letter.toUpperCase()}*. Try again!`,
+            ...channelInfo,
+        });
+        return true;
+    }
+
+    if (word.length < game.minLength) {
+        await sock.sendMessage(chatId, {
+            text: `❌ Too short! Need at least *${game.minLength}* letters. Try again!`,
+            ...channelInfo,
+        });
+        return true;
+    }
+
+    if (game.usedWords.has(word)) {
+        await sock.sendMessage(chatId, {
+            text: `❌ *${word}* was already used! Try a different word.`,
+            ...channelInfo,
+        });
+        return true;
+    }
+
+    if (!isValidWord(word)) {
+        await sock.sendMessage(chatId, {
+            text: `❌ *${word}* isn't in the dictionary. Try again!`,
+            ...channelInfo,
+        });
+        return true;
+    }
+
+    // ── Word accepted ───────────────────────────────────────────────────────
+    if (game.turnTimer) clearTimeout(game.turnTimer);
+    game.turnTimer = null;
+
+    game.usedWords.add(word);
+
+    const player = game.players.get(senderId)!;
+    const points = word.length;
+    player.score += points;
+
+    await sock.sendMessage(chatId, {
+        text:
+            `✅ *${word}* accepted! (+${points} pts)\n` +
+            `${mention(senderId)}: ${player.score} pts total`,
+        mentions: [senderId],
+        ...channelInfo,
+    });
+
+    advanceTurn(game);
+    await startTurn(sock, chatId, channelInfo);
+    return true;
+}
+
+// ── Command export ─────────────────────────────────────────────────────────────
+//
+//  isPrefixless: true  →  both ".wcg" and "wcg" trigger this command.
+//  commandHandler.getCommand() handles prefix-stripping automatically,
+//  and registers "wcg" in prefixlessCommands so bare "wcg" also matches.
 
 export default {
-    command:     "wcg",
-    aliases:     ["wordgame"],
-    category:    "games",
-    description: "Start Word Challenge Game",
-    usage:       ".wcg",
+    command:     'wcg',
+    aliases:     ['wordgame'],
+    category:    'games',
+    description: 'Start Word Challenge Game',
+    usage:       '.wcg',
 
     groupOnly:    true,
     isPrefixless: true,
@@ -251,174 +404,104 @@ export default {
         sock: any,
         message: any,
         _args: any[],
-        context: any = {}
+        context: any = {},
     ) {
-        const { chatId, senderId, userMessage, channelInfo } = context;
+        const { chatId, senderId, channelInfo } = context;
 
-        const msg  = userMessage.trim().toLowerCase();
-        const game = games.get(chatId);
-
-        // ── Start ──────────────────────────────────────────────
-        if (!game && msg === "wcg") {
-            const newGame: GameState = {
-                phase:     "joining",
-                players:   new Map(),
-                turnOrder: [],
-                turnIndex: 0,
-                round:     1,
-                letter:    "",
-                minLength: 3,
-                usedWords: new Set(),
-                timer:     null,
-                hostJid:   senderId,
-                startedAt: Date.now(),
-            };
-
-            // Host is auto-joined
-            newGame.players.set(senderId, { jid: senderId, score: 0 });
-            games.set(chatId, newGame);
-
-            await sock.sendMessage(chatId, {
-                text:
-                    `🎮 *Word Challenge Game*\n\n` +
-                    `${mention(senderId)} started a game!\n` +
-                    `Type *join* to enter. (max ${MAX_PLAYERS} players)\n\n` +
-                    `⏱️ Game kicks off in 60 seconds`,
-                mentions: [senderId],
-                ...channelInfo,
-            });
-
-            newGame.timer = setTimeout(async () => {
-                const g = games.get(chatId);
-                if (!g || g.phase !== "joining") return;
-
-                if (g.players.size < MIN_PLAYERS) {
-                    cleanupGame(chatId);
-                    return sock.sendMessage(chatId, {
-                        text: `❌ Not enough players. Need at least ${MIN_PLAYERS}.`,
-                        ...channelInfo,
-                    });
-                }
-
-                g.phase     = "active";
-                g.turnOrder = [...g.players.keys()].sort(() => 0.5 - Math.random());
-                g.turnIndex = 0;
-
-                const names = g.turnOrder.map(mention).join(", ");
-
-                await sock.sendMessage(chatId, {
-                    text:
-                        `✅ *Game starting with ${g.turnOrder.length} players!*\n\n` +
-                        `Turn order: ${names}\n\n` +
-                        `⚠️ Wrong answers are *allowed* — only running out of time gets you eliminated!`,
-                    mentions: g.turnOrder,
-                    ...channelInfo,
-                });
-
-                await startTurn(sock, chatId, channelInfo);
-
-            }, JOIN_WINDOW);
-
-            return;
-        }
-
-        if (!game) return;
-
-        // ── Join ───────────────────────────────────────────────
-        if (game.phase === "joining" && msg === "join") {
-            if (game.players.has(senderId)) {
-                return sock.sendMessage(chatId, {
-                    text: `⚠️ ${mention(senderId)} you're already in!`,
-                    mentions: [senderId],
-                    ...channelInfo,
-                });
-            }
-            if (game.players.size >= MAX_PLAYERS) {
-                return sock.sendMessage(chatId, {
-                    text: `⛔ Game is full! (max ${MAX_PLAYERS} players)`,
-                    ...channelInfo,
-                });
-            }
-
-            game.players.set(senderId, { jid: senderId, score: 0 });
-
+        if (games.has(chatId)) {
             return sock.sendMessage(chatId, {
-                text: `✅ ${mention(senderId)} joined! (${game.players.size}/${MAX_PLAYERS})`,
-                mentions: [senderId],
+                text: '⚠️ A game is already running in this group!',
                 ...channelInfo,
             });
         }
 
-        // ── Force-end (host only) ──────────────────────────────
-        if (msg === "endgame" && senderId === game.hostJid) {
-            cleanupGame(chatId);
-            return sock.sendMessage(chatId, {
-                text: "🛑 Game ended by host.",
-                ...channelInfo,
-            });
-        }
+        const newGame: GameState = {
+            phase:     'joining',
+            players:   new Map(),
+            turnOrder: [],
+            turnIndex: 0,
+            round:     1,
+            letter:    '',
+            minLength: 3,
+            usedWords: new Set(),
+            hostJid:   senderId,
+            startedAt: Date.now(),
+            joinTimer:  null,
+            reminder30: null,
+            reminder15: null,
+            turnTimer:  null,
+        };
 
-        // ── Gameplay ───────────────────────────────────────────
-        if (game.phase !== "active") return;
-        if (currentPlayer(game) !== senderId) return; // not your turn — ignore silently
-
-        const word = msg;
-
-        // Format check — send feedback but keep timer running
-        if (!/^[a-z]+$/.test(word)) {
-            return sock.sendMessage(chatId, {
-                text: `❌ Letters only — no spaces or special characters. Try again!`,
-                ...channelInfo,
-            });
-        }
-
-        if (word[0] !== game.letter) {
-            return sock.sendMessage(chatId, {
-                text: `❌ Must start with *${game.letter.toUpperCase()}*. Try again!`,
-                ...channelInfo,
-            });
-        }
-
-        if (word.length < game.minLength) {
-            return sock.sendMessage(chatId, {
-                text: `❌ Too short! Need at least *${game.minLength}* letters. Try again!`,
-                ...channelInfo,
-            });
-        }
-
-        if (game.usedWords.has(word)) {
-            return sock.sendMessage(chatId, {
-                text: `❌ *${word}* was already used! Try a different word.`,
-                ...channelInfo,
-            });
-        }
-
-        if (!isValidWord(word)) {
-            return sock.sendMessage(chatId, {
-                text: `❌ *${word}* isn't in the dictionary. Try again!`,
-                ...channelInfo,
-            });
-        }
-
-        // ── Word accepted ──────────────────────────────────────
-        if (game.timer) clearTimeout(game.timer);
-        game.timer = null;
-
-        game.usedWords.add(word);
-
-        const player = game.players.get(senderId)!;
-        const points = word.length;
-        player.score += points;
+        // Host is auto-joined
+        newGame.players.set(senderId, { jid: senderId, score: 0 });
+        games.set(chatId, newGame);
 
         await sock.sendMessage(chatId, {
             text:
-                `✅ *${word}* accepted! (+${points} pts)\n` +
-                `${mention(senderId)}: ${player.score} pts total`,
+                `🎮 *Random Word Game*\n\n` +
+                `${mention(senderId)} has started the game!\n` +
+                `👥 Needs 2 or more players 🙋‍♂️🙋‍♀️\n`+
+                `Type *join* to enter.\n` +
+                `⏱️ *60 seconds* left to join`,
             mentions: [senderId],
             ...channelInfo,
         });
 
-        advanceTurn(game);
-        await startTurn(sock, chatId, channelInfo);
+        // ── 30s reminder ──────────────────────────────────────────────────────
+        newGame.reminder30 = setTimeout(async () => {
+            const g = games.get(chatId);
+            if (!g || g.phase !== 'joining') return;
+            await sock.sendMessage(chatId, {
+                text:
+                    `⏳ *30 seconds left to join!*\n` +
+                    `Players so far: ${g.players.size}/${MAX_PLAYERS}\n` +
+                    `Type *join* to enter!`,
+                ...channelInfo,
+            });
+        }, 30_000);
+
+        // ── 15s reminder ──────────────────────────────────────────────────────
+        newGame.reminder15 = setTimeout(async () => {
+            const g = games.get(chatId);
+            if (!g || g.phase !== 'joining') return;
+            await sock.sendMessage(chatId, {
+                text:
+                    `🚨 *15 seconds left!*\n` +
+                    `Players so far: ${g.players.size}/${MAX_PLAYERS}\n` +
+                    `Last chance to *join!*`,
+                ...channelInfo,
+            });
+        }, 45_000);
+
+        // ── Game start at 60s ──────────────────────────────────────────────────
+        newGame.joinTimer = setTimeout(async () => {
+            const g = games.get(chatId);
+            if (!g || g.phase !== 'joining') return;
+
+            if (g.players.size < MIN_PLAYERS) {
+                cleanupGame(chatId);
+                return sock.sendMessage(chatId, {
+                    text: `❌ Not enough players, game terminated. Need at least ${MIN_PLAYERS}.`,
+                    ...channelInfo,
+                });
+            }
+
+            g.phase     = 'active';
+            g.turnOrder = [...g.players.keys()].sort(() => 0.5 - Math.random());
+            g.turnIndex = 0;
+
+            const names = g.turnOrder.map(mention).join(', ');
+
+            await sock.sendMessage(chatId, {
+                text:
+                    `✅ *Game starting with ${g.turnOrder.length} players!*\n\n` +
+                    `Turn order: ${names}\n\n` +
+                    `⚠️ Wrong answers are *allowed* — only running out of time gets you eliminated!`,
+                mentions: g.turnOrder,
+                ...channelInfo,
+            });
+
+            await startTurn(sock, chatId, channelInfo);
+        }, JOIN_WINDOW);
     },
 };
