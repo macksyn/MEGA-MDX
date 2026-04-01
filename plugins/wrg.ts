@@ -77,7 +77,7 @@ let wordSet: Set<string> = new Set();
 
 (function loadWordList() {
     try {
-        const fp   = path.resolve(__dirname, 'lib/words.json');
+        const fp   = path.resolve(__dirname, '../lib/words.json');
         const list = JSON.parse(fs.readFileSync(fp, 'utf-8')) as string[];
         wordSet    = new Set(list.map(w => w.toLowerCase().trim()));
         console.log(`[wcg] ✅ Loaded ${wordSet.size.toLocaleString()} words.`);
