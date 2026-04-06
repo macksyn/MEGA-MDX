@@ -116,8 +116,8 @@ function getDifficulty(round: number): { time: number; minLength: number } {
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 /** Skews away from rare letters (q, x, z) for fairness */
-function randomLetter(round : number): string {
-    let pool = 'aaabbbcccdddeeefffggghhh' +
+function randomLetter(): string {
+    const pool = 'aaabbbcccdddeeefffggghhh' +
                  'iiijjjkkkllllmmmnnnoooppp' +
                  'rrrssssttttuuuvvvwwwyyyy';
     if (round >= 4) pool += 'qxzqxz';
