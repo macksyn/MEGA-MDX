@@ -116,10 +116,11 @@ function getDifficulty(round: number): { time: number; minLength: number } {
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 /** Skews away from rare letters (q, x, z) for fairness */
-function randomLetter(): string {
-    const pool = 'aaabbbcccdddeeefffggghhh' +
+function randomLetter(round : number): string {
+    let pool = 'aaabbbcccdddeeefffggghhh' +
                  'iiijjjkkkllllmmmnnnoooppp' +
                  'rrrssssttttuuuvvvwwwyyyy';
+    if (round >= 4) pool += 'qxzqxz';
     return pool[Math.floor(Math.random() * pool.length)];
 }
 
@@ -133,7 +134,7 @@ function currentPlayer(game: GameState): string {
 
 function advanceTurn(game: GameState): void {
     game.turnIndex = (game.turnIndex + 1) % game.turnOrder.length;
-    game.round++;
+    if (game.turnIndex === 0) game.round++;
 }
 
 function cleanupGame(chatId: string): void {
@@ -156,7 +157,7 @@ async function startTurn(sock: any, chatId: string, channelInfo: any): Promise<v
     if (game.turnTimer) clearTimeout(game.turnTimer);
 
     const { time, minLength } = getDifficulty(game.round);
-    const letter              = randomLetter();
+    const letter              = randomLetter(game.round);
 
     game.letter    = letter;
     game.minLength = minLength;
