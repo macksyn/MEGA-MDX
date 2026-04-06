@@ -77,7 +77,7 @@ let wordSet: Set<string> = new Set();
 
 (function loadWordList() {
     try {
-        const fp   = path.resolve(__dirname, 'lib/words.json');
+        const fp   = path.resolve(process.cwd(), 'game_data/words.json');
         const list = JSON.parse(fs.readFileSync(fp, 'utf-8')) as string[];
         wordSet    = new Set(list.map(w => w.toLowerCase().trim()));
         console.log(`[wcg] ✅ Loaded ${wordSet.size.toLocaleString()} words.`);
@@ -170,8 +170,9 @@ async function startTurn(sock: any, chatId: string, channelInfo: any): Promise<v
             `${mention(turnJid)} your turn!\n\n` +
             `Your word must start with *${letter.toUpperCase()}*\n` +
             `Must be at least *${minLength}* letters\n` +
-            `${game.turnOrder.length} players remaining.` +
-            `You have *${time / 1000}s* ⏱️`,
+            `${game.turnOrder.length} players remaining.\n` +
+            `You have *${time / 1000}s* ⏱️` +
+            `Players remaining: ${game.players.size}/${MAX_PLAYERS}`,
         mentions: [turnJid],
         ...channelInfo,
     });
@@ -248,15 +249,15 @@ async function endGame(
     const duration    = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
 
     const longestLine = game.longestWord
-        ? `🔤 *Longest word:* "${game.longestWord.word}" (${game.longestWord.word.length} letters) by ${mention(game.longestWord.jid)}`
-        : `🔤 *Longest word:* none recorded`;
+        ? `📚 *Longest word:* "${game.longestWord.word}" (${game.longestWord.word.length} letters) by ${mention(game.longestWord.jid)}`
+        : `📚 *Longest word:* none recorded`;
 
     await sock.sendMessage(chatId, {
         text:
             `🏆 *Game Over!*\n\n` +
             `*👑 ${mention(winnerJid)} Won!*🎉\n\n` +
             `${longestLine}\n` +
-            `⏱️ *Game duration:* ${duration}`,
+            `⏱️ *Duration:* ${duration}`,
         mentions: [...game.players.keys()],
         ...channelInfo,
     });
@@ -301,7 +302,7 @@ export async function wcgOnMessage(
 
         game.players.set(senderId, { jid: senderId });
         await sock.sendMessage(chatId, {
-            text: `✅ ${mention(senderId)} joined! (${game.players.size}`,
+            text: `✅ ${mention(senderId)} joined!`,
             mentions: [senderId],
             ...channelInfo,
         });
@@ -375,10 +376,12 @@ export async function wcgOnMessage(
     game.longestWord = { word, jid: senderId };
 }
 
-        await sock.sendMessage(chatId, {
-            text: `✅ *${word}* accepted! (${word.length} letters)`,
-            ...channelInfo,
-        });
+    await sock.sendMessage(chatId, {
+        react: {
+            text: '✅',
+            key: message.key,
+        },
+    });
 
     advanceTurn(game);
     await startTurn(sock, chatId, channelInfo);
