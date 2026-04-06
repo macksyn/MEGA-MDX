@@ -169,12 +169,12 @@ async function startTurn(sock: any, chatId: string, channelInfo: any): Promise<v
         text:
             `🎯 *Round ${game.round}*\n\n` +
             `${mention(turnJid)} your turn!\n\n` +
-            `⏭️ Next: ${mention(nextJid)}` +
+            `⏭️ Next: ${mention(nextJid)}\n` +
             `Your word must start with *${letter.toUpperCase()}*\n` +
             `Must be at least *${minLength}* letters\n` +
-            `⏱️ You have *${time / 1000}s*` +
+            `⏱️ You have *${time / 1000}s*\n` +
             `👥 Players remaining: ${game.players.size}/${MAX_PLAYERS}`,
-        mentions: [turnJid],
+        mentions: [turnJid, nextJid],
         ...channelInfo,
     });
 
