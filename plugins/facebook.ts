@@ -28,12 +28,12 @@ function normalizeVideos(data: any): { url: string; resolution: string }[] {
     }));
   }
 
-  // Fallback API: res.data -> { hd, sd, ... }
-  if (data?.hd || data?.sd) {
-    const entries: { url: string; resolution: string }[] = [];
-    if (data.hd) entries.push({ url: data.hd, resolution: 'HD' });
-    if (data.sd) entries.push({ url: data.sd, resolution: 'SD' });
-    return entries;
+  // Fallback API: res.data -> { status, result: { video_url, quality } }
+  if (data?.result?.video_url) {
+    return [{
+      url: data.result.video_url,
+      resolution: data.result.quality ?? 'HD',
+    }];
   }
 
   return [];
