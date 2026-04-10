@@ -15,43 +15,77 @@ const PRIMARY_API = (url: string) =>
 const FALLBACK_API = (url: string) =>
   `https://api.malvin.gleeze.com/download/facebook?url=${encodeURIComponent(url)}&apikey=mvn_5a0a786002144470162f0a25d1e42492`;
 
+interface VideoResult {
+  buffer: Buffer;
+  resolution: string;
+}
+
+/** Resolves relative URLs returned by the primary API. */
+function resolveUrl(url: string): string {
+  return url.startsWith('http') ? url : `https://gtech-api-xtp1.onrender.com${url}`;
+}
+
 /**
- * Normalizes video entries from either API into a common shape:
- * { url: string, resolution: string }
+ * Downloads a video URL into a Buffer.
+ * Throws if the server returns a non-video content-type (e.g. broken proxy).
  */
-function normalizeVideos(data: any): { url: string; resolution: string }[] {
-  // Primary API: res.data.data.data -> array of { url, resolution }
-  if (Array.isArray(data?.data?.data)) {
-    return data.data.data.map((v: any) => ({
-      url: v.url,
-      resolution: v.resolution ?? 'Unknown',
-    }));
+async function downloadBuffer(videoUrl: string): Promise<Buffer> {
+  const res = await axios.get(videoUrl, {
+    ...AXIOS_DEFAULTS,
+    responseType: 'arraybuffer',
+    timeout: 120000, // longer timeout for actual video bytes
+  });
+
+  const contentType: string = res.headers['content-type'] ?? '';
+  if (!contentType.includes('video') && !contentType.includes('octet-stream')) {
+    throw new Error(`Bad content-type "${contentType}" — likely a broken proxy URL`);
   }
 
-  // Fallback API: res.data -> { status, result: { video_url, quality } }
-  if (data?.result?.video_url) {
-    return [{
-      url: data.result.video_url,
-      resolution: data.result.quality ?? 'HD',
-    }];
-  }
-
-  return [];
+  return Buffer.from(res.data);
 }
 
-async function fetchFromPrimary(url: string): Promise<{ url: string; resolution: string }[]> {
-  const res = await axios.get(PRIMARY_API(url), AXIOS_DEFAULTS);
+/**
+ * Primary API: fetches metadata, picks best quality, downloads buffer.
+ * Any failure (bad status, empty list, broken URL) throws so the caller
+ * can seamlessly fall through to the fallback.
+ */
+async function fetchFromPrimary(fbUrl: string): Promise<VideoResult> {
+  const res = await axios.get(PRIMARY_API(fbUrl), AXIOS_DEFAULTS);
+
   if (!res?.data?.status) throw new Error('Primary API returned unsuccessful status');
-  const videos = normalizeVideos(res.data);
-  if (!videos.length) throw new Error('No downloadable video found from primary API');
-  return videos;
+
+  const videos: any[] = res?.data?.data?.data;
+  if (!Array.isArray(videos) || !videos.length) {
+    throw new Error('No video entries in primary API response');
+  }
+
+  const sorted = videos.sort(
+    (a, b) => (parseInt(b.resolution, 10) || 0) - (parseInt(a.resolution, 10) || 0)
+  );
+  const selected = sorted[0];
+  const videoUrl = resolveUrl(selected.url);
+
+  // This is the key step — if the URL is a broken proxy it throws here,
+  // not inside Baileys' sendMessage where we can no longer catch it.
+  const buffer = await downloadBuffer(videoUrl);
+
+  return { buffer, resolution: selected.resolution ?? 'Unknown' };
 }
 
-async function fetchFromFallback(url: string): Promise<{ url: string; resolution: string }[]> {
-  const res = await axios.get(FALLBACK_API(url), AXIOS_DEFAULTS);
-  const videos = normalizeVideos(res.data);
-  if (!videos.length) throw new Error('No downloadable video found from fallback API');
-  return videos;
+/**
+ * Fallback API: fetches metadata and downloads buffer.
+ */
+async function fetchFromFallback(fbUrl: string): Promise<VideoResult> {
+  const res = await axios.get(FALLBACK_API(fbUrl), AXIOS_DEFAULTS);
+
+  if (!res?.data?.result?.video_url) {
+    throw new Error('No video_url in fallback API response');
+  }
+
+  const { video_url, quality } = res.data.result;
+  const buffer = await downloadBuffer(video_url);
+
+  return { buffer, resolution: quality ?? 'HD' };
 }
 
 export default {
@@ -85,50 +119,36 @@ export default {
         );
       }
 
-      await sock.sendMessage(chatId, {
-        react: { text: '🔄', key: message.key }
-      });
+      await sock.sendMessage(chatId, { react: { text: '🔄', key: message.key } });
 
-      // ── Try primary, fall back silently if it fails ──────────────────────
-      let videos: { url: string; resolution: string }[];
-      let usedFallback = false;
+      // ── Primary → Fallback chain ─────────────────────────────────────────
+      // Both fetchFromPrimary and fetchFromFallback download the actual video
+      // bytes before returning, so any broken URL is caught HERE — not inside
+      // Baileys' sendMessage where recovery is impossible.
+      let result: VideoResult;
 
       try {
-        videos = await fetchFromPrimary(url);
+        result = await fetchFromPrimary(url);
       } catch (primaryErr) {
-        console.warn('Primary Facebook API failed, switching to fallback:', primaryErr);
-        videos = await fetchFromFallback(url);
-        usedFallback = true;
+        console.warn('[Facebook] Primary failed, switching to fallback:', (primaryErr as Error).message);
+        result = await fetchFromFallback(url);
       }
-      // ─────────────────────────────────────────────────────────────────────
-
-      // Pick highest quality: HD first, then sort numeric resolutions descending
-      const sorted = videos.sort((a, b) => {
-        if (a.resolution === 'HD') return -1;
-        if (b.resolution === 'HD') return 1;
-        return (parseInt(b.resolution, 10) || 0) - (parseInt(a.resolution, 10) || 0);
-      });
-
-      const selected = sorted[0];
-
-      // Resolve relative URLs that may come from the primary API
-      const videoUrl = selected.url.startsWith('http')
-        ? selected.url
-        : `https://gtech-api-xtp1.onrender.com${selected.url}`;
+      // ────────────────────────────────────────────────────────────────────
 
       const caption = `📘 *Facebook Downloader*
-🎞 Quality: *${selected.resolution || 'Unknown'}*
+🎞 Quality: *${result.resolution}*
 
 > 📥 *_Groq™_*`;
 
+      // Send a pre-downloaded buffer — bypasses all Baileys streaming/proxy issues
       await sock.sendMessage(
         chatId,
-        { video: { url: videoUrl }, mimetype: 'video/mp4', caption },
+        { video: result.buffer, mimetype: 'video/mp4', caption },
         { quoted: message }
       );
 
     } catch (err: any) {
-      console.error('Facebook downloader error (both APIs failed):', err);
+      console.error('[Facebook] Both APIs failed:', err.message);
       await sock.sendMessage(
         chatId,
         { text: '❌ Failed to download Facebook video. Please try again later.' },
