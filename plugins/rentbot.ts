@@ -36,12 +36,11 @@ const MYSQL_URL    = process.env.MYSQL_URL;
 const SQLITE_URL   = process.env.DB_URL;
 const HAS_DB       = !!(MONGO_URL || POSTGRES_URL || MYSQL_URL || SQLITE_URL);
 
-const CLONES_DIR        = path.join(process.cwd(), 'session', 'clones');
-const REGISTRY_NS       = 'clone_registry';  // chatId namespace for registry
-const PAIRING_TIMEOUT   = 5 * 60 * 1000;    // 5 minutes
+const CLONES_DIR      = path.join(process.cwd(), 'session', 'clones');
+const REGISTRY_NS     = 'clone_registry';
+const PAIRING_TIMEOUT = 5 * 60 * 1000; // 5 minutes
 
 // ─── Registry ──────────────────────────────────────────────────────────────
-// Tracks which clones exist so we can reconnect them after a bot restart.
 
 interface CloneMeta {
     authId:     string;
@@ -78,10 +77,6 @@ async function updateCloneStatus(authId: string, status: CloneMeta['status']): P
 }
 
 // ─── DB-backed auth state ──────────────────────────────────────────────────
-//
-// BUG FIXED: useMultiFileAuthState always writes to disk, ignoring the DB
-// backend.  useDBAuthState stores the real creds *and* signal keys in the
-// store via BufferJSON so Buffers survive JSON round-trips.
 
 async function useDBAuthState(authId: string) {
     const ns = `clone_${authId}`;
@@ -90,21 +85,16 @@ async function useDBAuthState(authId: string) {
         const raw = await store.getSetting(ns, key);
         if (raw == null) return null;
         try {
-            // store may return already-parsed object (Mongo) or string (SQL)
             const str = typeof raw === 'string' ? raw : JSON.stringify(raw);
             return JSON.parse(str, BufferJSON.reviver);
-        } catch {
-            return null;
-        }
+        } catch { return null; }
     }
 
     async function writeData(key: string, data: any): Promise<void> {
-        // Convert Buffers → {type:"Buffer", data:[...]} before handing to store
         const safe = JSON.parse(JSON.stringify(data, BufferJSON.replacer));
         await store.saveSetting(ns, key, safe);
     }
 
-    // Load existing creds or create fresh ones
     const creds = (await readData('creds')) ?? initAuthCreds();
 
     return {
@@ -132,7 +122,6 @@ async function useDBAuthState(authId: string) {
                 }
             }
         },
-        // BUG FIXED: saveCreds now actually persists creds to the correct backend
         saveCreds: async () => writeData('creds', creds)
     };
 }
@@ -140,9 +129,7 @@ async function useDBAuthState(authId: string) {
 // ─── Auth-state routing ────────────────────────────────────────────────────
 
 async function getAuthState(authId: string) {
-    if (HAS_DB) {
-        return useDBAuthState(authId);
-    }
+    if (HAS_DB) return useDBAuthState(authId);
     const sessionPath = path.join(CLONES_DIR, authId);
     fs.mkdirSync(sessionPath, { recursive: true });
     return useMultiFileAuthState(sessionPath);
@@ -153,11 +140,9 @@ async function deleteAuthState(authId: string): Promise<void> {
         const p = path.join(CLONES_DIR, authId);
         if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
     }
-    // For DB: keys are namespaced to this authId and will be overwritten on
-    // reuse, so no explicit deletion is needed.
 }
 
-// ─── Full cleanup ──────────────────────────────────────────────────────────
+// ─── Cleanup ───────────────────────────────────────────────────────────────
 
 async function cleanup(authId: string): Promise<void> {
     await unregisterClone(authId);
@@ -167,12 +152,30 @@ async function cleanup(authId: string): Promise<void> {
     );
 }
 
+// ─── evOnce helper ─────────────────────────────────────────────────────────
+//
+// BUG FIX: baileys v7 rc uses a mitt-based emitter that has .on and .off
+// but NO .once — calling conn.ev.once() throws "not a function".
+// This helper simulates it with a fired-flag so the callback runs at most
+// once regardless of whether .off succeeds.
+
+function evOnce(ev: any, event: string, cb: () => void): void {
+    let fired = false;
+    const wrapper = () => {
+        if (fired) return;
+        fired = true;
+        try { ev.off(event, wrapper); } catch {}
+        cb();
+    };
+    ev.on(event, wrapper);
+}
+
 // ─── Core clone lifecycle ──────────────────────────────────────────────────
 
 async function startClone(opts: {
-    authId:       string;
-    userNumber:   string;
-    parentSock:   any;
+    authId:        string;
+    userNumber:    string;
+    parentSock:    any;
     notifyChatId?: string;
     isReconnect?:  boolean;
 }): Promise<void> {
@@ -196,15 +199,19 @@ async function startClone(opts: {
         },
         markOnlineOnConnect: true,
         msgRetryCounterCache,
-        connectTimeoutMs:    120_000,
+        connectTimeoutMs:      120_000,
         defaultQueryTimeoutMs: 0,
-        keepAliveIntervalMs: 30_000,
+        keepAliveIntervalMs:   30_000,
     }) as any;
+
+    // Register saveCreds FIRST — before pairing — so every key exchange
+    // during the handshake is persisted to the correct backend immediately.
+    conn.ev.on('creds.update', saveCreds);
 
     // ── Pairing flow ──────────────────────────────────────────────────────
     if (!conn.authState.creds.registered) {
         if (isReconnect) {
-            // BUG FIXED: orphaned un-paired sessions are removed on restart
+            // Never completed pairing — remove this orphan
             console.warn(`[rentbot] Clone ${authId} was never paired — removing orphan`);
             await cleanup(authId);
             return;
@@ -212,7 +219,7 @@ async function startClone(opts: {
 
         await new Promise(r => setTimeout(r, 6_000));
 
-        // BUG FIXED: pairing timeout cleans up the partial session automatically
+        // Auto-cleanup if user never scans within PAIRING_TIMEOUT
         let pairingDone = false;
         const pairingTimer = setTimeout(async () => {
             if (pairingDone) return;
@@ -220,53 +227,57 @@ async function startClone(opts: {
             try { (conn as any).end(undefined); } catch {}
             await cleanup(authId);
             if (notifyChatId) {
-                await parentSock.sendMessage(notifyChatId, {
+                parentSock.sendMessage(notifyChatId, {
                     text: `⏰ Pairing timed out for *${userNumber}*. Session cleaned up. Try again.`
-                });
+                }).catch(() => {});
             }
         }, PAIRING_TIMEOUT);
 
+        // BUG FIX: requestPairingCode is in its own try/catch.
+        // Previously it shared a try block with conn.ev.once(), so when
+        // .once threw "not a function" the catch called cleanup() even
+        // though the pairing code was already sent — destroying a valid session.
+        let code: string;
         try {
-            let code = await conn.requestPairingCode(userNumber);
-            code     = code?.match(/.{1,4}/g)?.join('-') || code;
-
-            if (notifyChatId) {
-                await parentSock.sendMessage(notifyChatId, {
-                    text: `*🤖 MEGA-MD CLONE PAIRING*\n\n` +
-                          `📱 Number: *${userNumber}*\n` +
-                          `🔑 Code:   *${code}*\n\n` +
-                          `1. Open WhatsApp → Settings → Linked Devices\n` +
-                          `2. Tap *Link a Device* → *Link with phone number*\n` +
-                          `3. Enter the code above.\n\n` +
-                          `⏳ Code expires in 5 minutes.`
-                });
-            }
-
-            // Clear timeout as soon as the first creds.update fires
-            conn.ev.once('creds.update', () => { pairingDone = true; clearTimeout(pairingTimer); });
-
+            code = await conn.requestPairingCode(userNumber);
+            code = code?.match(/.{1,4}/g)?.join('-') || code;
         } catch (err: any) {
             clearTimeout(pairingTimer);
             console.error('[rentbot] requestPairingCode error:', err.message);
             await cleanup(authId);
             if (notifyChatId) {
-                await parentSock.sendMessage(notifyChatId, {
+                parentSock.sendMessage(notifyChatId, {
                     text: `❌ Failed to generate pairing code for *${userNumber}*.\n${err.message}`
-                });
+                }).catch(() => {});
             }
             return;
         }
-    }
 
-    // ── Persist creds on every update ─────────────────────────────────────
-    conn.ev.on('creds.update', saveCreds);
+        // Send code — isolated so a send failure doesn't abort the clone
+        if (notifyChatId) {
+            parentSock.sendMessage(notifyChatId, {
+                text: `*🤖 MEGA-MD CLONE PAIRING*\n\n` +
+                      `📱 Number: *${userNumber}*\n` +
+                      `🔑 Code:   *${code}*\n\n` +
+                      `1. Open WhatsApp → Settings → Linked Devices\n` +
+                      `2. Tap *Link a Device* → *Link with phone number*\n` +
+                      `3. Enter the code above.\n\n` +
+                      `⏳ Code expires in 5 minutes.`
+            }).catch(() => {});
+        }
+
+        // BUG FIX: use evOnce() — mitt has no .once
+        evOnce(conn.ev, 'creds.update', () => {
+            pairingDone = true;
+            clearTimeout(pairingTimer);
+        });
+    }
 
     // ── Connection state ──────────────────────────────────────────────────
     conn.ev.on('connection.update', async (update: any) => {
         const { connection, lastDisconnect } = update;
 
         if (connection === 'open') {
-            // Remove any stale entry then add current conn
             (global as any).conns = (global as any).conns.filter(
                 (c: any) => c._cloneAuthId !== authId
             );
@@ -276,11 +287,11 @@ async function startClone(opts: {
 
             console.log(`[rentbot] ✅ Clone ${authId} (${userNumber}) connected`);
             if (notifyChatId && !isReconnect) {
-                await parentSock.sendMessage(notifyChatId, {
+                parentSock.sendMessage(notifyChatId, {
                     text: `✅ Clone *${userNumber}* is online!\n` +
                           `ID: \`${authId}\`\n` +
                           `Backend: ${HAS_DB ? 'Database 🗄️' : 'File System 📁'}`
-                });
+                }).catch(() => {});
             }
         }
 
@@ -294,12 +305,12 @@ async function startClone(opts: {
                 console.log(`[rentbot] Clone ${authId} logged out — removing`);
                 await cleanup(authId);
                 if (notifyChatId) {
-                    await parentSock.sendMessage(notifyChatId, {
+                    parentSock.sendMessage(notifyChatId, {
                         text: `📴 Clone *${userNumber}* was logged out and removed.`
-                    });
+                    }).catch(() => {});
                 }
             } else {
-                console.log(`[rentbot] Clone ${authId} lost connection (${statusCode}) — reconnecting in 5s…`);
+                console.log(`[rentbot] Clone ${authId} disconnected (${statusCode}) — reconnecting in 5s…`);
                 await updateCloneStatus(authId, 'offline');
                 setTimeout(() => {
                     startClone({ authId, userNumber, parentSock, isReconnect: true }).catch(e =>
@@ -321,20 +332,15 @@ async function startClone(opts: {
     }
 }
 
-// ─── onLoad — reconnect all clones after bot restart ──────────────────────
-//
-// BUG FIXED: export onLoad so commandHandler.runOnLoad() picks it up and
-// restores every registered clone automatically on startup.
+// ─── onLoad — reconnect clones after bot restart ───────────────────────────
 
 export async function onLoad(sock: any): Promise<void> {
     const registry = await getRegistry();
     if (registry.length === 0) return;
 
     console.log(`[rentbot] Restoring ${registry.length} clone(s) from registry…`);
-
     for (const { authId, userNumber } of registry) {
-        // Stagger restores so we don't hammer the WA servers simultaneously
-        await new Promise(r => setTimeout(r, 2_000));
+        await new Promise(r => setTimeout(r, 2_000)); // stagger restores
         startClone({ authId, userNumber, parentSock: sock, isReconnect: true }).catch(e =>
             console.error(`[rentbot] Failed to restore clone ${authId}:`, e.message)
         );
@@ -356,8 +362,7 @@ export default {
 
         if (!args[0]) {
             return sock.sendMessage(chatId, {
-                text: `*Usage:* \`.rentbot 923051391xxx\`\n` +
-                      `Provide the full international number (digits only).`
+                text: `*Usage:* \`.rentbot 923051391xxx\`\nProvide the full international number (digits only).`
             }, { quoted: message });
         }
 
@@ -370,8 +375,6 @@ export default {
 
         const authId = crypto.randomBytes(4).toString('hex');
 
-        // Register *before* starting so the clone is tracked even if pairing
-        // fails mid-way — the pairing timeout will call cleanup() to remove it.
         await registerClone({
             authId,
             userNumber,
@@ -386,14 +389,14 @@ export default {
         startClone({
             authId,
             userNumber,
-            parentSock:    sock,
-            notifyChatId:  chatId,
+            parentSock:   sock,
+            notifyChatId: chatId,
         }).catch(async e => {
             console.error('[rentbot] startClone error:', e.message);
             await cleanup(authId);
-            await sock.sendMessage(chatId, {
+            sock.sendMessage(chatId, {
                 text: `❌ Failed to start clone: ${e.message}`
-            }, { quoted: message });
+            }, { quoted: message }).catch(() => {});
         });
     }
 };
