@@ -1,93 +1,140 @@
 import type { BotContext } from '../types.js';
+/*****************************************************************************
+ *                                                                           *
+ *                     Developed By Qasim Ali                                *
+ *                                                                           *
+ *  🌐  GitHub   : https://github.com/GlobalTechInfo                         *
+ *  ▶️  YouTube  : https://youtube.com/@GlobalTechInfo                       *
+ *  💬  WhatsApp : https://whatsapp.com/channel/0029VagJIAr3bbVBCpEkAM07     *
+ *                                                                           *
+ *    © 2026 GlobalTechInfo. All rights reserved.                            *
+ *                                                                           *
+ *    Description: This file is part of the MEGA-MD Project.                 *
+ *                 Unauthorized copying or distribution is prohibited.       *
+ *                                                                           *
+ *****************************************************************************/
+
 
 import store from '../lib/lightweight_store.js';
-import fs from 'fs';
-import path from 'path';
 
-const HAS_DB = !!(
-    process.env.MONGO_URL    ||
-    process.env.POSTGRES_URL ||
-    process.env.MYSQL_URL    ||
-    process.env.DB_URL
-);
+const MONGO_URL = process.env.MONGO_URL;
+const POSTGRES_URL = process.env.POSTGRES_URL;
+const MYSQL_URL = process.env.MYSQL_URL;
+const SQLITE_URL = process.env.DB_URL;
+const HAS_DB = !!(MONGO_URL || POSTGRES_URL || MYSQL_URL || SQLITE_URL);
 
-async function getAllCloneMetas() {
-    const registry: string[] = (await store.getSetting('cloneMeta', '__registry')) ?? [];
-    const metas: any[] = [];
-    for (const authId of registry) {
-        const m = await store.getSetting('cloneMeta', authId);
-        if (m) metas.push({ authId, ...m });
+
+async function getAllCloneSessions() {
+    if (HAS_DB) {
+        const settings = await store.getAllSettings('clones') || {};
+        return Object.entries(settings)
+            .filter(([_key, value]) => value && (value as any).status)
+            .map(([authId, data]) => ({ authId, ...((data) as any) }));
+    } else {
+        const { default: fs } = await import('fs');
+        const { default: path } = await import('path');
+        const clonesDir = path.join(process.cwd(), 'session', 'clones');
+        if (!fs.existsSync(clonesDir)) return [];
+
+        const dirs = fs.readdirSync(clonesDir);
+        return dirs.map(authId => {
+            const sessionPath = path.join(clonesDir, authId, 'session.json');
+            if (fs.existsSync(sessionPath)) {
+                try {
+                    const data = JSON.parse(fs.readFileSync(sessionPath, 'utf-8'));
+                    return { authId, ...((data) as any) };
+                } catch(e: any) {
+                    return { authId, status: 'unknown' };
+                }
+            }
+            return { authId, status: 'unknown' };
+        });
     }
-    return metas;
 }
 
 export default {
-    command:     'listrent',
-    aliases:     ['listclone', 'botclones'],
-    category:    'owner',
-    description: 'List all active and stored sub-bot clones',
-    usage:       '.listrent',
-    ownerOnly:   true,
+    command: 'listrent',
+    aliases: ['listclone', 'botclones'],
+    category: 'owner',
+    description: 'List all currently active sub-bots',
+    usage: '.listrent',
 
-    async handler(sock: any, message: any, _args: any, context: BotContext) {
-        const { chatId, senderId } = context;
+    async handler(sock: any, message: any, args: any, context: BotContext) {
+        const { chatId } = context;
 
-        const conns: Map<string, { conn: any; ownerJid: string }> =
-            (global as any).conns ?? new Map();
+        const activeConns = (global as any).conns || [];
+        const storedClones = await getAllCloneSessions();
 
-        const metas = await getAllCloneMetas();
-
-        if (conns.size === 0 && metas.length === 0) {
-            return sock.sendMessage(chatId, {
-                text: '❌ No sub-bots are currently active or stored.'
+        if (activeConns.length === 0 && storedClones.length === 0) {
+            return await sock.sendMessage(chatId, {
+                text: "*❌ No sub-bots are currently active or stored.*"
             }, { quoted: message });
         }
 
         let msg = `*─── [ CLONE BOTS ] ───*\n\n`;
-        msg += `*Storage:* ${HAS_DB ? 'Database' : 'File system'}\n\n`;
+        msg += `*Storage:* ${HAS_DB ? 'Database 🗄️' : 'File System 📁'}\n\n`;
 
-        const mentions: string[] = [];
+        if (activeConns.length > 0) {
+            msg += `*🟢 ONLINE CLONES:*\n\n`;
 
-        if (conns.size > 0) {
-            msg += `*Online clones:*\n\n`;
-            let i = 1;
-            for (const [authId, { conn, ownerJid }] of conns) {
+            activeConns.forEach((conn: any, i: any) => {
                 const user = conn.user;
-                const numJid = user?.id ?? '';
-                const number = numJid.split(':')[0];
-                const isYours = ownerJid === senderId;
-
-                msg += `*${i}.* \`${authId}\`\n`;
-                msg += `   └ Number: @${number}\n`;
-                msg += `   └ Name: ${user?.name ?? 'Sub-bot'}\n`;
-                msg += `   └ Owner: ${isYours ? 'You' : ownerJid.split('@')[0]}\n`;
-                msg += `   └ Status: Online\n\n`;
-
-                if (numJid) mentions.push(numJid);
-                i++;
-            }
-        }
-
-        const offlineMetas = metas.filter(m => !conns.has(m.authId));
-        if (offlineMetas.length > 0) {
-            msg += `*Stored / offline clones:*\n\n`;
-            offlineMetas.forEach((m, i) => {
-                const isYours = m.ownerJid === senderId;
-                const created = m.createdAt
-                    ? new Date(m.createdAt).toLocaleString()
-                    : 'unknown';
-
-                msg += `*${i + 1}.* \`${m.authId}\`\n`;
-                msg += `   └ Number: ${m.userNumber ?? 'N/A'}\n`;
-                msg += `   └ Owner: ${isYours ? 'You' : (m.ownerJid?.split('@')[0] ?? 'N/A')}\n`;
-                msg += `   └ Status: ${m.status ?? 'offline'}\n`;
-                msg += `   └ Created: ${created}\n\n`;
+                msg += `*${i + 1}.* @${user.id.split(':')[0]}\n`;
+                msg += `   └ Name: ${user.name || 'Sub-Bot'}\n`;
+                msg += `   └ Status: Connected ✅\n\n`;
             });
         }
 
-        msg += `*Total online:* ${conns.size}\n`;
-        msg += `*Total stored:* ${metas.length}`;
+        if (HAS_DB && storedClones.length > 0) {
+            const offlineClones = storedClones.filter(clone => {
+                return !activeConns.some((conn: any) => {
+                    const connNumber = conn.user.id.split(':')[0];
+                    return (clone as any).userNumber === connNumber;
+                });
+            });
 
-        return sock.sendMessage(chatId, { text: msg, mentions }, { quoted: message });
+            if (offlineClones.length > 0) {
+                msg += `*⚪ STORED CLONES (Offline):*\n\n`;
+
+                offlineClones.forEach((clone, i) => {
+                    msg += `*${i + 1}.* ID: ${clone.authId}\n`;
+                    msg += `   └ Number: ${(clone as any).userNumber || 'N/A'}\n`;
+                    msg += `   └ Status: ${(clone as any).status || 'offline'}\n`;
+                    if (clone.createdAt) {
+                        const date = new Date(clone.createdAt);
+                        msg += `   └ Created: ${date.toLocaleString()}\n`;
+                    }
+                    msg += `\n`;
+                });
+            }
+        }
+
+        msg += `*Total Online:* ${activeConns.length}\n`;
+        if (HAS_DB) {
+            msg += `*Total Stored:* ${storedClones.length}`;
+        }
+
+        const mentions = activeConns.map((c: any) => c.user.id);
+
+        await sock.sendMessage(chatId, {
+            text: msg,
+            mentions: mentions
+        }, { quoted: message });
     }
 };
+
+/*****************************************************************************
+ *                                                                           *
+ *                     Developed By Qasim Ali                                *
+ *                                                                           *
+ *  🌐  GitHub   : https://github.com/GlobalTechInfo                         *
+ *  ▶️  YouTube  : https://youtube.com/@GlobalTechInfo                       *
+ *  💬  WhatsApp : https://whatsapp.com/channel/0029VagJIAr3bbVBCpEkAM07     *
+ *                                                                           *
+ *    © 2026 GlobalTechInfo. All rights reserved.                            *
+ *                                                                           *
+ *    Description: This file is part of the MEGA-MD Project.                 *
+ *                 Unauthorized copying or distribution is prohibited.       *
+ *                                                                           *
+ *****************************************************************************/
+
