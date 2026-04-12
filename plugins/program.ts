@@ -454,17 +454,17 @@ async function canManageSchedule(sock: any, chatId: string, senderId: string, se
 
 // ── Plugin export ─────────────────────────────────────────────────────────────
 export default {
-  command: 'schedule',
+  command: 'program',
   aliases: [
-    'program', 'programs', 'schedule-list',
-    'today', 'todayschedule',
+    'event', 'programs', 'program-list',
+    'today', 'todayprogram',
     'attend', 'rsvp', 'join',
     'cantmake', 'skip', 'absent',
     'attendees', 'rsvps', 'going',
   ],
   category: 'group',
   description: 'Group activity scheduler with RSVP, analytics, and automated reminders',
-  usage: '.schedule add [name] | [day] | [time] | [duration]',
+  usage: '.program add [name] | [day] | [time] | [duration]',
   groupOnly: true,
   cooldown: 2,
 
@@ -507,13 +507,13 @@ export default {
     const usedCmd    = rawWord.slice(usedPrefix.length).trim().split(/\s+/)[0].toLowerCase();
 
     // ── .programs / .schedule-list ─────────────────────────────────────────
-    if (['programs','schedule-list'].includes(usedCmd)) {
+    if (['programs','program-list'].includes(usedCmd)) {
       const s = await getScheduler(chatId);
       return reply(buildProgramList(s.programs));
     }
 
     // ── .today ─────────────────────────────────────────────────────────────
-    if (['today','todayschedule'].includes(usedCmd)) {
+    if (['today','todayprogram'].includes(usedCmd)) {
       const s        = await getScheduler(chatId);
       const today    = moment().tz(TIMEZONE);
       const programs = todaysPrograms(s.programs);
