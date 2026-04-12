@@ -45,7 +45,6 @@ async function disconnectClone(authId: string) {
     const entry = conns.get(authId);
     if (entry) {
         try {
-            entry.conn.ev.removeAllListeners();
             entry.conn.ws?.close();
         } catch {}
         conns.delete(authId);

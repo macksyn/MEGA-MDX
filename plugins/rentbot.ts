@@ -248,7 +248,6 @@ export async function startClone(
                 return;
             }
 
-            conn.ev.removeAllListeners();
             await saveCloneMeta({
                 authId, ownerJid, userNumber,
                 createdAt: Date.now(),
