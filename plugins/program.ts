@@ -496,6 +496,40 @@ export async function onLoad(sock: any): Promise<void> {
     }, 60_000);
 }
 
+export async function onLoad(sock: any): Promise<void> {
+    console.log('[SCHEDULER] Program reminder timers started');
+
+    // Morning daily schedule — 08:00 WAT
+    setInterval(async () => {
+        const now = moment().tz(TIMEZONE);
+        if (now.hour() === 8 && now.minute() === 0) {
+            await sendDailyReminders(sock).catch((e: any) =>
+                console.error('[SCHEDULER] sendDailyReminders:', e.message));
+        }
+    }, 60_000);
+
+    // Tomorrow preview — 22:00 WAT
+    setInterval(async () => {
+        const now = moment().tz(TIMEZONE);
+        if (now.hour() === 22 && now.minute() === 0) {
+            await sendTomorrowReminders(sock).catch((e: any) =>
+                console.error('[SCHEDULER] sendTomorrowReminders:', e.message));
+        }
+    }, 60_000);
+
+    // 2-hour reminder — checked every 5 minutes
+    setInterval(async () => {
+        await checkTwoHourReminders(sock).catch((e: any) =>
+            console.error('[SCHEDULER] checkTwoHourReminders:', e.message));
+    }, 5 * 60_000);
+
+    // Live start/end notifications — every minute
+    setInterval(async () => {
+        await checkLiveNotifications(sock).catch((e: any) =>
+            console.error('[SCHEDULER] checkLiveNotifications:', e.message));
+    }, 60_000);
+}
+
 // ── Plugin export ─────────────────────────────────────────────────────────────
 export default {
   command: 'program',
@@ -511,6 +545,7 @@ export default {
   usage: '.program add [name] | [day] | [time] | [duration]',
   groupOnly: true,
   cooldown: 2,
+  onLoad,
 
   // ── Main handler ──────────────────────────────────────────────────────────
   async handler(sock: any, message: any, args: any[], context: any = {}) {
