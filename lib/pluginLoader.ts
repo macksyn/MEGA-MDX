@@ -159,7 +159,7 @@ const pluginLoader = {
     let messageHookCount = 0;
 
     for (const plugin of plugins) {
-      const label = plugin.command || plugin.name || '(unnamed)';
+      const label = plugin.command || plugin.name || (plugin as any).default?.command || (plugin as any).default?.name || '(unnamed)';
 
       // 1. Register onMessage hooks
       if (typeof plugin.onMessage === 'function') {
