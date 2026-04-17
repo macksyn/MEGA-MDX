@@ -6,20 +6,16 @@ import isAdmin       from '../lib/isAdmin.js';
 import isOwnerOrSudo from '../lib/isOwner.js';
 import { createStore } from '../lib/pluginStore.js';
 import bus           from '../lib/pluginBus.js';
+import { createRequire } from 'module';
 
-// Activity tracker is loaded lazily on first use
+const _require = createRequire(import.meta.url);
+
+// Activity tracker is optional — fails gracefully if not present
 let activityTracker: any = null;
-let activityTrackerLoaded = false;
-
-async function getActivityTracker(): Promise<any> {
-  if (activityTrackerLoaded) return activityTracker;
-  activityTrackerLoaded = true;
-  try {
-    activityTracker = await import('../lib/activitytracker.js');
-  } catch {
-    activityTracker = null;
-  }
-  return activityTracker;
+try {
+  activityTracker = require('../lib/activitytracker.js');
+} catch (e) {
+  console.log('[ATTENDANCE] Activity tracker not available (optional)');
 }
 
 moment.tz.setDefault('Africa/Lagos');
@@ -482,9 +478,8 @@ async function handleAutoAttendance(message: any, sock: any): Promise<boolean> {
       streak:        currentStreak
     });
 
-    const tracker = await getActivityTracker();
-    if (tracker?.trackActivity) {
-      try { await tracker.trackActivity({ ...message, _attendanceEvent: true }); } catch {}
+    if (activityTracker?.trackActivity) {
+      try { await activityTracker.trackActivity({ ...message, _attendanceEvent: true }); } catch {}
     }
 
     await sock.sendMessage(chatId, {
