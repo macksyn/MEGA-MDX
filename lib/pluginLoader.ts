@@ -49,8 +49,9 @@ const { printLog } = require('./print');
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface Schedule {
-  at?:      string;
+  at?:      string | (() => string);
   every?:   number;
+  cron?:    string;
   handler:  (sock: any) => Promise<void>;
 }
 
@@ -111,7 +112,8 @@ function loadAllPlugins(): Plugin[] {
 
 // ── Schedule engine ───────────────────────────────────────────────────────────
 
-function scheduleAtTime(timeStr: string, handler: (sock: any) => Promise<void>, label: string): void {
+function scheduleAtTime(timeStrOrFn: string | (() => string), handler: (sock: any) => Promise<void>, label: string): void {
+  const timeStr    = typeof timeStrOrFn === 'function' ? timeStrOrFn() : timeStrOrFn;
   const expression = timeToCron(timeStr);
   const timezone   = settings.timeZone || 'UTC';
 
@@ -121,6 +123,21 @@ function scheduleAtTime(timeStr: string, handler: (sock: any) => Promise<void>, 
       await handler(_sock);
     } catch (err: any) {
       printLog('error', `[pluginLoader] Schedule "${label}" error: ${err.message}`);
+    }
+  }, { timezone });
+
+  _cronJobs.push(job);
+}
+
+function scheduleCron(expr: string, handler: (sock: any) => Promise<void>, label: string): void {
+  const timezone = settings.timeZone || 'UTC';
+
+  const job = cron.schedule(expr, async () => {
+    printLog('info', `[pluginLoader] 🔁 Cron "${label}" firing`);
+    try {
+      await handler(_sock);
+    } catch (err: any) {
+      printLog('error', `[pluginLoader] Cron "${label}" error: ${err.message}`);
     }
   }, { timezone });
 
@@ -181,12 +198,17 @@ const pluginLoader = {
       // 3. Register schedules
       if (Array.isArray(plugin.schedules)) {
         for (const sched of plugin.schedules) {
-          const schedLabel = `${label}/${sched.at ?? sched.every + 'ms'}`;
+          const atValue   = typeof sched.at === 'function' ? sched.at() : sched.at;
+          const schedLabel = `${label}/${atValue ?? sched.cron ?? sched.every + 'ms'}`;
 
           if (sched.at && typeof sched.handler === 'function') {
             scheduleAtTime(sched.at, sched.handler, schedLabel);
             scheduleCount++;
             printLog('info', `[pluginLoader] Schedule registered: ${schedLabel}`);
+          } else if (sched.cron && typeof sched.handler === 'function') {
+            scheduleCron(sched.cron, sched.handler, schedLabel);
+            scheduleCount++;
+            printLog('info', `[pluginLoader] Cron registered: ${schedLabel}`);
           } else if (sched.every && typeof sched.handler === 'function') {
             scheduleEvery(sched.every, sched.handler, schedLabel);
             scheduleCount++;

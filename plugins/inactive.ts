@@ -19,7 +19,6 @@ import isAdmin             from '../lib/isAdmin.js';
 import isOwnerOrSudo       from '../lib/isOwner.js';
 import { printLog }        from '../lib/print.js';
 import config              from '../config.js';
-import cron                from 'node-cron';
 
 // ── Storage ───────────────────────────────────────────────────────────────────
 // Tables created automatically by pluginStore on first access.
@@ -1084,29 +1083,24 @@ export async function runInactivityScheduler(sock: any): Promise<void> {
     await checkInactiveUsers(sock);
 }
 
-// ── onLoad ────────────────────────────────────────────────────────────────────
+// ── Schedules — managed by pluginLoader.start() ───────────────────────────────
 
-let inactivitySchedulerStarted = false;
-let _activeSock: any           = null;
-
-export async function onLoad(sock: any): Promise<void> {
-    _activeSock = sock; // always update — handles reconnects cleanly
-
-    if (inactivitySchedulerStarted) return;
-    inactivitySchedulerStarted = true;
-
-    // Daily inactivity DM check at 10:00 AM WAT
-    cron.schedule('0 10 * * *', () => {
-        if (_activeSock) runInactivityScheduler(_activeSock);
-    }, { timezone: 'Africa/Lagos' });
-
-    // Daily cleanup of expired pending-reply states at 02:00 AM WAT
-    cron.schedule('0 2 * * *', () => {
-        cleanupExpiredReplies();
-    }, { timezone: 'Africa/Lagos' });
-
-    printLog('info', '[INACTIVE] Daily scheduler started (10:00 AM WAT)');
-}
+export const schedules = [
+    {
+        at: '10:00',
+        handler: async (sock: any) => {
+            await runInactivityScheduler(sock).catch((e: any) =>
+                printLog('error', `[INACTIVE] Scheduler error: ${e.message}`)
+            );
+        },
+    },
+    {
+        at: '02:00',
+        handler: async (_sock: any) => {
+            cleanupExpiredReplies();
+        },
+    },
+];
 
 // ── Plugin export ─────────────────────────────────────────────────────────────
 
@@ -1197,7 +1191,7 @@ export default {
     },
 
     // Exposed for external wiring and testing
-    onLoad,
+    schedules,
     trackInactivity,
     runInactivityScheduler,
     checkInactiveUsers,

@@ -1,6 +1,5 @@
 // plugins/birthday.ts
 
-import cron   from 'node-cron';
 import moment from 'moment-timezone';
 
 import { printLog }    from '../lib/print.js';
@@ -84,14 +83,8 @@ const dbAdminGroup   = db.table!('admin_group');
 // ── State ─────────────────────────────────────────────────────────────────────
 
 let birthdaySettings: BirthdaySettings = { ...DEFAULT_SETTINGS, loaded: false };
-let schedulerStarted      = false;
 let busListenerRegistered = false;
 
-// Mutable socket reference — cron closures always use the live socket
-// so reconnects don't leave jobs holding a dead connection.
-let currentSock: any = null;
-
-const cronJobs             = new Map<string, any>();
 const lastSchedulerRun: Record<string, boolean> = {};
 
 // ── Settings persistence ──────────────────────────────────────────────────────
@@ -570,40 +563,32 @@ async function runBirthdayReminders(sock: any, daysAhead: number): Promise<void>
   }
 }
 
-// ── node-cron scheduler ───────────────────────────────────────────────────────
+// ── Schedules — managed by pluginLoader.start() ───────────────────────────────
 
-function startScheduler(sock: any): void {
-  currentSock = sock; // always refresh — handles reconnects
-
-  if (schedulerStarted) return; // register cron jobs only once
-  schedulerStarted = true;
-
-  const [wishH, wishM] = birthdaySettings.wishTime.split(':').map(Number);
-  const [remH,  remM]  = birthdaySettings.reminderTime.split(':').map(Number);
-
-  cronJobs.set('wishes', cron.schedule(
-    `${wishM} ${wishH} * * *`,
-    () => runBirthdayWishes(currentSock),
-    { timezone: TIMEZONE }
-  ));
-
-  cronJobs.set('reminders', cron.schedule(
-    `${remM} ${remH} * * *`,
-    async () => {
+export const schedules = [
+  {
+    at: () => birthdaySettings.wishTime,
+    handler: async (sock: any) => {
+      await runBirthdayWishes(sock);
+    },
+  },
+  {
+    at: () => birthdaySettings.reminderTime,
+    handler: async (sock: any) => {
       for (const days of birthdaySettings.reminderDays) {
-        await runBirthdayReminders(currentSock, days);
+        await runBirthdayReminders(sock, days);
       }
     },
-    { timezone: TIMEZONE }
-  ));
-
-  cronJobs.set('cleanup', cron.schedule('0 2 * * 0', runCleanup, { timezone: TIMEZONE }));
-
-  printLog('info', '[BIRTHDAY] node-cron scheduler started');
-}
+  },
+  {
+    cron: '0 2 * * 0',
+    handler: async (_sock: any) => {
+      await runCleanup();
+    },
+  },
+];
 
 async function runMissedTasks(sock: any): Promise<void> {
-  currentSock = sock;
 
   const today       = moment.tz(TIMEZONE).format('YYYY-MM-DD');
   const currentTime = moment.tz(TIMEZONE).format('HH:mm');
@@ -654,12 +639,6 @@ async function onLoad(sock: any): Promise<void> {
     printLog('info', '[BIRTHDAY] ✅ Now listening for attendance:birthday events');
   }
 
-  try {
-    startScheduler(sock);
-    await runMissedTasks(sock);
-  } catch (err: any) {
-    printLog('error', `[BIRTHDAY] Scheduler failed (non-fatal): ${err.message}`);
-  }
 }
 
 // ── Sub-command handlers ──────────────────────────────────────────────────────
@@ -876,7 +855,7 @@ async function handleBirthdayStatus(sock: any, message: any, chatId: string): Pr
 
   let msg  = `📊 *BIRTHDAY SYSTEM STATUS* 📊\n\n`;
   msg     += `⏰ Time (WAT): ${now.format('YYYY-MM-DD HH:mm:ss')}\n`;
-  msg     += `🤖 Scheduler: ${schedulerStarted ? '✅ Running' : '⚠️ Not started'}\n\n`;
+  msg     += `🤖 Scheduler: ✅ Running\n\n`;
   msg     += `📊 *Registered:* ${Object.keys(allBdays).length}\n`;
   msg     += `• Today: ${todayCount}\n`;
   msg     += `• Tomorrow: ${tomorrowCount}\n`;
@@ -1318,7 +1297,6 @@ async function handleBirthdayCommand(sock: any, message: any, args: string[], co
   const isGroup  = chatId.endsWith('@g.us');
 
   if (!birthdaySettings.loaded) await loadSettings();
-  startScheduler(sock);
 
   const invokedCmd = (context.userMessage || '').trim().split(/\s+/)[0].replace(/^[.!#\/]/, '');
   if (['mybirthday', 'mybday'].includes(invokedCmd)) {
@@ -1362,13 +1340,13 @@ const birthdayPlugin = {
   category:    'social',
   handler:     handleBirthdayCommand,
   onLoad,
+  schedules,
   saveBirthdayData,
   getBirthdayData,
   getAllBirthdays,
   getTodaysBirthdays,
   getUpcomingBirthdays,
   parseDOB,
-  startScheduler
 };
 
 export default birthdayPlugin;
@@ -1380,6 +1358,6 @@ export {
   getTodaysBirthdays,
   getUpcomingBirthdays,
   parseDOB,
-  startScheduler,
-  onLoad
+  onLoad,
+  schedules,
 };
