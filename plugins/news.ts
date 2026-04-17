@@ -11,7 +11,7 @@ export default {
     const chatId = context.chatId || message.key.remoteJid;
     try {
       const apiKey = 'dcd720a6f1914e2d9dba9790c188c08c';
-      const response = await axios.get(`https://newsapi.org/v2/top-headlines?country=us&apiKey=${apiKey}`);
+      const response = await axios.get(`https://newsapi.org/v2/top-headlines?country=nigeria&apiKey=${apiKey}`);
       if (!response.data || !response.data.articles) throw new Error('Invalid API response');
       const articles = response.data.articles.slice(0, 5);
       if (articles.length === 0) {
