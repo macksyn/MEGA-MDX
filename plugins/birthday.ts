@@ -1359,5 +1359,4 @@ export {
   getUpcomingBirthdays,
   parseDOB,
   onLoad,
-  schedules,
 };
