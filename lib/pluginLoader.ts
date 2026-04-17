@@ -39,6 +39,7 @@ const require = createRequire(import.meta.url);
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import cron from 'node-cron';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
@@ -71,8 +72,9 @@ interface MessageHook {
 let _sock:    any    = null;
 let _started: boolean = false;
 
-const _messageHooks: MessageHook[] = [];
+const _messageHooks: MessageHook[]    = [];
 const _timers:       NodeJS.Timeout[] = [];
+const _cronJobs:     cron.ScheduledTask[] = [];
 
 const settings = (() => {
   try { return require('../settings'); }
@@ -81,13 +83,9 @@ const settings = (() => {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function nowInTZ(): string {
-  return new Date().toLocaleString('en-GB', {
-    timeZone: settings.timeZone || 'UTC',
-    hour:     '2-digit',
-    minute:   '2-digit',
-    hour12:   false,
-  });
+function timeToCron(timeStr: string): string {
+  const [h, m] = timeStr.split(':').map(Number);
+  return `${m} ${h} * * *`;
 }
 
 function pluginsDir(): string {
@@ -114,29 +112,23 @@ function loadAllPlugins(): Plugin[] {
 // ── Schedule engine ───────────────────────────────────────────────────────────
 
 function scheduleAtTime(timeStr: string, handler: (sock: any) => Promise<void>, label: string): void {
-  let lastFiredDate: string | null = null;
+  const expression = timeToCron(timeStr);
+  const timezone   = settings.timeZone || 'UTC';
 
-  const id = setInterval(async () => {
-    const now   = nowInTZ();
-    const today = new Date().toLocaleDateString();
-
-    if (now === timeStr && lastFiredDate !== today) {
-      lastFiredDate = today;
-      printLog('info', `[pluginLoader] ⏰ Schedule "${label}" firing at ${timeStr}`);
-      try {
-        await handler(_sock);
-      } catch (err: any) {
-        printLog('error', `[pluginLoader] Schedule "${label}" error: ${err.message}`);
-      }
+  const job = cron.schedule(expression, async () => {
+    printLog('info', `[pluginLoader] ⏰ Schedule "${label}" firing at ${timeStr}`);
+    try {
+      await handler(_sock);
+    } catch (err: any) {
+      printLog('error', `[pluginLoader] Schedule "${label}" error: ${err.message}`);
     }
-  }, 60_000);
+  }, { timezone });
 
-  _timers.push(id);
+  _cronJobs.push(job);
 }
 
 function scheduleEvery(ms: number, handler: (sock: any) => Promise<void>, label: string): void {
   const id = setInterval(async () => {
-    printLog('info', `[pluginLoader] 🔁 Interval "${label}" firing`);
     try {
       await handler(_sock);
     } catch (err: any) {
@@ -223,10 +215,12 @@ const pluginLoader = {
     }
   },
 
-  /** Graceful shutdown — clears all timers */
+  /** Graceful shutdown — clears all timers and cron jobs */
   stop(): void {
     for (const id of _timers) clearInterval(id);
     _timers.length = 0;
+    for (const job of _cronJobs) job.stop();
+    _cronJobs.length = 0;
     _started = false;
     printLog('info', '[pluginLoader] All plugin timers cleared.');
   },

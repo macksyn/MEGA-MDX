@@ -452,49 +452,41 @@ async function canManageSchedule(sock: any, chatId: string, senderId: string, se
   return isSenderAdmin;
 }
 
-// ── Self-register reminders via commandHandler's onLoad hook ─────────────────
-// pluginLoader.start() is never called in index.ts, so schedules[] is dead.
-// onLoad IS called via commandHandler.runOnLoad(), so we use that instead.
-let _reminderSock: any = null;
-
-export async function onLoad(sock: any): Promise<void> {
-    _reminderSock = sock;
-    console.log('[SCHEDULER] Reminder timers registered');
-
-    // Morning reminder — fires at 08:00 WAT every day
-    setInterval(async () => {
-        const now = moment().tz(TIMEZONE);
-        if (now.hour() === 8 && now.minute() === 0) {
-            await sendDailyReminders(_reminderSock).catch((e: any) =>
-                console.error('[SCHEDULER] sendDailyReminders error:', e.message)
-            );
-        }
-    }, 60_000);
-
-    // Tomorrow preview — fires at 22:00 WAT every day
-    setInterval(async () => {
-        const now = moment().tz(TIMEZONE);
-        if (now.hour() === 22 && now.minute() === 0) {
-            await sendTomorrowReminders(_reminderSock).catch((e: any) =>
-                console.error('[SCHEDULER] sendTomorrowReminders error:', e.message)
-            );
-        }
-    }, 60_000);
-
-    // 2-hour reminder — checked every 5 minutes
-    setInterval(async () => {
-        await checkTwoHourReminders(_reminderSock).catch((e: any) =>
-            console.error('[SCHEDULER] checkTwoHourReminders error:', e.message)
-        );
-    }, 5 * 60_000);
-
-    // Start / end live notifications — checked every minute
-    setInterval(async () => {
-        await checkLiveNotifications(_reminderSock).catch((e: any) =>
-            console.error('[SCHEDULER] checkLiveNotifications error:', e.message)
-        );
-    }, 60_000);
-}
+// ── Schedules — managed by pluginLoader.start() ───────────────────────────────
+export const schedules = [
+  {
+    at: '08:00',
+    handler: async (sock: any) => {
+      await sendDailyReminders(sock).catch((e: any) =>
+        console.error('[SCHEDULER] sendDailyReminders error:', e.message)
+      );
+    },
+  },
+  {
+    at: '22:00',
+    handler: async (sock: any) => {
+      await sendTomorrowReminders(sock).catch((e: any) =>
+        console.error('[SCHEDULER] sendTomorrowReminders error:', e.message)
+      );
+    },
+  },
+  {
+    every: 5 * 60_000,
+    handler: async (sock: any) => {
+      await checkTwoHourReminders(sock).catch((e: any) =>
+        console.error('[SCHEDULER] checkTwoHourReminders error:', e.message)
+      );
+    },
+  },
+  {
+    every: 60_000,
+    handler: async (sock: any) => {
+      await checkLiveNotifications(sock).catch((e: any) =>
+        console.error('[SCHEDULER] checkLiveNotifications error:', e.message)
+      );
+    },
+  },
+];
 
 // ── Plugin export ─────────────────────────────────────────────────────────────
 export default {
@@ -511,7 +503,7 @@ export default {
   usage: '.program add [name] | [day] | [time] | [duration]',
   groupOnly: true,
   cooldown: 2,
-  onLoad,
+  schedules,
 
   // ── Main handler ──────────────────────────────────────────────────────────
   async handler(sock: any, message: any, args: any[], context: any = {}) {

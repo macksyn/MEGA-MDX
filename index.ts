@@ -15,6 +15,7 @@ const __dirname = dirname(__filename);
 
 import { smsg } from './lib/myfunc.js';
 import { compileAll } from './lib/compile.js';
+import pluginLoader from './lib/pluginLoader.js';
 import makeWASocket, {
     useMultiFileAuthState,
     DisconnectReason,
@@ -451,6 +452,12 @@ async function startQasimDev(): Promise<any> {
                     await commandHandler.runOnLoad(QasimDev);
                 } catch (e: any) {
                     printLog('error', `Failed to run plugin onLoad hooks: ${e.message}`);
+                }
+
+                try {
+                    await pluginLoader.start(QasimDev);
+                } catch (e: any) {
+                    printLog('error', `Failed to start plugin schedules: ${e.message}`);
                 }
 
                 try {
