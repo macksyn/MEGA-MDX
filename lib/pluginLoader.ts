@@ -163,10 +163,11 @@ const pluginLoader = {
    * Call once inside `connection.update → connection === 'open'`.
    * Safe to call multiple times — only runs once.
    */
-  async start(sock: any): Promise<void> {
+// AFTER (always refreshes the socket)
+ async start(sock: any): Promise<void> {
+    _sock = sock;           // ← always update, even after reconnects
     if (_started) return;
     _started = true;
-    _sock    = sock;
 
     printLog('info', '[pluginLoader] Starting plugin lifecycle hooks...');
 
