@@ -10,7 +10,7 @@ import bus           from '../lib/pluginBus.js';
 // Activity tracker is optional — fails gracefully if not present
 let activityTracker: any = null;
 try {
-  activityTracker = require('../lib/activitytracker.ts');
+  activityTracker = require('../lib/activitytracker.js');
 } catch (e) {
   console.log('[ATTENDANCE] Activity tracker not available (optional)');
 }
