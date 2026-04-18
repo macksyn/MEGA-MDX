@@ -78,9 +78,10 @@ const _timers:       NodeJS.Timeout[] = [];
 const _cronJobs:     cron.ScheduledTask[] = [];
 
 const settings = (() => {
-  try { return require('../settings'); }
-  catch { return { timeZone: 'UTC' }; }
+  try { return require('../config').default || require('../config'); }
+  catch { return { timeZone: 'Africa/Lagos' }; }
 })();
+
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
