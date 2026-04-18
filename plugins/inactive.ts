@@ -380,7 +380,7 @@ async function alertAdmins(
             `_Consider reaching out to them privately. Avoid referencing this in the group._`;
     } else {
         // boring — fully anonymous, no name, no mention
-        const summary = await summarizeFeedback(userMessage, pending.groupName);
+        const summary = summarizeFeedback(userMessage, pending.groupName);
         alertText =
             `💡 *Inactivity Tracker — Engagement Feedback*\n\n` +
             `🏷️ Group: *${pending.groupName}*\n\n` +
@@ -554,7 +554,7 @@ export async function handleInactiveReply(sock: any, message: any): Promise<bool
 
         // ── Stage: conflict consent ───────────────────────────────────────────
         if (pending.stage === 'conflict_consent') {
-            const consent = await classifyConsent(userMessage);
+            const consent = classifyConsent(userMessage);
 
             if (consent === 'yes') {
                 await sock.sendMessage(chatId, {
@@ -643,7 +643,7 @@ export async function handleInactiveReply(sock: any, message: any): Promise<bool
 
         // ── Stage: initial — first reply to the inactivity DM ────────────────
         printLog('info', `[INACTIVE] Reply from ${chatId.split('@')[0]} — classifying...`);
-        const { category, reasoning } = await classifyReply(userMessage);
+        const { category, reasoning } = classifyReply(userMessage);
         printLog('info', `[INACTIVE] Classified as "${category}": ${reasoning}`);
 
         const botReply = pickReply(category);
