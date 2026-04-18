@@ -78,7 +78,7 @@ export async function handleLinkDetection(sock: any, chatId: string, message: an
             linkType = 'Telegram';
         } else if (linkPatterns.allLinks.test(userMessage)) {
             shouldAct = true;
-            linkType = 'Link';
+            linkType = 'Scam';
         }
 
         if (!shouldAct) return;
@@ -103,7 +103,7 @@ export async function handleLinkDetection(sock: any, chatId: string, message: an
 
         if (action === 'warn' || action === 'delete') {
             await sock.sendMessage(chatId, {
-                text: `⚠️ *Antilink Warning*\n\n@${senderId.split('@')[0]}, posting ${linkType} links is not allowed!`,
+                text: `⚠️ *Warning!!!*\n\n@${senderId.split('@')[0]}, posting ${linkType} links is not allowed here!`,
                 mentions: [senderId]
             });
         }
