@@ -254,143 +254,41 @@ function getMentions(message: any): string[] {
     return ctx?.mentionedJid ?? [];
 }
 
-// ── AI: reply classifier ──────────────────────────────────────────────────────
+function classifyReply(userMessage: string): ClassifiedReply {
+    const t = userMessage.toLowerCase();
 
-async function classifyReply(userMessage: string): Promise<ClassifiedReply> {
-    try {
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                model:      'claude-sonnet-4-20250514',
-                max_tokens: 200,
-                system:
-`You classify WhatsApp replies to an inactivity reminder DM.
-Respond ONLY with valid JSON. No markdown, no explanation outside the JSON.
+    if (/sick|ill|hospital|death|died|dead|bereave|grief|mental|accident|surgery|not (feeling|doing|fine|well|okay|ok|good)|feeling (bad|terrible|awful|down|low|sad|depressed)|not (fine|well|okay)|things are (not|bad)|just managing|struggling|can't cope|rough (time|patch)|hard time/i.test(t))
+        return { category: 'serious', reasoning: 'Health or personal distress detected' };
 
-Categories:
-- "serious"   → illness, death, bereavement, grief, mental health crisis,
-                 family emergency, accident, hospital, surgery, or any genuinely
-                 distressing personal situation.
-- "conflict"  → went quiet because of something that happened in the group: drama,
-                 argument, feeling ignored, excluded, disrespected, hurt by someone's
-                 words. Subtle signals: "needed space from it", "some people",
-                 "the vibe", "felt left out", "no one noticed I was gone",
-                 "didn't feel welcome", "needed a break from the group".
-- "exams"     → inactive because of exams, studying, tests, school, university,
-                 college, revision, coursework, assignments, academic pressure,
-                 thesis, finals, or any educational commitment.
-- "boring"    → person finds the group uninteresting, boring, dead, inactive,
-                 repetitive, not engaging, not relevant. Also catch: "same people",
-                 "nothing new", "group died", "no vibes", "doesn't interest me
-                 anymore", "feels pointless", "nobody talks".
-- "casual"    → busy at work, travelling, on break, general life busyness,
-                 no distress signals, no group-related reason.
-- "returning" → person says they are back, thanks the bot, says they will be
-                 active again, or responds positively with no complaint or distress.
-- "unknown"   → unrelated, gibberish, or too ambiguous to classify.
+    if (/exam|study|studi|test|school|university|college|revision|coursework|assignment|finals|thesis|academic|lectures|semester/i.test(t))
+        return { category: 'exams', reasoning: 'Academic commitment detected' };
 
-Respond with exactly: {"category":"<one of the seven>","reasoning":"<one short sentence>"}`,
-                messages: [{
-                    role:    'user',
-                    content: `Classify this reply to an inactivity DM: "${userMessage.slice(0, 500)}"`,
-                }],
-            }),
-        });
+    if (/boring|dead|quiet|same people|nothing new|doesn.t interest|no vibe|group died|feels? pointless|nobody talks?|not relevant|repetitive/i.test(t))
+        return { category: 'boring', reasoning: 'Group disengagement detected' };
 
-        if (!response.ok) throw new Error(`API ${response.status}`);
+    if (/drama|argument|argued|fight|ignored|excluded|left out|disrespect|hurt|needed space|some people|the vibe|didn.t feel|felt unwelcome|needed a break from/i.test(t))
+        return { category: 'conflict', reasoning: 'Group conflict signal detected' };
 
-        const data   = await response.json() as { content?: { text?: string }[] };
-        const raw    = data.content?.[0]?.text?.trim() ?? '';
-        const parsed = JSON.parse(raw) as ClassifiedReply;
+    if (/i.?m back|i am back|returning|active again|thank|thanks|missed|coming back/i.test(t))
+        return { category: 'returning', reasoning: 'Returning member detected' };
 
-        const validCategories: ReplyCategory[] = ['serious', 'conflict', 'exams', 'boring', 'casual', 'returning', 'unknown'];
-        if (!validCategories.includes(parsed.category)) throw new Error('Invalid category returned');
+    if (/busy|work|travel|vacation|trip|offline|family|personal|life|things/i.test(t))
+        return { category: 'casual', reasoning: 'General busyness detected' };
 
-        return parsed;
-    } catch (error: any) {
-        printLog('error', `[INACTIVE] classifyReply failed: ${error.message}`);
-        return { category: 'unknown', reasoning: 'Classification failed — defaulting to unknown.' };
-    }
+    return { category: 'unknown', reasoning: 'Could not classify' };
 }
 
-// ── AI: consent classifier ────────────────────────────────────────────────────
-
-async function classifyConsent(userMessage: string): Promise<ConsentResult> {
-    const text = userMessage.toLowerCase().trim();
-
-    // Fast local check first — avoids an API call for clear yes/no
-    const yesSignals = ['yes', 'yeah', 'yep', 'yh', 'sure', 'ok', 'okay', 'please', 'go ahead', 'do it', 'alright', 'fine'];
-    const noSignals  = ['no', 'nah', 'nope', "don't", 'dont', 'no thanks', 'its fine', "it's fine", 'leave it', 'forget it', 'never mind', 'nevermind'];
-
-    if (yesSignals.some(s => text === s || text.startsWith(s + ' '))) return 'yes';
-    if (noSignals.some(s => text === s || text.startsWith(s + ' ')))  return 'no';
-
-    // Ambiguous — use Claude
-    try {
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                model:      'claude-sonnet-4-20250514',
-                max_tokens: 50,
-                system:
-`Reply ONLY with one word: "yes", "no", or "unknown".
-The user was asked if they want something shared with group admins.
-Classify their reply as consent (yes), refusal (no), or unclear (unknown).`,
-                messages: [{ role: 'user', content: userMessage.slice(0, 200) }],
-            }),
-        });
-
-        if (!response.ok) throw new Error(`API ${response.status}`);
-
-        const data   = await response.json() as { content?: { text?: string }[] };
-        const result = data.content?.[0]?.text?.trim().toLowerCase();
-
-        if (result === 'yes' || result === 'no') return result;
-        return 'unknown';
-    } catch (error: any) {
-        printLog('error', `[INACTIVE] classifyConsent failed: ${error.message}`);
-        return 'unknown';
-    }
+function classifyConsent(userMessage: string): ConsentResult {
+    const t = userMessage.toLowerCase().trim();
+    const yes = ['yes','yeah','yep','yh','sure','ok','okay','please','go ahead','do it','alright','fine','why not','no problem'];
+    const no  = ['no','nah','nope',"don't",'dont','no thanks','its fine',"it's fine",'leave it','forget it','never mind','nevermind','keep it','private'];
+    if (yes.some(s => t === s || t.startsWith(s + ' '))) return 'yes';
+    if (no.some(s  => t === s || t.startsWith(s + ' '))) return 'no';
+    return 'unknown';
 }
 
-// ── AI: feedback summarizer ───────────────────────────────────────────────────
-
-async function summarizeFeedback(userMessage: string, groupName: string): Promise<string> {
-    try {
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                model:      'claude-sonnet-4-20250514',
-                max_tokens: 200,
-                system:
-`You turn raw member feedback about a WhatsApp group into a constructive,
-actionable 2-3 sentence summary for group admins.
-
-Rules:
-- Never quote the member directly
-- Frame as an opportunity, not a complaint
-- Be specific about the concern without being accusatory
-- Do not mention or hint at who gave the feedback
-- Keep it professional and kind
-- Start with "A member shared feedback that..."`,
-                messages: [{
-                    role:    'user',
-                    content: `Group name: "${groupName}"\nRaw feedback: "${userMessage.slice(0, 400)}"`,
-                }],
-            }),
-        });
-
-        if (!response.ok) throw new Error(`API ${response.status}`);
-
-        const data = await response.json() as { content?: { text?: string }[] };
-        return data.content?.[0]?.text?.trim() ?? 'A member shared feedback about group engagement.';
-    } catch (error: any) {
-        printLog('error', `[INACTIVE] summarizeFeedback failed: ${error.message}`);
-        return 'A member shared feedback about group engagement but the summary could not be generated.';
-    }
+function summarizeFeedback(userMessage: string, groupName: string): string {
+    return `A member shared feedback that the *${groupName}* group feels less engaging than it used to. They suggested the content or interactions may need refreshing to keep members interested and involved.`;
 }
 
 // ── Reply message pools ───────────────────────────────────────────────────────
