@@ -450,6 +450,17 @@ if (isGroup && !message.key.fromMe) {
                 printLog('error', `PM blocker error: ${e.message}`);
             }
         }
+        
+        // ── Inactive tracker reply interception (private messages only) ──────────────
+if (!isGroup && !message.key.fromMe) {
+    try {
+        const { handleInactiveReply } = await import('../plugins/inactive.js');
+        const handled = await handleInactiveReply(sock, message);
+        if (handled) return;
+    } catch (e: any) {
+        printLog('error', `[INACTIVE] Reply handler error: ${e.message}`);
+    }
+}
 
         const usedPrefix = config.prefixes.find(p => userMessage.startsWith(p));
 
