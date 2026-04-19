@@ -33,6 +33,7 @@ import { channelInfo } from './messageConfig.js';
 import { handleAutoAttendance } from '../plugins/attendance.js';
 import { handleGroupAutoDownload } from '../plugins/group-autodownload.js';
 import { wcgOnMessage } from '../plugins/wrg.js';
+import { c4OnMessage } from '../plugins/connect4.js';
 
 const MONGO_URL = process.env.MONGO_URL;
 const POSTGRES_URL = process.env.POSTGRES_URL;
@@ -387,6 +388,9 @@ if (isGroup && !message.key.fromMe) {
         });
         if (wcgHandled) return;
         // ───────────────────────────────────────────────────────────────────
+
+      const c4Handled = await c4OnMessage(sock, message, context);
+     if (c4Handled) return;
 
         if (!message.key.fromMe) {
             await store.incrementMessageCount(chatId, senderId, message.pushName);
