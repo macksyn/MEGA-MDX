@@ -389,7 +389,20 @@ if (isGroup && !message.key.fromMe) {
         if (wcgHandled) return;
         // ───────────────────────────────────────────────────────────────────
 
-      const c4Handled = await c4OnMessage(sock, message, context);
+      const c4Handled = await c4OnMessage(sock, message, {
+            chatId,
+            senderId,
+            isGroup,
+            channelInfo,
+            userMessage,
+            messageText,
+            rawText,
+            config,
+            isSenderAdmin: false,
+            isBotAdmin: false,
+            senderIsOwnerOrSudo: false,
+            isOwnerOrSudoCheck: false,
+        });
      if (c4Handled) return;
 
         if (!message.key.fromMe) {
