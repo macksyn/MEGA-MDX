@@ -366,6 +366,22 @@ if (isGroup && !message.key.fromMe) {
     if (autoHandled) return;
 }
 
+      const c4Handled = await c4OnMessage(sock, message, {
+            chatId,
+            senderId,
+            isGroup,
+            channelInfo,
+            userMessage,
+            messageText,
+            rawText,
+            config,
+            isSenderAdmin: false,
+            isBotAdmin: false,
+            senderIsOwnerOrSudo: false,
+            isOwnerOrSudoCheck: false,
+        });
+     if (c4Handled) return;
+
         if (/^[1-9]$/.test(userMessage) || userMessage === 'surrender') {
             await handleTicTacToeMove(sock, chatId, senderId, userMessage);
             return;
@@ -388,22 +404,6 @@ if (isGroup && !message.key.fromMe) {
         });
         if (wcgHandled) return;
         // ───────────────────────────────────────────────────────────────────
-
-      const c4Handled = await c4OnMessage(sock, message, {
-            chatId,
-            senderId,
-            isGroup,
-            channelInfo,
-            userMessage,
-            messageText,
-            rawText,
-            config,
-            isSenderAdmin: false,
-            isBotAdmin: false,
-            senderIsOwnerOrSudo: false,
-            isOwnerOrSudoCheck: false,
-        });
-     if (c4Handled) return;
 
         if (!message.key.fromMe) {
             await store.incrementMessageCount(chatId, senderId, message.pushName);
