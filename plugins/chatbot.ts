@@ -109,16 +109,6 @@ const API_ENDPOINTS = [
             : null
     },
     {
-        name:   'VeniceAI',
-        url:    'https://rynekoo-api.hf.space/text.gen/venice',
-        body:   (text: string, systemPrompt: string, _sessionId?: string) => ({
-            text: `${systemPrompt}\n\n${text}`
-        }),
-        parse:  (data: any) => typeof data?.result === 'string' && data.result
-            ? { text: data.result }
-            : null
-    },
-    {
         name:   'CopilotAI',
         url:    'https://rynekoo-api.hf.space/text.gen/copilot',
         body:   (text: string, systemPrompt: string, _sessionId?: string) => ({
@@ -126,6 +116,16 @@ const API_ENDPOINTS = [
         }),
         parse:  (data: any) => typeof data?.result?.text === 'string' && data.result.text
             ? { text: data.result.text }
+            : null
+    },
+    {
+        name:   'VeniceAI',
+        url:    'https://rynekoo-api.hf.space/text.gen/venice',
+        body:   (text: string, systemPrompt: string, _sessionId?: string) => ({
+            text: `${systemPrompt}\n\n${text}`
+        }),
+        parse:  (data: any) => typeof data?.result === 'string' && data.result
+            ? { text: data.result }
             : null
     },
     {
@@ -139,6 +139,8 @@ const API_ENDPOINTS = [
             : null
     }
 ];
+
+const GEMINI_GRACE_MS = 5000;
 
 const API_FAILURE_RESET_MS = 5 * 60 * 1000;
 const API_SKIP_THRESHOLD   = 3;  // skip API once it hits this many recent failures
@@ -411,76 +413,108 @@ async function getAIResponse(
     const sessionId    = userContext.userInfo[sessionKey] as string | undefined;
     const healthyApis  = API_ENDPOINTS.filter(api => isApiHealthy(api.name));
 
-    // ── FIX #11: Top 2 healthy APIs race in parallel ──────────────────────────
-    const parallelApis = healthyApis.slice(0, 2);
-    const restApis     = healthyApis.slice(2);
+    if (healthyApis.length === 0) {
+        console.error('[API] No healthy APIs available');
+        return null;
+    }
 
-    if (parallelApis.length > 0) {
-        try {
-            const winner = await promiseAny(
-                parallelApis.map(api =>
-                    tryApi(api, textWithHistory, systemPrompt, sessionId)
-                        .then(result => ({ result, api }))
-                )
-            );
+    // ── Staggered race: Gemini gets a solo grace period, then others join ─────
+    const gemini = healthyApis.find(api => api.name === 'GeminiRealtime');
+    const others = healthyApis.filter(api => api.name !== 'GeminiRealtime');
 
+    const startedApis: typeof API_ENDPOINTS = [];
+    const inFlight: Promise<{ result: any; api: typeof API_ENDPOINTS[number] }>[] = [];
+
+    const startApi = (api: typeof API_ENDPOINTS[number]) => {
+        startedApis.push(api);
+        return tryApi(api, textWithHistory, systemPrompt, sessionId)
+            .then(result => ({ result, api }));
+    };
+
+    if (gemini) {
+        const geminiPromise = startApi(gemini);
+        console.log(`[API] ${gemini.name} started — solo grace period (${GEMINI_GRACE_MS}ms)`);
+
+        type GraceOutcome =
+            | { type: 'success'; winner: { result: any; api: typeof API_ENDPOINTS[number] } }
+            | { type: 'fail'; err: any }
+            | { type: 'timeout' };
+
+        const graceResult: GraceOutcome = await Promise.race([
+            geminiPromise
+                .then(winner => ({ type: 'success' as const, winner }))
+                .catch(err   => ({ type: 'fail'    as const, err })),
+            new Promise<GraceOutcome>(resolve =>
+                setTimeout(() => resolve({ type: 'timeout' }), GEMINI_GRACE_MS)
+            )
+        ]);
+
+        if (graceResult.type === 'success') {
+            const { winner } = graceResult;
             apiStats[winner.api.name].count         = 0;
             apiStats[winner.api.name].lastSuccessAt = Date.now();
-            console.log(`[API] ${winner.api.name} won parallel race`);
-            // Track failures for any parallel API that lost (may have failed silently)
-            for (const api of parallelApis) {
-                if (api.name !== winner.api.name && apiStats[api.name].lastSuccessAt < apiStats[api.name].lastFailAt) {
-                    apiStats[api.name].count++;
-                    apiStats[api.name].lastFailAt = Date.now();
-                    console.log(`[API] ${api.name} lost parallel race (failure recorded)`);
-                }
-            }
+            console.log(`[API] ${winner.api.name} won inside grace period`);
 
             if (winner.result.sessionId) {
                 const profile = await loadProfile(senderId);
                 profile[`_sid_${chatId}`] = winner.result.sessionId;
                 await saveProfile(senderId, profile);
             }
-
             return cleanResponse(winner.result.text);
+        }
 
-        } catch (parallelErr: any) {
-            // All parallel attempts failed — penalise and fall through to sequential
-            for (const api of parallelApis) {
-                apiStats[api.name].count++;
-                apiStats[api.name].lastFailAt = Date.now();
-                console.log(`[API] ${api.name} failed in parallel attempt`);
-            }
+        if (graceResult.type === 'fail') {
+            apiStats[gemini.name].count++;
+            apiStats[gemini.name].lastFailAt = Date.now();
+            console.log(`[API] ${gemini.name} failed in grace period: ${graceResult.err?.message} — firing others now`);
+            // Swallow any later state of the rejected gemini promise so we don't get an unhandled rejection
+            geminiPromise.catch(() => {});
+        } else {
+            console.log(`[API] ${gemini.name} grace expired — firing others in parallel, ${gemini.name} stays in race`);
+            // Keep Gemini in the race; ensure stats get recorded if it eventually rejects
+            inFlight.push(geminiPromise);
+            geminiPromise.catch(() => {
+                apiStats[gemini.name].count++;
+                apiStats[gemini.name].lastFailAt = Date.now();
+                console.log(`[API] ${gemini.name} eventually failed after grace`);
+            });
         }
     }
 
-    // ── Sequential fallback for remaining APIs ────────────────────────────────
-    for (const api of restApis) {
-        try {
-            console.log(`[API] Trying ${api.name} (sequential fallback)...`);
-            const result = await tryApi(api, textWithHistory, systemPrompt, sessionId);
-
-            apiStats[api.name].count         = 0;
-            apiStats[api.name].lastSuccessAt = Date.now();
-            console.log(`[API] ${api.name} success`);
-
-            if (result.sessionId) {
-                const profile = await loadProfile(senderId);
-                profile[`_sid_${chatId}`] = result.sessionId;
-                await saveProfile(senderId, profile);
-            }
-
-            return cleanResponse(result.text);
-
-        } catch (error: any) {
+    // Fire the rest in parallel
+    for (const api of others) {
+        const p = startApi(api);
+        inFlight.push(p);
+        p.catch(err => {
             apiStats[api.name].count++;
             apiStats[api.name].lastFailAt = Date.now();
-            console.log(`[API] ${api.name} error: ${error.message}`);
-        }
+            console.log(`[API] ${api.name} failed in parallel race: ${err?.message}`);
+        });
     }
 
-    console.error('[API] All APIs failed');
-    return null;
+    if (inFlight.length === 0) {
+        console.error('[API] All APIs failed');
+        return null;
+    }
+
+    try {
+        const winner = await promiseAny(inFlight);
+
+        apiStats[winner.api.name].count         = 0;
+        apiStats[winner.api.name].lastSuccessAt = Date.now();
+        console.log(`[API] ${winner.api.name} won parallel race`);
+
+        if (winner.result.sessionId) {
+            const profile = await loadProfile(senderId);
+            profile[`_sid_${chatId}`] = winner.result.sessionId;
+            await saveProfile(senderId, profile);
+        }
+
+        return cleanResponse(winner.result.text);
+    } catch (_err) {
+        console.error('[API] All APIs failed');
+        return null;
+    }
 }
 
 // ── Main chatbot handler ──────────────────────────────────────────────────────
