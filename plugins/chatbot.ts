@@ -140,7 +140,8 @@ const API_ENDPOINTS = [
     }
 ];
 
-const GEMINI_GRACE_MS = 5000;
+const GEMINI_GRACE_MS  = 5000;
+const COPILOT_GRACE_MS = 5000;
 
 const API_FAILURE_RESET_MS = 5 * 60 * 1000;
 const API_SKIP_THRESHOLD   = 3;  // skip API once it hits this many recent failures
@@ -418,100 +419,138 @@ async function getAIResponse(
         return null;
     }
 
-    // ── Staggered race: Gemini gets a solo grace period, then others join ─────
-    const gemini = healthyApis.find(api => api.name === 'GeminiRealtime');
-    const others = healthyApis.filter(api => api.name !== 'GeminiRealtime');
+    type ApiInfo   = typeof API_ENDPOINTS[number];
+    type ApiResult = { result: any; api: ApiInfo };
+    type RaceOutcome =
+        | { type: 'success'; winner: ApiResult }
+        | { type: 'allFailed' }
+        | { type: 'timeout' };
 
-    const startedApis: typeof API_ENDPOINTS = [];
-    const inFlight: Promise<{ result: any; api: typeof API_ENDPOINTS[number] }>[] = [];
+    // ── Staggered race: Gemini → +Copilot → +Venice/Felo ──────────────────────
+    const gemini  = healthyApis.find(a => a.name === 'GeminiRealtime');
+    const copilot = healthyApis.find(a => a.name === 'CopilotAI');
+    const others  = healthyApis.filter(a => a.name !== 'GeminiRealtime' && a.name !== 'CopilotAI');
 
-    const startApi = (api: typeof API_ENDPOINTS[number]) => {
-        startedApis.push(api);
-        return tryApi(api, textWithHistory, systemPrompt, sessionId)
+    const allInFlight: Promise<ApiResult>[] = [];
+
+    const startApi = (api: ApiInfo): Promise<ApiResult> => {
+        const p = tryApi(api, textWithHistory, systemPrompt, sessionId)
             .then(result => ({ result, api }));
+        allInFlight.push(p);
+        // Always attach a base swallow so unhandled-rejection warnings don't fire
+        p.catch(() => {});
+        return p;
     };
 
-    if (gemini) {
-        const geminiPromise = startApi(gemini);
-        console.log(`[API] ${gemini.name} started — solo grace period (${GEMINI_GRACE_MS}ms)`);
+    const recordSuccess = (api: ApiInfo) => {
+        apiStats[api.name].count         = 0;
+        apiStats[api.name].lastSuccessAt = Date.now();
+    };
+    const recordFailure = (api: ApiInfo) => {
+        apiStats[api.name].count++;
+        apiStats[api.name].lastFailAt = Date.now();
+    };
 
-        type GraceOutcome =
-            | { type: 'success'; winner: { result: any; api: typeof API_ENDPOINTS[number] } }
-            | { type: 'fail'; err: any }
-            | { type: 'timeout' };
-
-        const graceResult: GraceOutcome = await Promise.race([
-            geminiPromise
-                .then(winner => ({ type: 'success' as const, winner }))
-                .catch(err   => ({ type: 'fail'    as const, err })),
-            new Promise<GraceOutcome>(resolve =>
-                setTimeout(() => resolve({ type: 'timeout' }), GEMINI_GRACE_MS)
-            )
-        ]);
-
-        if (graceResult.type === 'success') {
-            const { winner } = graceResult;
-            apiStats[winner.api.name].count         = 0;
-            apiStats[winner.api.name].lastSuccessAt = Date.now();
-            console.log(`[API] ${winner.api.name} won inside grace period`);
-
-            if (winner.result.sessionId) {
-                const profile = await loadProfile(senderId);
-                profile[`_sid_${chatId}`] = winner.result.sessionId;
-                await saveProfile(senderId, profile);
-            }
-            return cleanResponse(winner.result.text);
-        }
-
-        if (graceResult.type === 'fail') {
-            apiStats[gemini.name].count++;
-            apiStats[gemini.name].lastFailAt = Date.now();
-            console.log(`[API] ${gemini.name} failed in grace period: ${graceResult.err?.message} — firing others now`);
-            // Swallow any later state of the rejected gemini promise so we don't get an unhandled rejection
-            geminiPromise.catch(() => {});
-        } else {
-            console.log(`[API] ${gemini.name} grace expired — firing others in parallel, ${gemini.name} stays in race`);
-            // Keep Gemini in the race; ensure stats get recorded if it eventually rejects
-            inFlight.push(geminiPromise);
-            geminiPromise.catch(() => {
-                apiStats[gemini.name].count++;
-                apiStats[gemini.name].lastFailAt = Date.now();
-                console.log(`[API] ${gemini.name} eventually failed after grace`);
-            });
-        }
-    }
-
-    // Fire the rest in parallel
-    for (const api of others) {
-        const p = startApi(api);
-        inFlight.push(p);
-        p.catch(err => {
-            apiStats[api.name].count++;
-            apiStats[api.name].lastFailAt = Date.now();
-            console.log(`[API] ${api.name} failed in parallel race: ${err?.message}`);
-        });
-    }
-
-    if (inFlight.length === 0) {
-        console.error('[API] All APIs failed');
-        return null;
-    }
-
-    try {
-        const winner = await promiseAny(inFlight);
-
-        apiStats[winner.api.name].count         = 0;
-        apiStats[winner.api.name].lastSuccessAt = Date.now();
-        console.log(`[API] ${winner.api.name} won parallel race`);
-
+    const finalize = async (winner: ApiResult): Promise<string> => {
+        recordSuccess(winner.api);
         if (winner.result.sessionId) {
             const profile = await loadProfile(senderId);
             profile[`_sid_${chatId}`] = winner.result.sessionId;
             await saveProfile(senderId, profile);
         }
-
         return cleanResponse(winner.result.text);
-    } catch (_err) {
+    };
+
+    const raceWithGrace = (
+        pool: Promise<ApiResult>[],
+        graceMs: number
+    ): Promise<RaceOutcome> => {
+        if (pool.length === 0) return Promise.resolve({ type: 'allFailed' });
+        return new Promise<RaceOutcome>(resolve => {
+            let rejectedCount = 0;
+            const timer = setTimeout(() => resolve({ type: 'timeout' }), graceMs);
+            pool.forEach(p => {
+                p.then(winner => {
+                    clearTimeout(timer);
+                    resolve({ type: 'success', winner });
+                }).catch(() => {
+                    rejectedCount++;
+                    if (rejectedCount === pool.length) {
+                        clearTimeout(timer);
+                        resolve({ type: 'allFailed' });
+                    }
+                });
+            });
+        });
+    };
+
+    // ── Tier 1: Gemini solo ───────────────────────────────────────────────────
+    if (gemini) {
+        const gp = startApi(gemini);
+        console.log(`[API] ${gemini.name} started — solo grace ${GEMINI_GRACE_MS}ms`);
+
+        const tier1 = await raceWithGrace([gp], GEMINI_GRACE_MS);
+
+        if (tier1.type === 'success') {
+            console.log(`[API] ${tier1.winner.api.name} won inside Gemini grace`);
+            return finalize(tier1.winner);
+        }
+        if (tier1.type === 'allFailed') {
+            recordFailure(gemini);
+            console.log(`[API] ${gemini.name} failed in grace — escalating to Copilot`);
+        } else {
+            console.log(`[API] ${gemini.name} grace expired — escalating to Copilot, ${gemini.name} stays in race`);
+            gp.catch(() => {
+                recordFailure(gemini);
+                console.log(`[API] ${gemini.name} eventually failed`);
+            });
+        }
+    }
+
+    // ── Tier 2: + Copilot ─────────────────────────────────────────────────────
+    if (copilot) {
+        const cp = startApi(copilot);
+        console.log(`[API] ${copilot.name} started — tier-2 grace ${COPILOT_GRACE_MS}ms`);
+
+        // Pool = Copilot + any tier-1 promise still in flight (Gemini if it timed out)
+        const pool = allInFlight.slice();
+        const tier2 = await raceWithGrace(pool, COPILOT_GRACE_MS);
+
+        if (tier2.type === 'success') {
+            console.log(`[API] ${tier2.winner.api.name} won inside Copilot grace`);
+            return finalize(tier2.winner);
+        }
+        if (tier2.type === 'allFailed') {
+            recordFailure(copilot);
+            console.log(`[API] all tier-2 APIs failed — escalating to Venice/Felo`);
+        } else {
+            console.log(`[API] Copilot grace expired — escalating to Venice/Felo, top APIs stay in race`);
+            cp.catch(() => {
+                recordFailure(copilot);
+                console.log(`[API] ${copilot.name} eventually failed`);
+            });
+        }
+    }
+
+    // ── Tier 3: + Venice/Felo (final free-for-all) ────────────────────────────
+    for (const api of others) {
+        const p = startApi(api);
+        p.catch(err => {
+            recordFailure(api);
+            console.log(`[API] ${api.name} failed: ${err?.message}`);
+        });
+    }
+
+    if (allInFlight.length === 0) {
+        console.error('[API] No APIs in flight');
+        return null;
+    }
+
+    try {
+        const winner = await promiseAny(allInFlight);
+        console.log(`[API] ${winner.api.name} won final race`);
+        return finalize(winner);
+    } catch {
         console.error('[API] All APIs failed');
         return null;
     }
