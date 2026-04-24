@@ -25,14 +25,15 @@ async function loadSchedules(): Promise<ScheduledMessage[]> {
     try {
         if (HAS_DB) {
             const data = await store.getSetting('global', 'schedules');
-            return data || [];
+            return Array.isArray(data) ? data : [];  // ← key fix
         } else {
             if (!fs.existsSync(configPath)) {
                 const dataDir = path.dirname(configPath);
                 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
                 fs.writeFileSync(configPath, JSON.stringify([], null, 2));
             }
-            return JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+            const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+            return Array.isArray(parsed) ? parsed : [];  // ← key fix
         }
     } catch {
         return [];
@@ -117,6 +118,7 @@ export function startSchedulerEngine(sock: any) {
         try {
             const now = Date.now();
             const schedules = await loadSchedules();
+            if (!Array.isArray(schedules)) return;  // ← safety net
             const remaining: ScheduledMessage[] = [];
             let changed = false;
 
