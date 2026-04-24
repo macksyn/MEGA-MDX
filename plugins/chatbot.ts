@@ -917,3 +917,4 @@ export default {
     loadUserGroupData,
     saveUserGroupData
 };
+// plugins/chatbot.ts
