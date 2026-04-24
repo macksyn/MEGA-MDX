@@ -140,7 +140,7 @@ const API_ENDPOINTS = [
     }
 ];
 
-const GEMINI_GRACE_MS = 5000;
+const GEMINI_GRACE_MS = 10000;
 
 const API_FAILURE_RESET_MS = 5 * 60 * 1000;
 const API_SKIP_THRESHOLD   = 3;  // skip API once it hits this many recent failures
