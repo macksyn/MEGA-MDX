@@ -376,6 +376,49 @@ function promiseAny<T>(promises: Promise<T>[]): Promise<T> {
     });
 }
 
+// ── Real-time query detection ─────────────────────────────────────────────────
+const REALTIME_PATTERNS = [
+    /\b(match|fixture|score|result|epl|premier league|champions league|ucl|la liga|serie a|bundesliga)\b/i,
+    /\b(playing (today|tonight|next|now)|next (match|game)|who (are|is) .+ playing)\b/i,
+    /\b(latest|breaking|today'?s? news|current(ly)?|right now|as of today)\b/i,
+    /\b(stock|crypto|bitcoin|price of|exchange rate|weather in)\b/i,
+    /\b(who (won|scored|beat)|final score|live score|standings|table)\b/i,
+];
+
+function needsRealTimeSearch(message: string): boolean {
+    return REALTIME_PATTERNS.some(p => p.test(message));
+}
+
+// ── Felo search (used for real-time queries only) ─────────────────────────────
+async function feloSearch(query: string): Promise<string | null> {
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 12000);
+
+        const response = await fetch(
+            `https://api.felo.ai/search/threads`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ q: query }),
+                signal: controller.signal
+            }
+        );
+        clearTimeout(timeoutId);
+
+        if (!response.ok) return null;
+
+        const data = await response.json() as any;
+        const text = data?.result?.text;
+        if (!text) return null;
+
+        // Strip markdown bold/italic for WhatsApp friendliness
+        return text.replace(/\*\*/g, '*').trim();
+    } catch {
+        return null;
+    }
+}
+
 // ── AI call ───────────────────────────────────────────────────────────────────
 
 async function getAIResponse(
@@ -384,6 +427,20 @@ async function getAIResponse(
     chatId: string,
     senderId: string
 ): Promise<string | null> {
+  
+       // ── Real-time path: ask Felo to search, return directly ──────────────────
+    if (needsRealTimeSearch(userMessage)) {
+        console.log('[API] Real-time query detected — using Felo search');
+        const searchResult = await feloSearch(userMessage);
+        if (searchResult) {
+            console.log('[API] Felo search success');
+            return searchResult;
+        }
+        console.log('[API] Felo search failed, falling through to normal APIs');
+    }
+
+    // ── Normal path: persona prompt → API fallback chain ─────────────────────
+
     const { systemPrompt } = buildPrompt(userMessage, userContext.userInfo);
 
     const history = userContext.messages.slice(-4).join('\n');
