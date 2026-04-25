@@ -28,6 +28,8 @@ const EMOJIS = {
     EMPTY:   '⚪',
     PLAYER1: '🔴',
     PLAYER2: '🔵',
+    PLAYER1_WIN: '🟥',
+    PLAYER2_WIN: '🟦',
     WIN:     '✨',
     NUMBERS: ['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣'],
 } as const;
@@ -94,6 +96,7 @@ class Connect4Game {
     createdAt:   Date;
     lastMove:    Date | null;
     moveHistory: MoveRecord[];
+    winningCells: Set<string>;   // "row,col" keys of the 4 winning discs
 
     constructor(gameId: string, player1Id: string, chatId: string) {
         this.gameId      = gameId;
@@ -108,6 +111,7 @@ class Connect4Game {
         this.createdAt   = new Date();
         this.lastMove    = null;
         this.moveHistory = [];
+        this.winningCells = new Set();
     }
 
     join(player2Id: string): { success: boolean; message?: string } {
@@ -171,34 +175,45 @@ class Connect4Game {
 
     private checkDirection(row: number, col: number, rd: number, cd: number): boolean {
         const player = this.board[row][col];
-        let count    = 1;
+        const cells: [number, number][] = [[row, col]];
 
         for (let i = 1; i < 4; i++) {
             const r = row + rd * i, c = col + cd * i;
             if (r < 0 || r >= GAME_CONFIG.ROWS || c < 0 || c >= GAME_CONFIG.COLS) break;
             if (this.board[r][c] !== player) break;
-            count++;
+            cells.push([r, c]);
         }
         for (let i = 1; i < 4; i++) {
             const r = row - rd * i, c = col - cd * i;
             if (r < 0 || r >= GAME_CONFIG.ROWS || c < 0 || c >= GAME_CONFIG.COLS) break;
             if (this.board[r][c] !== player) break;
-            count++;
+            cells.push([r, c]);
         }
-        return count >= 4;
+
+        if (cells.length >= 4) {
+            for (const [r, c] of cells) this.winningCells.add(`${r},${c}`);
+            return true;
+        }
+        return false;
     }
 
     private isBoardFull(): boolean {
         return this.board[0].every(cell => cell !== 0);
     }
 
-    getBoardString(): string {
+    getBoardString(highlightWin = false): string {
         let s = '\n  ' + EMOJIS.NUMBERS.join(' ') + '\n';
         for (let row = 0; row < GAME_CONFIG.ROWS; row++) {
             s += '  ';
             for (let col = 0; col < GAME_CONFIG.COLS; col++) {
                 const cell = this.board[row][col];
-                s += (cell === 0 ? EMOJIS.EMPTY : cell === 1 ? EMOJIS.PLAYER1 : EMOJIS.PLAYER2) + ' ';
+                if (cell === 0) {
+                    s += EMOJIS.EMPTY + ' ';
+                } else if (highlightWin && this.winningCells.has(`${row},${col}`)) {
+                    s += (cell === 1 ? EMOJIS.PLAYER1_WIN : EMOJIS.PLAYER2_WIN) + ' ';
+                } else {
+                    s += (cell === 1 ? EMOJIS.PLAYER1 : EMOJIS.PLAYER2) + ' ';
+                }
             }
             s += '\n';
         }
@@ -487,11 +502,13 @@ export async function c4OnMessage(sock: any, message: any, context: any): Promis
 
         if (result.win) {
             const winner = game.winner === 1 ? game.player1 : game.player2!;
+            const winSquare = game.winner === 1 ? EMOJIS.PLAYER1_WIN : EMOJIS.PLAYER2_WIN;
             await sock.sendMessage(chatId, { react: { text: '🎉', key: message.key } });
             await sock.sendMessage(chatId, {
                 text:
                     `${EMOJIS.WIN} *CONNECT FOUR!* ${EMOJIS.WIN}\n` +
-                    `${game.getBoardString()}\n` +
+                    `${game.getBoardString(true)}\n` +
+                    `${winSquare} = Winning discs\n\n` +
                     `🏆 Winner: ${tag(winner.id)} ${winner.disc}\n\n` +
                     `Congratulations! 🎊`,
                 mentions: getPlayerMentions(game),
@@ -568,7 +585,6 @@ export default {
 
         // ── .c4 stats [mention] ───────────────────────────────────────────────
         if (sub === 'stats') {
-            // Pull mentioned user from raw message context info
             const mentionedJid =
                 message.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
             const targetId = mentionedJid ?? senderId;
@@ -609,7 +625,8 @@ export default {
                 `• Join window: ${GAME_CONFIG.JOIN_TIMEOUT / 1000}s\n` +
                 `• Turn timeout: ${GAME_CONFIG.TURN_TIMEOUT / 1000}s (player is eliminated)\n` +
                 `• Draw: both players get a draw recorded\n\n` +
-                `${EMOJIS.PLAYER1} = Player 1 | ${EMOJIS.PLAYER2} = Player 2`
+                `${EMOJIS.PLAYER1} = Player 1 | ${EMOJIS.PLAYER2} = Player 2\n` +
+                `${EMOJIS.PLAYER1_WIN} ${EMOJIS.PLAYER2_WIN} = Winning discs (shown at game end)`
             );
         }
 
