@@ -508,7 +508,6 @@ export async function c4OnMessage(sock: any, message: any, context: any): Promis
                 text:
                     `${EMOJIS.WIN} *CONNECT FOUR!* ${EMOJIS.WIN}\n` +
                     `${game.getBoardString(true)}\n` +
-                    `${winSquare} = Winning discs\n\n` +
                     `🏆 Winner: ${tag(winner.id)} ${winner.disc}\n\n` +
                     `Congratulations! 🎊`,
                 mentions: getPlayerMentions(game),
