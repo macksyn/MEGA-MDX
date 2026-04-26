@@ -89,7 +89,7 @@ export default {
 
     try {
       await sock.sendMessage(chatId, {
-        text: '⏳ Downloading TikTok video...'
+        react: '⏳'
       }, { quoted: message });
 
       // Route: prefer fallback API for vt.tiktok.com; use primary for everything else.
