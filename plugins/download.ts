@@ -30,7 +30,7 @@ function extractUrl(text: string): string | null {
 // Order matters — first match wins.
 
 const DETECTORS: Array<{ regex: RegExp; plugin: string }> = [
-    { regex: /(?:(?:vm|vt)\.)?tiktok\.com/i,       plugin: './tiktok.js'    },
+    { regex: /(?:(?:vt|vm)\.)?tiktok\.com/i,       plugin: './tiktok.js'    },
     { regex: /(?:x\.com|twitter\.com)/i,            plugin: './twitter.js'   },
     { regex: /facebook\.com|fb\.watch/i,            plugin: './facebook.js'  },
     { regex: /instagram\.com|instagr\.am/i,         plugin: './instagram.js' },
