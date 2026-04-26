@@ -88,8 +88,9 @@ export default {
     }
 
     try {
-      await sock.sendMessage(chatId, { react: { text: '⏳'
-      }, { quoted: message });
+      await sock.sendMessage(chatId, {
+        react: { text: '⏳', key: message.key }
+      });
 
       // Route: prefer fallback API for vt.tiktok.com; use primary for everything else.
       // If the primary fails for any reason, fall back automatically.
@@ -140,6 +141,10 @@ ${title}
         mimetype: 'video/mp4',
         caption
       }, { quoted: message });
+
+      await sock.sendMessage(chatId, {
+        react: { text: '', key: message.key }
+      });
 
     } catch (error: any) {
       console.error('TikTok plugin error:', error);
