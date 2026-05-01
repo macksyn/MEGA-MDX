@@ -102,7 +102,7 @@ async function handleJoinEvent(sock: any, id: any, participants: any) {
           `> *ᴘᴏᴡᴇʀᴇᴅ ʙʏ *GROQ-AI*`;
       }
 
-      let profilePicUrl = 'https://img.pyrocdn.com/dbKUgahg.png';
+      let profilePicUrl = 'https://iili.io/BspSjGp.jpg';
       try {
         const pp = await sock.profilePictureUrl(participantJid, 'image');
         if (pp) profilePicUrl = pp;
