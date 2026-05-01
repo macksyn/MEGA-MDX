@@ -67,7 +67,7 @@ async function handleLeaveEvent(sock: any, id: any, participants: any) {
         finalMessage = `*@${displayName}* just left ${groupName}!`;
       }
 
-      let profilePicUrl = 'https://img.pyrocdn.com/dbKUgahg.png';
+      let profilePicUrl = 'https://iili.io/BspSjGp.jpg';
       try {
         const pp = await sock.profilePictureUrl(participantJid, 'image');
         if (pp) profilePicUrl = pp;
