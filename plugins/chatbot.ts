@@ -95,9 +95,12 @@ async function clearHistory(senderId: string, chatId: string): Promise<void> {
 
 // ── API endpoints ─────────────────────────────────────────────────────────────
 
+const MALVIN_API_KEY = process.env.MALVIN_API_KEY ?? '';
+
 const API_ENDPOINTS = [
     {
         name:   'GeminiRealtime',
+        method: 'POST' as const,
         url:    'https://rynekoo-api.hf.space/text.gen/gemini/realtime',
         body:   (text: string, systemPrompt: string, sessionId?: string) => ({
             text,
@@ -110,6 +113,7 @@ const API_ENDPOINTS = [
     },
     {
         name:   'CopilotAI',
+        method: 'POST' as const,
         url:    'https://rynekoo-api.hf.space/text.gen/copilot',
         body:   (text: string, systemPrompt: string, _sessionId?: string) => ({
             text: `${systemPrompt}\n\n${text}`
@@ -120,6 +124,7 @@ const API_ENDPOINTS = [
     },
     {
         name:   'VeniceAI',
+        method: 'POST' as const,
         url:    'https://rynekoo-api.hf.space/text.gen/venice',
         body:   (text: string, systemPrompt: string, _sessionId?: string) => ({
             text: `${systemPrompt}\n\n${text}`
@@ -130,12 +135,49 @@ const API_ENDPOINTS = [
     },
     {
         name:   'FeloAI',
+        method: 'POST' as const,
         url:    'https://rynekoo-api.hf.space/text.gen/feloai',
         body:   (text: string, systemPrompt: string, _sessionId?: string) => ({
             text: `${systemPrompt}\n\n${text}`
         }),
         parse:  (data: any) => typeof data?.result?.text === 'string' && data.result.text
             ? { text: data.result.text }
+            : null
+    },
+    {
+        name:   'MalvinCopilotThink',
+        method: 'GET' as const,
+        url:    'https://api.malvin.gleeze.com/ai/copilot-think',
+        params: (text: string, systemPrompt: string, _sessionId?: string) => ({
+            text: `${systemPrompt}\n\n${text}`,
+            apikey: MALVIN_API_KEY
+        }),
+        parse:  (data: any) => typeof data?.result === 'string' && data.result
+            ? { text: data.result }
+            : null
+    },
+    {
+        name:   'MalvinVenice',
+        method: 'GET' as const,
+        url:    'https://api.malvin.gleeze.com/ai/venice',
+        params: (text: string, systemPrompt: string, _sessionId?: string) => ({
+            text: `${systemPrompt}\n\n${text}`,
+            apikey: MALVIN_API_KEY
+        }),
+        parse:  (data: any) => typeof data?.result === 'string' && data.result
+            ? { text: data.result }
+            : null
+    },
+    {
+        name:   'MalvinGPT5',
+        method: 'GET' as const,
+        url:    'https://api.malvin.gleeze.com/ai/gpt-5',
+        params: (text: string, systemPrompt: string, _sessionId?: string) => ({
+            text: `${systemPrompt}\n\n${text}`,
+            apikey: MALVIN_API_KEY
+        }),
+        parse:  (data: any) => typeof data?.result === 'string' && data.result
+            ? { text: data.result }
             : null
     }
 ];
@@ -316,12 +358,22 @@ async function tryApi(
     const controller = new AbortController();
     const timeoutId  = setTimeout(() => controller.abort(), 15000);
     try {
-        const response = await fetch(api.url, {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json' },
-            signal:  controller.signal,
-            body:    JSON.stringify(api.body(textWithHistory, systemPrompt, sessionId))
-        });
+        let response: Response;
+        if (api.method === 'GET') {
+            const params = (api as any).params(textWithHistory, systemPrompt, sessionId);
+            const qs = new URLSearchParams(params).toString();
+            response = await fetch(`${api.url}?${qs}`, {
+                method: 'GET',
+                signal: controller.signal
+            });
+        } else {
+            response = await fetch(api.url, {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                signal:  controller.signal,
+                body:    JSON.stringify((api as any).body(textWithHistory, systemPrompt, sessionId))
+            });
+        }
         clearTimeout(timeoutId);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data   = await response.json() as any;
