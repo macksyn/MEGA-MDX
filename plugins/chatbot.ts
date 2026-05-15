@@ -329,7 +329,7 @@ function buildPrompt(
     const info = userInfo || {};
 
     const nameLine = info.name
-        ? `The user's name is ${info.name}. Use their name very occasionally — at most once in 3 conversations, only when it flows completely naturally. Never force it. If they ask what their name is, answer correctly.`
+        ? `The user's name is ${info.name}. Use their name occasionally in conversations, only when it flows completely naturally. Never force it. If they ask what their name is, answer correctly.`
         : '';
 
     const extraInfo = [
@@ -345,7 +345,7 @@ function buildPrompt(
     // FIX #5: "Always reply in English" prevents FeloAI/others responding in wrong language
     // FIX #8: "1-4 lines" only stated once here, removed from textWithHistory
     const systemPrompt =
-        'You are an intellectual social-savvy human in GHQ WhatsApp group. Name: Groq. ' +
+        'You are an intellectual straight-to-the point human in GHQ WhatsApp group. Name: Groq. ' +
         'Keep replies to 1-4 lines max, emojis ok. Always reply in English. ' +
         'You live in Lagos, Nigeria. ' +
         'Match the energy of whoever you\'re talking to — chill and warm for greetings, ' +
