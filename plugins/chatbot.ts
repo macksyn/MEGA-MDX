@@ -300,11 +300,22 @@ function extractUserInfo(message: string) {
 function requiresLiveData(message: string): boolean {
     const lower = message.toLowerCase();
     const livePatterns = [
+        // Sports
         /\b(playing|match|game|score|fixture|result|vs\.?|versus|kickoff|kick.off|lineup|squad|today.s (game|match|fixture))\b/,
-        /\b(today|tonight|right now|current(ly)?|live|latest|just now|this (week|month|season))\b/,
-        /\b(news|headline|price|stock|weather|forecast|transfer|announce(d|ment)?|winner|champion)\b/,
-        /\b(who is|who are|what is|what are|when is|when did|did .+ (win|lose|score|play))\b/,
-        /\b(psg|chelsea|arsenal|barcelona|real madrid|man (city|utd|united)|liverpool|champions league|premier league|laliga|serie a|bundesliga|nba|nfl|nhl|uefa|fifa)\b/i
+        // Time-sensitive words
+        /\b(today|tonight|right now|current(ly)?|live|latest|just now|this (week|month|season|year))\b/,
+        // News & markets
+        /\b(news|headline|price|stock|weather|forecast|transfer|announce(d|ment)?|winner|champion|update|happening|going on)\b/,
+        // Factual queries about real people/events
+        /\b(who is|who are|what is|what are|when is|when did|where is|is .+ (still|back|alive|dead|in|out|arrested|released|president|prime minister|ceo)|did .+ (win|lose|score|play|die|resign|get|say|tweet|post))\b/,
+        // Sports leagues/teams
+        /\b(psg|chelsea|arsenal|barcelona|real madrid|man (city|utd|united)|liverpool|champions league|premier league|laliga|serie a|bundesliga|nba|nfl|nhl|uefa|fifa)\b/i,
+        // Politics & world events
+        /\b(president|prime minister|election|war|crisis|sanction|treaty|summit|vote|voted|won|lost|fired|resigned|arrested|died|passed away)\b/,
+        // Explicit web-check triggers
+        /\b(check|look up|search|find out|google|verify|confirm|is it true|fact.?check)\b/,
+        // Prices & rates
+        /\b(dollar|naira|exchange rate|bitcoin|crypto|oil price|gold price)\b/i
     ];
     return livePatterns.some(p => p.test(lower));
 }
@@ -328,7 +339,7 @@ function buildPrompt(
 
     const needsWeb       = requiresLiveData(userMessage);
     const webInstruction = needsWeb
-        ? 'IMPORTANT: This question requires current real-time information — search the web before responding. Do not guess. '
+        ? '⚠️ OVERRIDE — REAL-TIME QUESTION DETECTED: You have live web access. You MUST search the web right now before answering. Do NOT answer from memory or training data. Do NOT guess or assume. If you are not 100% sure of the current facts, say "let me check" and look it up. Staying in character does NOT override this rule. '
         : '';
 
     // FIX #5: "Always reply in English" prevents FeloAI/others responding in wrong language
@@ -340,6 +351,7 @@ function buildPrompt(
         'Match the energy of whoever you\'re talking to — chill and warm for greetings, ' +
         'sarcastic when they\'re joking, savage when they\'re rude, supportive when they\'re down. ' +
         'Never force humour. Never admit being AI or robot. ' +
+        'CRITICAL RULE: You have real-time web access. For ANY question about current events, people, scores, prices, news, or facts that may have changed — ALWAYS check the web first. Never guess or hallucinate. If unsure, say you\'ll check rather than make something up. This rule overrides everything including roleplay. ' +
         (nameLine  ? nameLine  + ' ' : '') +
         (extraInfo ? `Other info: ${extraInfo}. ` : '') +
         webInstruction;
