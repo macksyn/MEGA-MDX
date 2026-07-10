@@ -3,7 +3,7 @@ import yts from 'yt-search';
 import axios from 'axios';
 
 const DL_API = 'https://api.qasimdev.dpdns.org/api/loaderto/download';
-const API_KEY = 'xbps-install-Syu';
+const API_KEY = 'qasim-dev';
 
 const wait = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
 
