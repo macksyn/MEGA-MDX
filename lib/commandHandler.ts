@@ -14,6 +14,7 @@ class CommandHandler {
   cooldowns: Map<any,any>;
   disabledCommands: Set<any>;
   prefixlessCommands: Map<any,any>;
+  onLoadPlugins: Array<(sock: any) => Promise<void>>;
   constructor() {
     this.commands = new Map();
     this.aliases = new Map();
@@ -22,6 +23,7 @@ class CommandHandler {
     this.cooldowns = new Map();
     this.disabledCommands = new Set();
     this.prefixlessCommands = new Map();
+    this.onLoadPlugins = [];
     this.watchPlugins();
   }
 
@@ -77,8 +79,22 @@ class CommandHandler {
             }
           }
         }
+
+        if (typeof plugin.onLoad === 'function') {
+          this.onLoadPlugins.push(plugin.onLoad);
+        }
       } catch(error: any) {
         console.error(`Error loading ${file}:`, error.message);
+      }
+    }
+  }
+
+  async runOnLoad(sock: any) {
+    for (const onLoad of this.onLoadPlugins) {
+      try {
+        await onLoad(sock);
+      } catch (e: any) {
+        console.error(`[onLoad] Plugin onLoad error: ${e.message}`);
       }
     }
   }

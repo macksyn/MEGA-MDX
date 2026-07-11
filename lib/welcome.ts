@@ -3,7 +3,7 @@ import { addWelcome, delWelcome, isWelcomeOn, addGoodbye, delGoodBye, isGoodByeO
 async function handleWelcome(sock: any, chatId: string, message: any, match: string) {
     if (!match) {
         return sock.sendMessage(chatId, {
-            text: `📥 *Welcome Message Setup*\n\n✅ *.welcome on* — Enable welcome messages\n🛠️ *.welcome set Your custom message* — Set a custom welcome message\n🚫 *.welcome off* — Disable welcome messages\n\n*Available Variables:*\n• {user} - Mentions the new member\n• {group} - Shows group name\n• {description} - Shows group description`,
+            text: `📥 *Welcome Message Setup*\n\n✅ *.welcome on* — Enable welcome messages\n🛠️ *.welcome set Your custom message* — Set a custom welcome message\n🚫 *.welcome off* — Disable welcome messages\n\n*Available Variables:*\n• {user} - Mentions the new member\n• {group} - Shows group name\n• {description} - Shows group description\n• {count} - Current member count\n• {pp} - Include member's profile picture as image`,
             quoted: message
         });
     }
@@ -48,7 +48,7 @@ async function handleGoodbye(sock: any, chatId: string, message: any, match: str
 
     if (!match) {
         return sock.sendMessage(chatId, {
-            text: `📤 *Goodbye Message Setup*\n\n✅ *.goodbye on* — Enable goodbye messages\n🛠️ *.goodbye set Your custom message* — Set a custom goodbye message\n🚫 *.goodbye off* — Disable goodbye messages\n\n*Available Variables:*\n• {user} - Mentions the leaving member\n• {group} - Shows group name`,
+            text: `📤 *Goodbye Message Setup*\n\n✅ *.goodbye on* — Enable goodbye messages\n🛠️ *.goodbye set Your custom message* — Set a custom goodbye message\n🚫 *.goodbye off* — Disable goodbye messages\n\n*Available Variables:*\n• {user} - Mentions the leaving member\n• {group} - Shows group name\n• {count} - Current member count\n• {pp} - Include member's profile picture as image`,
             quoted: message
         });
     }

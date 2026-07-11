@@ -128,6 +128,7 @@ if (MONGO_URL) {
       name: { type: String, default: '' },
       notify: String,
       verifiedName: String,
+      phone: String,
       ts: { type: Number, default: Date.now }
     })
 
@@ -280,7 +281,7 @@ if (MONGO_URL) {
           const docs = await Contact.find({})
           const result = {}
           docs.forEach(doc => {
-            result[doc.jid] = { id: doc.jid, name: doc.name, notify: doc.notify }
+            result[doc.jid] = { id: doc.jid, name: doc.name, notify: doc.notify, phone: doc.phone || undefined }
           })
           return result
         } catch (e) {
@@ -409,12 +410,14 @@ if (MONGO_URL) {
 if (backend === 'memory' && POSTGRES_URL) {
   try {
     const { Pool } = require('pg')
+    const PG_POOL_MAX = Number(process.env.PG_POOL_MAX) || 5
+    const PG_POOL_MIN = Number(process.env.PG_POOL_MIN) || 0
     const pool = new Pool({
       connectionString: POSTGRES_URL,
       ssl: { rejectUnauthorized: false },
-      max: 20,
-      min: 2,
-      idleTimeoutMillis: 60000,
+      max: PG_POOL_MAX,
+      min: PG_POOL_MIN,
+      idleTimeoutMillis: 10000,
       connectionTimeoutMillis: 10000,
       keepAlive: true,
       keepAliveInitialDelayMillis: 10000
@@ -469,9 +472,12 @@ if (backend === 'memory' && POSTGRES_URL) {
                   name TEXT,
                   notify TEXT,
                   verified_name TEXT,
+                  phone TEXT,
                   ts BIGINT NOT NULL
                 )
               `)
+
+              await client.query(`ALTER TABLE contacts ADD COLUMN IF NOT EXISTS phone TEXT`).catch(() => {})
 
               await client.query(`
                 CREATE TABLE IF NOT EXISTS chats (
@@ -482,6 +488,22 @@ if (backend === 'memory' && POSTGRES_URL) {
                   ts BIGINT NOT NULL
                 )
               `)
+
+              // Migrate legacy `settings` table if its schema is incompatible
+              const existing = await client.query(
+                `SELECT column_name FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = 'settings'`
+              )
+              if (existing.rows.length > 0) {
+                const cols = existing.rows.map(r => r.column_name)
+                const required = ['chat_id', 'key', 'value', 'ts']
+                const compatible = required.every(c => cols.includes(c))
+                if (!compatible) {
+                  const legacyName = `settings_legacy_${Date.now()}`
+                  printLog('warning', `Legacy 'settings' table detected (columns: ${cols.join(',')}). Renaming to ${legacyName} to preserve data.`)
+                  await client.query(`ALTER TABLE settings RENAME TO ${legacyName}`)
+                }
+              }
 
               await client.query(`
                 CREATE TABLE IF NOT EXISTS settings (
@@ -665,9 +687,9 @@ if (backend === 'memory' && POSTGRES_URL) {
           const client = await pool.connect()
           try {
             await client.query(
-              `INSERT INTO contacts(jid, name, notify, verified_name, ts) VALUES($1, $2, $3, $4, $5)
-               ON CONFLICT (jid) DO UPDATE SET name=$2, notify=$3, verified_name=$4, ts=$5`,
-              [jid, contact.name || '', contact.notify || '', contact.verifiedName || '', Date.now()]
+              `INSERT INTO contacts(jid, name, notify, verified_name, phone, ts) VALUES($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (jid) DO UPDATE SET name=$2, notify=$3, verified_name=$4, phone=COALESCE($5, contacts.phone), ts=$6`,
+              [jid, contact.name || '', contact.notify || '', contact.verifiedName || '', contact.phone || null, Date.now()]
             )
           } finally {
             client.release()
@@ -698,10 +720,10 @@ if (backend === 'memory' && POSTGRES_URL) {
           await this.init()
           const client = await pool.connect()
           try {
-            const res = await client.query(`SELECT jid, name, notify FROM contacts`)
+            const res = await client.query(`SELECT jid, name, notify, phone FROM contacts`)
             const result = {}
             res.rows.forEach(row => {
-              result[row.jid] = { id: row.jid, name: row.name, notify: row.notify }
+              result[row.jid] = { id: row.jid, name: row.name, notify: row.notify, phone: row.phone || undefined }
             })
             return result
           } finally {
@@ -948,9 +970,12 @@ if (backend === 'memory' && MYSQL_URL) {
                 name TEXT,
                 notify TEXT,
                 verified_name TEXT,
+                phone VARCHAR(50),
                 ts BIGINT NOT NULL
               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             `)
+
+            await mysqlConn.execute(`ALTER TABLE contacts ADD COLUMN IF NOT EXISTS phone VARCHAR(50)`).catch(() => {})
 
             await mysqlConn.execute(`
               CREATE TABLE IF NOT EXISTS chats (
@@ -1100,9 +1125,9 @@ if (backend === 'memory' && MYSQL_URL) {
         try {
           const conn = await this.getConn()
           await conn.execute(
-            `INSERT INTO contacts(jid, name, notify, verified_name, ts) VALUES(?, ?, ?, ?, ?)
-             ON DUPLICATE KEY UPDATE name=VALUES(name), notify=VALUES(notify), verified_name=VALUES(verified_name), ts=VALUES(ts)`,
-            [jid, contact.name || '', contact.notify || '', contact.verifiedName || '', Date.now()]
+            `INSERT INTO contacts(jid, name, notify, verified_name, phone, ts) VALUES(?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE name=VALUES(name), notify=VALUES(notify), verified_name=VALUES(verified_name), phone=COALESCE(VALUES(phone), phone), ts=VALUES(ts)`,
+            [jid, contact.name || '', contact.notify || '', contact.verifiedName || '', contact.phone || null, Date.now()]
           )
         } catch (e) {
           console.error('[MYSQL] Save contact error:', e.message)
@@ -1123,10 +1148,10 @@ if (backend === 'memory' && MYSQL_URL) {
       async getAllContacts() {
         try {
           const conn = await this.getConn()
-          const [rows] = await conn.execute(`SELECT jid, name, notify FROM contacts`)
+          const [rows] = await conn.execute(`SELECT jid, name, notify, phone FROM contacts`)
           const result = {}
           rows.forEach(row => {
-            result[row.jid] = { id: row.jid, name: row.name, notify: row.notify }
+            result[row.jid] = { id: row.jid, name: row.name, notify: row.notify, phone: row.phone || undefined }
           })
           return result
         } catch (e) {
@@ -1318,9 +1343,12 @@ if (backend === 'memory' && SQLITE_URL) {
         name TEXT,
         notify TEXT,
         verified_name TEXT,
+        phone TEXT,
         ts INTEGER NOT NULL
       )
     `).run();
+
+    try { sqlite.prepare(`ALTER TABLE contacts ADD COLUMN phone TEXT`).run() } catch(_) {}
 
     sqlite.prepare(`
       CREATE TABLE IF NOT EXISTS chats (
@@ -1363,9 +1391,9 @@ if (backend === 'memory' && SQLITE_URL) {
     const getMetadataStmt = sqlite.prepare(`SELECT value FROM metadata WHERE key=?`);
     const setMetadataStmt = sqlite.prepare(`INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)`);
 
-    const saveContactStmt = sqlite.prepare(`INSERT OR REPLACE INTO contacts(jid, name, notify, verified_name, ts) VALUES(?, ?, ?, ?, ?)`);
+    const saveContactStmt = sqlite.prepare(`INSERT OR REPLACE INTO contacts(jid, name, notify, verified_name, phone, ts) VALUES(?, ?, ?, ?, ?, ?)`);
     const getContactStmt = sqlite.prepare(`SELECT * FROM contacts WHERE jid=?`);
-    const getAllContactsStmt = sqlite.prepare(`SELECT jid, name, notify FROM contacts`);
+    const getAllContactsStmt = sqlite.prepare(`SELECT jid, name, notify, phone FROM contacts`);
 
     const saveChatStmt = sqlite.prepare(`INSERT OR REPLACE INTO chats(jid, name, conversation_timestamp, unread_count, ts) VALUES(?, ?, ?, ?, ?)`);
     const getChatStmt = sqlite.prepare(`SELECT * FROM chats WHERE jid=?`);
@@ -1466,7 +1494,7 @@ if (backend === 'memory' && SQLITE_URL) {
 
       saveContact(jid, contact) {
         try {
-          saveContactStmt.run(jid, contact.name || '', contact.notify || '', contact.verifiedName || '', Date.now());
+          saveContactStmt.run(jid, contact.name || '', contact.notify || '', contact.verifiedName || '', contact.phone || null, Date.now());
         } catch (e) {
           console.error('[SQLITE] Save contact error:', e.message);
         }
@@ -1486,7 +1514,7 @@ if (backend === 'memory' && SQLITE_URL) {
           const rows = getAllContactsStmt.all();
           const result = {};
           rows.forEach(row => {
-            result[row.jid] = { id: row.jid, name: row.name, notify: row.notify };
+            result[row.jid] = { id: row.jid, name: row.name, notify: row.notify, phone: row.phone || undefined };
           });
           return result;
         } catch (e) {
@@ -1618,6 +1646,7 @@ const store = {
   messageCount: {},
   isPublic: true,
   botMode: 'public',
+  lidToPhone: {},   // lid-numeric → phone-digits, built at runtime from contacts + groups
 
   async readFromFile(filePath = STORE_FILE) {
     try {
@@ -1753,11 +1782,16 @@ const store = {
     ev.on('contacts.update', async (contacts) => {
       for (const contact of contacts) {
         if (contact.id) {
+          const phoneFromId = !contact.id.includes('@lid') ? contact.id.split('@')[0].split(':')[0] : undefined
+          const lidNorm = contact.id.split('@')[0].split(':')[0]
+          const phoneFromLidMap = contact.id.includes('@lid') ? (this.lidToPhone[lidNorm] || undefined) : undefined
           const contactData = {
             id: contact.id,
             name: contact.notify || contact.name || contact.verifiedName || '',
             notify: contact.notify,
-            verifiedName: contact.verifiedName
+            verifiedName: contact.verifiedName,
+            lid: contact.lid,
+            phone: contact.phone || phoneFromId || phoneFromLidMap || undefined
           }
 
           if (backend === 'memory') {
@@ -1776,11 +1810,16 @@ const store = {
     ev.on('contacts.set', async (contacts) => {
       for (const contact of contacts) {
         if (contact.id) {
+          const phoneFromId = !contact.id.includes('@lid') ? contact.id.split('@')[0].split(':')[0] : undefined
+          const lidNorm = contact.id.split('@')[0].split(':')[0]
+          const phoneFromLidMap = contact.id.includes('@lid') ? (this.lidToPhone[lidNorm] || undefined) : undefined
           const contactData = {
             id: contact.id,
             name: contact.notify || contact.name || contact.verifiedName || '',
             notify: contact.notify,
-            verifiedName: contact.verifiedName
+            verifiedName: contact.verifiedName,
+            lid: contact.lid,
+            phone: contact.phone || phoneFromId || phoneFromLidMap || undefined
           }
 
           if (backend === 'memory') {
@@ -1878,7 +1917,37 @@ const store = {
     }
   },
 
+  // ---- Settings cache (in-memory, TTL-based) ----
+  // Dramatically cuts DB round-trips: every incoming message reads many settings,
+  // but settings change infrequently. Cache hits avoid network/DB I/O entirely.
+  _settingCache: new Map(),       // key: `${chatId}::${key}` -> { value, expires }
+  _allSettingsCache: new Map(),   // key: chatId             -> { value, expires }
+  _settingsCacheTtlMs: Number(process.env.SETTINGS_CACHE_TTL_MS) || 30_000,
+  _settingsInflight: new Map(),   // dedupe concurrent reads of the same key
+
+  _settingCacheGet(chatId, key) {
+    const cacheKey = `${chatId}::${key}`
+    const entry = this._settingCache.get(cacheKey)
+    if (entry && entry.expires > Date.now()) return entry
+    if (entry) this._settingCache.delete(cacheKey)
+    return null
+  },
+
+  _settingCacheSet(chatId, key, value) {
+    const cacheKey = `${chatId}::${key}`
+    this._settingCache.set(cacheKey, { value, expires: Date.now() + this._settingsCacheTtlMs })
+  },
+
+  _settingCacheInvalidate(chatId, key) {
+    this._settingCache.delete(`${chatId}::${key}`)
+    this._allSettingsCache.delete(chatId)
+  },
+
   async saveSetting(chatId, key, value) {
+    // Update cache immediately so subsequent reads return the new value.
+    this._settingCacheSet(chatId, key, value)
+    this._allSettingsCache.delete(chatId)
+
     if (backend === 'memory') {
       const dataDir = './data'
       if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true })
@@ -1889,83 +1958,100 @@ const store = {
         fs.writeFileSync(filePath, JSON.stringify(value, null, 2))
       } catch (e) {
         console.error(`[STORE] Failed to save setting ${key}:`, e.message)
+        this._settingCacheInvalidate(chatId, key)
       }
     } else {
       try {
         await adapters[backend].saveSetting(chatId, key, value)
       } catch (e) {
         console.error(`[STORE] Failed to save setting ${key}:`, e.message)
+        this._settingCacheInvalidate(chatId, key)
       }
     }
   },
 
   async getSetting(chatId, key) {
-    if (backend === 'memory') {
-      const dataDir = './data'
-      const filePath = path.join(dataDir, `${key}.json`)
+    const cached = this._settingCacheGet(chatId, key)
+    if (cached) return cached.value
 
-      try {
-        if (fs.existsSync(filePath)) {
-          const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
-          // Flat format {enabled: ...} takes priority over {chatId: {enabled: ...}}
-          if (data.enabled !== undefined) return data;
-          if (data[chatId] !== undefined) return data[chatId];
-          return null
+    // Dedupe concurrent reads of the same setting so a burst of plugin hooks
+    // only triggers one DB round-trip instead of N.
+    const inflightKey = `${chatId}::${key}`
+    const existing = this._settingsInflight.get(inflightKey)
+    if (existing) return existing
+
+    const promise = (async () => {
+      let value: any = null
+      if (backend === 'memory') {
+        const dataDir = './data'
+        const filePath = path.join(dataDir, `${key}.json`)
+        try {
+          if (fs.existsSync(filePath)) {
+            const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+            if (data.enabled !== undefined) value = data
+            else if (data[chatId] !== undefined) value = data[chatId]
+          }
+        } catch (e) {
+          console.error(`[STORE] Failed to get setting ${key}:`, e.message)
         }
-        return null
-      } catch (e) {
-        console.error(`[STORE] Failed to get setting ${key}:`, e.message)
-        return null
+      } else {
+        try {
+          value = await adapters[backend].getSetting(chatId, key)
+        } catch (e) {
+          console.error(`[STORE] Failed to get setting ${key}:`, e.message)
+        }
       }
-    } else {
-      try {
-        return await adapters[backend].getSetting(chatId, key)
-      } catch (e) {
-        console.error(`[STORE] Failed to get setting ${key}:`, e.message)
-        return null
-      }
+      this._settingCacheSet(chatId, key, value)
+      return value
+    })()
+
+    this._settingsInflight.set(inflightKey, promise)
+    try {
+      return await promise
+    } finally {
+      this._settingsInflight.delete(inflightKey)
     }
   },
 
   async getAllSettings(chatId) {
+    const cached = this._allSettingsCache.get(chatId)
+    if (cached && cached.expires > Date.now()) return cached.value
+    if (cached) this._allSettingsCache.delete(chatId)
+
+    let result: any = {}
     if (backend === 'memory') {
       const dataDir = './data'
-      const result = {}
-
       try {
         if (fs.existsSync(dataDir)) {
           const files = fs.readdirSync(dataDir).filter(f => f.endsWith('.json'))
-
           for (const file of files) {
             const key = path.basename(file, '.json')
             if (key === 'messageCount' || key === 'owner') continue
-
             const filePath = path.join(dataDir, file)
             const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
-
-            if (data[chatId]) {
-              result[key] = data[chatId]
-            }
+            if (data[chatId]) result[key] = data[chatId]
           }
         }
-        return result
       } catch (e) {
         console.error(`[STORE] Failed to get all settings:`, e.message)
-        return {}
       }
     } else {
       try {
-        return await adapters[backend].getAllSettings(chatId)
+        result = await adapters[backend].getAllSettings(chatId)
       } catch (e) {
         console.error(`[STORE] Failed to get all settings:`, e.message)
-        return {}
+        result = {}
       }
     }
+    this._allSettingsCache.set(chatId, { value: result, expires: Date.now() + this._settingsCacheTtlMs })
+    return result
   },
 
   /**
   * BOT MODE METHODS (Advanced)
   */
+
+  _botModeCache: null as null | { value: string, expires: number },
 
   async setBotMode(mode) {
     const validModes = ['public', 'private', 'groups', 'inbox', 'self']
@@ -1974,6 +2060,8 @@ const store = {
       mode = 'public'
     }
 
+    this._botModeCache = { value: mode, expires: Date.now() + this._settingsCacheTtlMs }
+
     if (backend === 'memory') {
       this.botMode = mode
     } else {
@@ -1981,22 +2069,27 @@ const store = {
         await adapters[backend].setMetadata('botMode', mode)
       } catch (e) {
         console.error(`[STORE] Failed to set bot mode:`, e.message)
+        this._botModeCache = null
       }
     }
   },
 
   async getBotMode() {
+    if (this._botModeCache && this._botModeCache.expires > Date.now()) {
+      return this._botModeCache.value
+    }
+    let mode = 'public'
     if (backend === 'memory') {
-      return this.botMode || 'public'
+      mode = this.botMode || 'public'
     } else {
       try {
-        const mode = await adapters[backend].getMetadata('botMode')
-        return mode || 'public'
+        mode = (await adapters[backend].getMetadata('botMode')) || 'public'
       } catch (e) {
         console.error(`[STORE] Failed to get bot mode:`, e.message)
-        return 'public'
       }
     }
+    this._botModeCache = { value: mode, expires: Date.now() + this._settingsCacheTtlMs }
+    return mode
   },
 
   async incrementMessageCount(chatId: any, userId: any, _pushName?: string) {
@@ -2075,6 +2168,19 @@ const store = {
   /**
   * Get store statistics
   */
+
+  async saveContact(jid: string, contactData: Record<string, any>) {
+    if (!jid) return
+    if (backend === 'memory') {
+      this.contacts[jid] = { ...this.contacts[jid], ...contactData }
+    } else {
+      try {
+        await adapters[backend].saveContact(jid, contactData)
+      } catch (e: any) {
+        console.error(`[STORE] Failed to save contact:`, e.message)
+      }
+    }
+  },
 
   getStats() {
     let totalMessages = 0

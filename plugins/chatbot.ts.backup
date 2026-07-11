@@ -1,0 +1,942 @@
+import type { BotContext } from '../types.js';
+import { createStore, getAdapter } from '../lib/pluginStore.js';
+import {
+    detectInsult,
+    getGrudge,
+    setGrudge,
+    clearGrudge,
+    getGrudgeClapback,
+    getThawMessage,
+    type GrudgeRecord
+} from '../lib/grudge.js';
+import {
+    classifyIntent,
+    compressHistory,
+    extractPreferences,
+    extractQuotedContext,
+    getClarificationHint,
+    getConfidenceLevel,
+    getIntentInstruction,
+    summarizeGroupHistory,
+    summarizeProfile,
+    type ChatIntent,
+    type ConfidenceLevel
+} from '../lib/intentRouter.js';
+
+const MONGO_URL    = process.env.MONGO_URL;
+const POSTGRES_URL = process.env.POSTGRES_URL;
+const MYSQL_URL    = process.env.MYSQL_URL;
+const SQLITE_URL   = process.env.DB_URL;
+const HAS_DB       = !!(MONGO_URL || POSTGRES_URL || MYSQL_URL || SQLITE_URL);
+
+const db        = createStore('chatbot');
+const dbUsers   = db.table!('users');
+const dbHistory = db.table!('history');
+const dbConfig  = db.table!('config');
+
+const profileCache = new Map<string, Record<string, any>>();
+const historyCache = new Map<string, string[]>();
+const processingLock = new Set<string>();
+
+// ── Group metadata TTL cache (10 min) ────────────────────────────────────────
+const GROUP_META_TTL_MS = 10 * 60 * 1000;
+interface GroupMetaEntry { meta: any; ts: number }
+const groupMetaCache = new Map<string, GroupMetaEntry>();
+
+async function getCachedGroupMeta(sock: any, chatId: string): Promise<any> {
+    const cached = groupMetaCache.get(chatId);
+    if (cached && Date.now() - cached.ts < GROUP_META_TTL_MS) return cached.meta;
+    const meta = await (sock as any).groupMetadata(chatId).catch(() => null);
+    if (meta) groupMetaCache.set(chatId, { meta, ts: Date.now() });
+    return meta;
+}
+
+export function invalidateGroupMetaCache(chatId: string): void {
+    groupMetaCache.delete(chatId);
+}
+
+// ── Bot JID cache ─────────────────────────────────────────────────────────────
+let _cachedBotJids: string[] | null = null;
+
+export function setBotJidsCache(sock: any): void {
+    const botId     = sock.user?.id ?? '';
+    const botNumber = botId.split(':')[0];
+    const botLid    = sock.user?.lid ?? '';
+    _cachedBotJids = [botId, `${botNumber}@s.whatsapp.net`, `${botNumber}@whatsapp.net`];
+    if (botLid) _cachedBotJids.push(botLid, `${botLid.split(':')[0]}@lid`);
+    console.log(`[CHATBOT] botJids cached: ${_cachedBotJids.join(', ')}`);
+}
+
+function getBotJids(sock: any): string[] {
+    if (_cachedBotJids) return _cachedBotJids;
+    const botId     = sock.user?.id ?? '';
+    const botNumber = botId.split(':')[0];
+    const botLid    = sock.user?.lid ?? '';
+    const jids = [botId, `${botNumber}@s.whatsapp.net`, `${botNumber}@whatsapp.net`];
+    if (botLid) jids.push(botLid, `${botLid.split(':')[0]}@lid`);
+    return jids;
+}
+
+// ── Cache eviction ────────────────────────────────────────────────────────────
+const CACHE_TTL_MS        = 2 * 60 * 60 * 1000;
+const INACTIVE_DAYS       = 180;
+const INACTIVE_MS         = INACTIVE_DAYS * 24 * 60 * 60 * 1000;
+const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const cacheLastAccessed   = new Map<string, number>();
+
+setInterval(() => {
+    const now = Date.now();
+    let evicted = 0;
+    for (const [senderId, lastAt] of cacheLastAccessed.entries()) {
+        if (now - lastAt > CACHE_TTL_MS) {
+            profileCache.delete(senderId);
+            for (const hKey of historyCache.keys()) {
+                if (hKey.startsWith(`${senderId}__`)) historyCache.delete(hKey);
+            }
+            cacheLastAccessed.delete(senderId);
+            evicted++;
+        }
+    }
+    if (evicted > 0) console.log(`[CACHE] Evicted ${evicted} idle user(s)`);
+}, CACHE_TTL_MS);
+
+async function pruneInactiveData(): Promise<void> {
+    try {
+        const adapter = await getAdapter();
+        if ((adapter as any).name === 'file') return;
+        const users   = await adapter.getAllWithMeta?.('chatbot_users')   ?? [];
+        const history = await adapter.getAllWithMeta?.('chatbot_history') ?? [];
+        const now     = Date.now();
+
+        const inactiveUsers = new Set<string>();
+        for (const entry of users) {
+            const lastSeen = typeof entry.value?.lastSeen === 'number' ? entry.value.lastSeen : entry.ts;
+            if (lastSeen && now - lastSeen > INACTIVE_MS) inactiveUsers.add(entry.key);
+        }
+        for (const key of inactiveUsers) {
+            await dbUsers.del(key);
+            profileCache.delete(key);
+            cacheLastAccessed.delete(key);
+            for (const hKey of historyCache.keys()) {
+                if (hKey.startsWith(`${key}__`)) historyCache.delete(hKey);
+            }
+        }
+        let prunedHistory = 0;
+        for (const entry of history) {
+            const lastSeen = typeof entry.value?.lastSeen === 'number' ? entry.value.lastSeen : entry.ts;
+            if (lastSeen && now - lastSeen > INACTIVE_MS) {
+                await dbHistory.del(entry.key);
+                historyCache.delete(entry.key);
+                prunedHistory++;
+            }
+        }
+        if (inactiveUsers.size > 0 || prunedHistory > 0) {
+            console.log(`[CLEANUP] Pruned ${inactiveUsers.size} profile(s) and ${prunedHistory} history entry(s)`);
+        }
+    } catch (error: any) {
+        console.error('[CLEANUP] Failed:', error.message);
+    }
+}
+
+setInterval(() => { void pruneInactiveData(); }, CLEANUP_INTERVAL_MS);
+void pruneInactiveData();
+
+// ── Profile / history helpers ─────────────────────────────────────────────────
+async function loadProfile(senderId: string): Promise<Record<string, any>> {
+    cacheLastAccessed.set(senderId, Date.now());
+    if (profileCache.has(senderId)) return profileCache.get(senderId)!;
+    const stored = await dbUsers.get(senderId) ?? {};
+    profileCache.set(senderId, stored);
+    return stored;
+}
+
+async function saveProfile(senderId: string, profile: Record<string, any>): Promise<void> {
+    cacheLastAccessed.set(senderId, Date.now());
+    profileCache.set(senderId, profile);
+    await dbUsers.set(senderId, profile);
+}
+
+function historyKey(senderId: string, chatId: string): string { return `${senderId}__${chatId}`; }
+function groupHistoryKey(chatId: string): string { return `group__${chatId}`; }
+
+async function loadHistory(senderId: string, chatId: string): Promise<string[]> {
+    const key = historyKey(senderId, chatId);
+    cacheLastAccessed.set(senderId, Date.now());
+    if (historyCache.has(key)) return historyCache.get(key)!;
+    const stored = await dbHistory.get(key) ?? [];
+    historyCache.set(key, stored);
+    return stored;
+}
+
+async function saveHistory(senderId: string, chatId: string, messages: string[]): Promise<void> {
+    const key = historyKey(senderId, chatId);
+    cacheLastAccessed.set(senderId, Date.now());
+    historyCache.set(key, messages);
+    await dbHistory.set(key, messages);
+}
+
+async function clearHistory(senderId: string, chatId: string): Promise<void> {
+    const key = historyKey(senderId, chatId);
+    historyCache.delete(key);
+    await dbHistory.del(key);
+}
+
+async function loadGroupHistory(chatId: string): Promise<string[]> {
+    const stored = await dbHistory.get(groupHistoryKey(chatId)) ?? [];
+    return summarizeGroupHistory(stored);
+}
+
+async function saveGroupHistory(chatId: string, messages: string[]): Promise<void> {
+    await dbHistory.set(groupHistoryKey(chatId), messages);
+}
+
+// ── API endpoints ─────────────────────────────────────────────────────────────
+const MALVIN_API_KEY = process.env.MALVIN_API_KEY ?? '';
+
+const API_ENDPOINTS = [
+    {
+        name:   'MalvinCopilotThink',
+        method: 'GET' as const,
+        url:    'https://api.malvin.gleeze.com/ai/copilot-think',
+        // FIX: params() now receives the merged prompt string — no separate systemPrompt arg.
+        // The old signature was params(text, systemPrompt) and then called:
+        //   text: `${systemPrompt}\n\n${text}`
+        // meaning systemPrompt was embedded inside textWithHistory AND prepended again here —
+        // the API was receiving the system prompt TWICE every single call.
+        params: (prompt: string) => ({ text: prompt, apikey: MALVIN_API_KEY }),
+        parse:  (data: any) => typeof data?.result === 'string' && data.result ? { text: data.result } : null
+    },
+    {
+        name:   'MalvinVenice',
+        method: 'GET' as const,
+        url:    'https://api.malvin.gleeze.com/ai/venice',
+        params: (prompt: string) => ({ text: prompt, apikey: MALVIN_API_KEY }),
+        parse:  (data: any) => typeof data?.result === 'string' && data.result ? { text: data.result } : null
+    },
+    {
+        name:   'MalvinGPT5',
+        method: 'GET' as const,
+        url:    'https://api.malvin.gleeze.com/ai/gpt-5',
+        params: (prompt: string) => ({ text: prompt, apikey: MALVIN_API_KEY }),
+        parse:  (data: any) => typeof data?.result === 'string' && data.result ? { text: data.result } : null
+    }
+];
+
+// ── API health tracking ───────────────────────────────────────────────────────
+const API_FAILURE_RESET_MS = 5 * 60 * 1000;
+const API_SKIP_THRESHOLD   = 3;
+const apiStats: Record<string, { count: number; lastFailAt: number; lastSuccessAt: number }> = {};
+API_ENDPOINTS.forEach(api => { apiStats[api.name] = { count: 0, lastFailAt: 0, lastSuccessAt: 0 }; });
+
+setInterval(() => {
+    const now = Date.now();
+    for (const name of Object.keys(apiStats)) {
+        if (apiStats[name].count > 0 && now - apiStats[name].lastFailAt > API_FAILURE_RESET_MS) {
+            apiStats[name].count = 0;
+            console.log(`[API] Reset failure count for ${name}`);
+        }
+    }
+}, API_FAILURE_RESET_MS);
+
+function isApiHealthy(name: string): boolean {
+    const s = apiStats[name];
+    if (s.count >= API_SKIP_THRESHOLD && Date.now() - s.lastFailAt < API_FAILURE_RESET_MS) {
+        console.log(`[API] Skipping ${name} — ${s.count} recent failures`);
+        return false;
+    }
+    return true;
+}
+
+// ── Config storage ────────────────────────────────────────────────────────────
+async function loadUserGroupData() {
+    try {
+        return { chatbot: await dbConfig.getAll() };
+    } catch (error: any) {
+        console.error('Error loading chatbot config:', error.message);
+        return { chatbot: {} };
+    }
+}
+
+async function saveUserGroupData(data: any) {
+    try {
+        const current = await dbConfig.getAll();
+        for (const [chatId, val] of Object.entries(data.chatbot ?? {})) await dbConfig.set(chatId, val);
+        for (const chatId of Object.keys(current)) {
+            if (!(chatId in (data.chatbot ?? {}))) await dbConfig.del(chatId);
+        }
+    } catch (error: any) {
+        console.error('Error saving chatbot config:', error.message);
+    }
+}
+
+// ── Typing helpers ────────────────────────────────────────────────────────────
+async function startTyping(sock: any, chatId: string): Promise<void> {
+    try {
+        await sock.presenceSubscribe(chatId);
+        await sock.sendPresenceUpdate('composing', chatId);
+    } catch (error: any) {
+        console.error('Typing start error:', error.message);
+    }
+}
+
+async function stopTyping(sock: any, chatId: string): Promise<void> {
+    try { await sock.sendPresenceUpdate('paused', chatId); } catch (_) {}
+}
+
+async function showTyping(sock: any, chatId: string, estimatedResponseLength = 80): Promise<void> {
+    try {
+        const base  = Math.min(Math.max(estimatedResponseLength * 40, 1500), 6000);
+        const delay = Math.round(base * (0.7 + Math.random() * 0.6));
+        await sock.presenceSubscribe(chatId);
+        await sock.sendPresenceUpdate('composing', chatId);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        if (Math.random() < 0.25) {
+            await sock.sendPresenceUpdate('paused', chatId);
+            await new Promise(resolve => setTimeout(resolve, 400 + Math.random() * 600));
+            await sock.sendPresenceUpdate('composing', chatId);
+            await new Promise(resolve => setTimeout(resolve, 600 + Math.random() * 800));
+        }
+    } catch (error: any) {
+        console.error('Typing indicator error:', error.message);
+    }
+}
+
+// ── Name helpers ──────────────────────────────────────────────────────────────
+function extractFirstName(pushName: string | undefined): string | null {
+    if (!pushName) return null;
+    const tokens = pushName.trim().split(/\s+/);
+    for (const token of tokens) {
+        const letters = token.replace(/[^\p{L}'\-]/gu, '');
+        if (letters.length >= 2) return letters.charAt(0).toUpperCase() + letters.slice(1).toLowerCase();
+    }
+    return null;
+}
+
+function isAffirmative(text: string): boolean {
+    return /^\s*(yes|yeah|yep|yup|yh|yas|correct|right|sure|ok|okay|that'?s (right|correct|me)|absolutely|exactly|confirmed?|go ahead|perfect|true)\b/i.test(text.trim());
+}
+
+function isNegative(text: string): boolean {
+    return /^\s*(no|nope|nah|nah+|not (right|correct|me|really)|wrong|that'?s (wrong|not (right|me))|different|change it|incorrect)\b/i.test(text.trim());
+}
+
+function parseNameFromReply(text: string): string | null {
+    const t = text.trim();
+    if (!t) return null;
+    const patterns = [
+        /\bmy\s+name\s+is\s+([a-z][a-z'\-]{1,20})/i,
+        /\bcall\s+me\s+([a-z][a-z'\-]{1,20})\b/i,
+        /\bi\s+am\s+([a-z][a-z'\-]{1,20})\b/i,
+        /\bI'm\s+([a-z][a-z'\-]{1,20})\b/i,
+        /\bit'?s\s+([a-z][a-z'\-]{1,20})\b/i,
+        /\bjust\s+(?:call\s+me\s+)?([a-z][a-z'\-]{1,20})\b/i,
+    ];
+    for (const p of patterns) {
+        const m = t.match(p);
+        if (m?.[1]) return m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase();
+    }
+    const words = t.split(/\s+/);
+    if (words.length >= 1 && words.length <= 3 && words.every(w => /^[a-zA-Z'\-]+$/.test(w)) && words[0].length >= 2) {
+        return words[0].charAt(0).toUpperCase() + words[0].slice(1).toLowerCase();
+    }
+    return null;
+}
+
+// ── User info extractor ───────────────────────────────────────────────────────
+function extractUserInfo(message: string) {
+    const text = message.trim();
+    const info: Record<string, any> = {};
+    const namePatterns = [
+        /\bmy\s+name\s+is\s+([a-z][a-z'-]{1,20})/i,
+        /\bi\s+am\s+([a-z][a-z'-]{1,20})\b/i,
+        /\bcall\s+me\s+([a-z][a-z'-]{1,20})\b/i,
+        /\bI'm\s+([a-z][a-z'-]{1,20})\b/i
+    ];
+    for (const pattern of namePatterns) {
+        const match = text.match(pattern);
+        if (match?.[1]) { info.name = match[1].replace(/^./, c => c.toUpperCase()); break; }
+    }
+    const ageMatch = text.match(/\b(?:i am|i'm|i'm|my age is)\s*(\d{1,3})\b/i)
+        ?? text.match(/\b(\d{1,3})\s*(?:years?|yrs?)\s+old\b/i);
+    if (ageMatch?.[1]) info.age = ageMatch[1];
+    const locationMatch = text.match(/\b(?:i live in|i'm from|i'm from|my city is|my country is|i am from)\s+([a-z][a-z ,.-]{1,40})/i)
+        ?? text.match(/\b(?:from|in)\s+([a-z][a-z ,.-]{1,40})\b/i);
+    if (locationMatch?.[1]) info.location = locationMatch[1].replace(/[.,!?]+$/g, '').trim();
+    return info;
+}
+
+// ── Prompt builder ────────────────────────────────────────────────────────────
+// OPTIMIZATION: slim system prompt + lean context block
+// Before: system prompt alone was ~400-600 tokens with 8-10 concatenated sections
+// Now: fixed persona ≈50 tokens, user context only appended when non-empty
+
+function buildSystemPrompt(
+    userInfo: Record<string, any>,
+    intent: ChatIntent,
+    confidence: ConfidenceLevel,
+    needsWeb: boolean
+): string {
+    // Fixed persona: ~50 tokens
+    const parts: string[] = [
+        'You are Groq — sharp, socially-aware, in the GHQ WhatsApp group. Lagos, Nigeria. Reply in 1-4 lines, English only. Match energy: chill=warm, jokes=sarcastic, rude=savage, sad=supportive. Never admit being AI.'
+    ];
+
+    // Intent instruction (from intentRouter — keep it short)
+    const intentInstruction = getIntentInstruction(intent);
+    if (intentInstruction) parts.push(intentInstruction);
+
+    // Clarification hint only when confidence is low
+    if (confidence === 'low') {
+        const hint = getClarificationHint(intent, confidence);
+        if (hint) parts.push(hint);
+    }
+
+    // Real-time flag
+    if (needsWeb) parts.push('This may need live info — say you\'ll check if unsure, don\'t guess.');
+
+    // User context — only include populated fields
+    const ctx: string[] = [];
+    if (userInfo.name)     ctx.push(`name: ${userInfo.name}`);
+    if (userInfo.age)      ctx.push(`age: ${userInfo.age}`);
+    if (userInfo.location) ctx.push(`location: ${userInfo.location}`);
+
+    // Summarized preferences (from summarizeProfile — should be ≤1 line)
+    const memLine = summarizeProfile(userInfo);
+    if (memLine) ctx.push(memLine);
+
+    if (ctx.length) parts.push(`User — ${ctx.join(', ')}.`);
+
+    return parts.join(' ');
+}
+
+// ── Context block builder ─────────────────────────────────────────────────────
+// OPTIMIZATION: group members list capped to 6 (was 12), stored as a short phrase.
+// Quoted context trimmed to 80 chars (was unlimited).
+// History entries reduced to 6 turns (was 8) with 80-char truncation (was 120).
+
+function buildContextBlock(
+    userMessage: string,
+    messages: string[],
+    userInfo: Record<string, any>
+): string {
+    const lines: string[] = [];
+
+    // Group member snippet — 6 names max, skipped if empty
+    if (userInfo.groupContext) lines.push(userInfo.groupContext);
+
+    // Quoted reply context — trimmed to 80 chars
+    if (userInfo.quotedContext) {
+        const q = (userInfo.quotedContext as string).slice(0, 80);
+        lines.push(`Replying to: "${q}"`);
+    }
+
+    // Compressed history — 6 recent turns
+    const compressed = compressHistory(messages, 6);
+    if (compressed.summary) lines.push(`Earlier: ${compressed.summary}`);
+    if (compressed.recent.length) {
+        lines.push('Recent:');
+        lines.push(...compressed.recent);
+    }
+
+    lines.push(`User: ${userMessage}`);
+    lines.push('Groq:');
+
+    return lines.join('\n');
+}
+
+// ── Live query detection ──────────────────────────────────────────────────────
+const REALTIME_PATTERNS = [
+    /\b(match|fixture|score|result|epl|premier league|champions league|ucl|la liga|serie a|bundesliga)\b/i,
+    /\b(playing (today|tonight|next|now)|next (match|game)|who (are|is) .+ playing)\b/i,
+    /\b(latest|breaking|today'?s? news|current(ly)?|right now|as of today)\b/i,
+    /\b(stock|crypto|bitcoin|price of|exchange rate|weather in)\b/i,
+    /\b(who (won|scored|beat)|final score|live score|standings|table)\b/i,
+];
+function needsRealTimeSearch(message: string): boolean {
+    return REALTIME_PATTERNS.some(p => p.test(message));
+}
+
+// ── Single API attempt ────────────────────────────────────────────────────────
+async function tryApi(
+    api: typeof API_ENDPOINTS[number],
+    fullPrompt: string          // ← single merged string, no double-send
+): Promise<{ text: string }> {
+    const controller = new AbortController();
+    const timeoutId  = setTimeout(() => controller.abort(), 15000);
+    try {
+        const params = (api as any).params(fullPrompt);
+        const qs     = new URLSearchParams(params).toString();
+        const response = await fetch(`${api.url}?${qs}`, { method: 'GET', signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data   = await response.json() as any;
+        const result = api.parse(data);
+        if (!result) throw new Error('No result in response');
+        return result;
+    } catch (err) {
+        clearTimeout(timeoutId);
+        throw err;
+    }
+}
+
+// ── Response cleaner ──────────────────────────────────────────────────────────
+function cleanResponse(text: string): string {
+    return text
+        .trim()
+        .replace(/winks/g,                              '😉')
+        .replace(/eye roll/g,                            '🙄')
+        .replace(/shrug/g,                               '🤷')
+        .replace(/raises eyebrow/g,                      '🤨')
+        .replace(/smiles/g,                              '😊')
+        .replace(/laughs/g,                              '😂')
+        .replace(/cries/g,                               '😢')
+        .replace(/thinks/g,                              '🤔')
+        .replace(/sleeps/g,                              '😴')
+        .replace(/google/gi,                             'Groq')
+        .replace(/a large language model/gi,             'just a person')
+        .replace(/Remember:.*$/gm,                       '')
+        .replace(/IMPORTANT:.*$/gm,                      '')
+        .replace(/^(Groq|Bot|AI|Assistant)\s*:\s*/gim,  '')
+        .replace(/By the way, to unlock the full functionality of all Apps, enable\s*\[?Gemini Apps Activity\]?[^\n]*/gi, '')
+        .replace(/\[Gemini Apps Activity\]\(https?:\/\/[^)]+\)/gi, '')
+        .replace(/https?:\/\/myactivity\.\S+\/product\/gemini\S*/gi, '')
+        .replace(/\n{2,}/g, '\n')
+        .trim();
+}
+
+// ── Promise.any polyfill ──────────────────────────────────────────────────────
+function promiseAny<T>(promises: Promise<T>[]): Promise<T> {
+    return new Promise((resolve, reject) => {
+        let rejectedCount = 0;
+        const errors: any[] = new Array(promises.length);
+        promises.forEach((p, i) => {
+            p.then(resolve).catch(err => {
+                errors[i] = err;
+                if (++rejectedCount === promises.length) reject(new Error('All promises were rejected'));
+            });
+        });
+    });
+}
+
+// ── AI call ───────────────────────────────────────────────────────────────────
+async function getAIResponse(
+    userMessage: string,
+    userContext: { messages: string[]; userInfo: Record<string, any> },
+    chatId: string,
+    senderId: string
+): Promise<string | null> {
+    const intent     = classifyIntent(userMessage);
+    const confidence = getConfidenceLevel(userMessage);
+    const needsWeb   = needsRealTimeSearch(userMessage) || intent === 'realtime';
+
+    // Build each part separately, then merge once
+    const systemPrompt   = buildSystemPrompt(userContext.userInfo, intent, confidence, needsWeb);
+    const contextBlock   = buildContextBlock(userMessage, userContext.messages, userContext.userInfo);
+
+    // BEFORE: `${systemPrompt}\n\n${textWithHistory}` was sent as params.text AND
+    //         the endpoint's params() already prepended systemPrompt again → doubled.
+    // NOW:    single merged string, sent once. No duplication.
+    const fullPrompt = `${systemPrompt}\n\n${contextBlock}`;
+
+    const sessionId   = userContext.userInfo[`_sid_${chatId}`] as string | undefined;
+    const healthyApis = API_ENDPOINTS.filter(api => isApiHealthy(api.name));
+
+    if (healthyApis.length === 0) { console.error('[API] No healthy APIs available'); return null; }
+
+    type ApiInfo   = typeof API_ENDPOINTS[number];
+    type ApiResult = { result: any; api: ApiInfo };
+
+    const allInFlight: Promise<ApiResult>[] = [];
+
+    const startApi = (api: ApiInfo): Promise<ApiResult> => {
+        const p = tryApi(api, fullPrompt).then(result => ({ result, api }));
+        allInFlight.push(p);
+        p.catch(() => {});
+        return p;
+    };
+
+    const recordSuccess = (api: ApiInfo) => { apiStats[api.name].count = 0; apiStats[api.name].lastSuccessAt = Date.now(); };
+    const recordFailure = (api: ApiInfo) => { apiStats[api.name].count++; apiStats[api.name].lastFailAt = Date.now(); };
+
+    const finalize = async (winner: ApiResult): Promise<string> => {
+        recordSuccess(winner.api);
+        if (winner.result.sessionId) {
+            const profile = await loadProfile(senderId);
+            profile[`_sid_${chatId}`] = winner.result.sessionId;
+            await saveProfile(senderId, profile);
+        } else if (sessionId) {
+            const profile = await loadProfile(senderId);
+            if (profile[`_sid_${chatId}`]) {
+                delete profile[`_sid_${chatId}`];
+                await saveProfile(senderId, profile);
+                console.log(`[API] Cleared stale sessionId for ${senderId.split('@')[0]} — ${winner.api.name} won`);
+            }
+        }
+        return cleanResponse(winner.result.text);
+    };
+
+    for (const api of healthyApis) {
+        const p = startApi(api);
+        p.catch(err => { recordFailure(api); console.log(`[API] ${api.name} failed: ${err?.message}`); });
+    }
+
+    if (allInFlight.length === 0) { console.error('[API] No APIs in flight'); return null; }
+
+    try {
+        const winner = await promiseAny(allInFlight);
+        console.log(`[API] ${winner.api.name} won`);
+        return finalize(winner);
+    } catch {
+        console.error('[API] All APIs failed');
+        return null;
+    }
+}
+
+// ── Main chatbot handler ──────────────────────────────────────────────────────
+export async function handleChatbotResponse(
+    sock: any,
+    chatId: string,
+    message: any,
+    userMessage: string,
+    senderId: string
+) {
+    const data = await loadUserGroupData();
+    if (!data.chatbot[chatId]) return;
+
+    try {
+        const botJids  = getBotJids(sock);
+        const botId     = sock.user?.id ?? '';
+        const botNumber = botId.split(':')[0];
+
+        let isBotMentioned = false;
+        let isReplyToBot   = false;
+
+        if (message.message?.extendedTextMessage) {
+            const mentionedJid      = message.message.extendedTextMessage.contextInfo?.mentionedJid || [];
+            const quotedParticipant = message.message.extendedTextMessage.contextInfo?.participant;
+            isBotMentioned = mentionedJid.some((jid: string) => {
+                const n = jid.split('@')[0].split(':')[0];
+                return botJids.some((b: string) => b.split('@')[0].split(':')[0] === n);
+            });
+            if (quotedParticipant) {
+                const cleanQuoted = quotedParticipant.replace(/[:@].*$/, '');
+                isReplyToBot = botJids.some((b: string) => b.replace(/[:@].*$/, '') === cleanQuoted);
+            }
+        } else if (message.message?.conversation) {
+            isBotMentioned = userMessage.includes(`@${botNumber}`);
+        }
+
+        if (!isBotMentioned && !isReplyToBot) return;
+
+        let cleanedMessage = userMessage;
+        if (isBotMentioned) cleanedMessage = cleanedMessage.replace(new RegExp(`@${botNumber}`, 'g'), '').trim();
+
+        // Resolve @mentions to display names
+        const allMentioned: string[] = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+        const contacts = (sock as any).store?.contacts || {};
+        for (const jid of allMentioned) {
+            const numPart  = jid.split('@')[0].split(':')[0];
+            const isBotJid = botJids.some((b: string) => b.split('@')[0].split(':')[0] === numPart);
+            if (isBotJid) continue;
+            const contact     = contacts[jid] || contacts[`${numPart}@s.whatsapp.net`] || contacts[`${numPart}@lid`];
+            const displayName = contact?.notify || contact?.name || contact?.pushName;
+            if (displayName) cleanedMessage = cleanedMessage.replace(new RegExp(`@${numPart}`, 'g'), `@${displayName}`);
+        }
+
+        // Group context — 6 member names max (was 12), "none" fallback skipped entirely
+        const groupMeta   = await getCachedGroupMeta(sock, chatId);
+        const memberNames = (groupMeta?.participants || [])
+            .map((p: any) => p?.notify || p?.name || p?.subject || p?.id)
+            .filter(Boolean)
+            .slice(0, 6);                           // ← was 12
+        // OPTIMIZATION: omit the group label entirely if we have no member names —
+        // the generic fallback ("this is a group chat") added tokens but zero value.
+        const groupLabel = memberNames.length
+            ? `Group: ${memberNames.join(', ')}.`   // ← shorter format (was a long sentence)
+            : '';
+
+        // Grudge check
+        const activeGrudge = await getGrudge(chatId, senderId, profileCache);
+        if (activeGrudge) {
+            console.log(`[GRUDGE] Silent: ${senderId.split('@')[0]} (${Math.round((activeGrudge.expiresAt - Date.now()) / 3600000)}h left)`);
+            return;
+        }
+
+        try {
+            processingLock.add(senderId);
+
+            const insult = detectInsult(cleanedMessage);
+            if (insult.hit) {
+                const grudge    = await setGrudge(chatId, senderId, insult.severity, cleanedMessage, profileCache);
+                const clapback  = getGrudgeClapback(insult.severity);
+                const hoursLeft = Math.round((grudge.expiresAt - Date.now()) / 3600000);
+                console.log(`[GRUDGE] Set for ${senderId.split('@')[0]} — severity: ${insult.severity}, labels: ${insult.matchedLabels.join(', ')}, ${hoursLeft}h, strikes: ${grudge.strikes}`);
+                await new Promise(r => setTimeout(r, 1200 + Math.random() * 1000));
+                await sock.sendMessage(chatId, { text: clapback }, { quoted: message });
+                return;
+            }
+
+            const profile    = await loadProfile(senderId);
+            const wasGrudged = profile._justThawed?.[chatId];
+            if (wasGrudged) {
+                if (profile._justThawed) delete profile._justThawed[chatId];
+                await saveProfile(senderId, profile);
+                await showTyping(sock, chatId, 20);
+                await sock.sendMessage(chatId, { text: getThawMessage() }, { quoted: message });
+                return;
+            }
+
+            const sharedMessages = await loadGroupHistory(chatId);
+            const userMessages   = await loadHistory(senderId, chatId);
+            // OPTIMIZATION: 10 combined turns (was 12) — still plenty of context
+            const messages = [...sharedMessages, ...userMessages].slice(-10);
+
+            // Name resolution
+            const pushName    = message.pushName as string | undefined;
+            const waFirstName = extractFirstName(pushName);
+            if (waFirstName && !profile.name) {
+                profile.name      = waFirstName;
+                profile.pushName  = pushName;
+                profile.firstSeen = profile.firstSeen ?? Date.now();
+            }
+            profile.lastSeen = Date.now();
+
+            // Name state machine (only runs when WA name unavailable)
+            if (!profile.name) {
+                if (profile._nameState === 'confirming_name') {
+                    if (isAffirmative(cleanedMessage)) {
+                        profile.name = profile._namePending as string;
+                        delete profile._nameState;
+                        delete profile._namePending;
+                        await saveProfile(senderId, profile);
+                        await showTyping(sock, chatId, 30);
+                        await sock.sendMessage(chatId, { text: `Got it, ${profile.name}! Nice to meet you 😊` }, { quoted: message });
+                        return;
+                    } else if (isNegative(cleanedMessage)) {
+                        profile._nameState = 'awaiting_name';
+                        delete profile._namePending;
+                        await saveProfile(senderId, profile);
+                        await showTyping(sock, chatId, 30);
+                        await sock.sendMessage(chatId, { text: `My bad! What should I call you then?` }, { quoted: message });
+                        return;
+                    } else {
+                        const candidate = parseNameFromReply(cleanedMessage);
+                        if (candidate) {
+                            profile._namePending = candidate;
+                            await saveProfile(senderId, profile);
+                            await showTyping(sock, chatId, 40);
+                            await sock.sendMessage(chatId, { text: `Just to confirm — should I call you *${candidate}*?` }, { quoted: message });
+                            return;
+                        }
+                        await showTyping(sock, chatId, 40);
+                        await sock.sendMessage(chatId, { text: `Sorry, didn't catch that! Is *${profile._namePending}* your name? (yes/no)` }, { quoted: message });
+                        return;
+                    }
+                }
+
+                if (profile._nameState === 'awaiting_name') {
+                    const candidate = parseNameFromReply(cleanedMessage);
+                    if (candidate) {
+                        profile._nameState   = 'confirming_name';
+                        profile._namePending = candidate;
+                        await saveProfile(senderId, profile);
+                        await showTyping(sock, chatId, 40);
+                        await sock.sendMessage(chatId, { text: `Just to confirm — should I call you *${candidate}*?` }, { quoted: message });
+                        return;
+                    }
+                    await showTyping(sock, chatId, 30);
+                    await sock.sendMessage(chatId, { text: `Hmm, what's your name? Just drop it here and I'll remember you 😄` }, { quoted: message });
+                    return;
+                }
+
+                profile._nameState = 'awaiting_name';
+                profile.firstSeen  = profile.firstSeen ?? Date.now();
+                await saveProfile(senderId, profile);
+                await showTyping(sock, chatId, 50);
+                await sock.sendMessage(chatId, { text: `Hey! Before we chat — what's your name? 😊` }, { quoted: message });
+                return;
+            }
+
+            // Profile extraction — skip when already complete
+            if (!profile.age || !profile.location) {
+                const extracted = extractUserInfo(cleanedMessage);
+                if (extracted.age)      profile.age      = extracted.age;
+                if (extracted.location) profile.location = extracted.location;
+            }
+
+            const preferences = extractPreferences(cleanedMessage);
+            if (Object.keys(preferences).length > 0) {
+                profile.preferences = { ...(profile.preferences ?? {}), ...preferences };
+            }
+
+            await saveProfile(senderId, profile);
+            await startTyping(sock, chatId);
+
+            const quotedContext = extractQuotedContext(message);
+            const response = await getAIResponse(cleanedMessage, {
+                messages,
+                userInfo: { ...profile, groupContext: groupLabel, quotedContext }
+            }, chatId, senderId);
+
+            await stopTyping(sock, chatId);
+
+            if (!response) {
+                await showTyping(sock, chatId, 40);
+                await sock.sendMessage(chatId, { text: "Hmm... I lost my train of thought there 🤔 try again?" }, { quoted: message });
+                return;
+            }
+
+            await showTyping(sock, chatId, response.length);
+            await sock.sendMessage(chatId, { text: response }, { quoted: message });
+
+            // Truncate history entries to 80 chars (was 120) — saves ~30% history tokens
+            const trim = (s: string, n: number) => s.length > n ? s.slice(0, n) + '…' : s;
+            const userTurn = `${profile.name ?? senderId.split('@')[0]}: ${trim(cleanedMessage, 80)}`;
+            const botTurn  = `Groq: ${trim(response, 80)}`;
+
+            const sharedThread   = [...sharedMessages, userTurn, botTurn].slice(-10);
+            const personalThread = [...userMessages,   userTurn, botTurn].slice(-10);
+
+            await Promise.all([
+                saveGroupHistory(chatId, sharedThread),
+                saveHistory(senderId, chatId, personalThread),
+            ]);
+
+        } finally {
+            processingLock.delete(senderId);
+        }
+
+    } catch (error: any) {
+        console.error('Error in chatbot response:', error.message);
+        if (error.message?.includes('No sessions')) return;
+        try {
+            await sock.sendMessage(chatId, { text: "Oops! 😅 Got a bit confused there. Try again?" }, { quoted: message });
+        } catch (sendError: any) {
+            console.error('Failed to send error message:', sendError.message);
+        }
+    }
+}
+
+// ── Command handler ───────────────────────────────────────────────────────────
+export default {
+    command:     'chatbot',
+    aliases:     ['bot', 'ai', 'achat'],
+    category:    'admin',
+    description: 'Enable or disable AI chatbot for the group',
+    usage:       '.chatbot <on|off|stats|pardon|grudges|reset|history>',
+    groupOnly:   true,
+    adminOnly:   true,
+
+    async handler(sock: any, message: any, args: any, context: BotContext) {
+        const chatId = context.chatId || message.key.remoteJid;
+        const match  = args.join(' ').toLowerCase().trim();
+
+        if (!match) {
+            return sock.sendMessage(chatId, {
+                text:
+                    `*🤖 CHATBOT SETUP*\n\n` +
+                    `*Storage:* ${HAS_DB ? 'Database' : 'File System'}\n` +
+                    `*APIs:* ${API_ENDPOINTS.length} endpoints running in parallel\n\n` +
+                    `*Commands:*\n` +
+                    `• \`.chatbot on\` — Enable chatbot\n` +
+                    `• \`.chatbot off\` — Disable chatbot\n` +
+                    `• \`.chatbot stats\` — API health & memory stats\n` +
+                    `• \`.chatbot pardon @user\` — Lift a grudge early\n` +
+                    `• \`.chatbot grudges\` — List active grudges in this group\n` +
+                    `• \`.chatbot reset @user\` — Clear a user's conversation history\n` +
+                    `• \`.chatbot history @user\` — View a user's stored context\n\n` +
+                    `*How it works:*\n` +
+                    `When enabled, bot responds when mentioned or replied to.\n` +
+                    `All healthy APIs run in parallel — fastest wins.\n` +
+                    `Failing APIs are skipped after ${API_SKIP_THRESHOLD} failures.\n\n` +
+                    `*Grudge tiers:*\n` +
+                    `• Mild → 2h • Medium → 6h • Heavy → 24h • Repeat → multiplied`
+            }, { quoted: message });
+        }
+
+        const data = await loadUserGroupData();
+
+        if (match === 'on') {
+            if (data.chatbot[chatId]) return sock.sendMessage(chatId, { text: '⚠️ *Chatbot is already enabled*' }, { quoted: message });
+            data.chatbot[chatId] = true;
+            await saveUserGroupData(data);
+            return sock.sendMessage(chatId, { text: '✅ *Chatbot enabled!*\n\nMention me or reply to my messages to chat.' }, { quoted: message });
+        }
+
+        if (match === 'off') {
+            if (!data.chatbot[chatId]) return sock.sendMessage(chatId, { text: '⚠️ *Chatbot is already disabled*' }, { quoted: message });
+            delete data.chatbot[chatId];
+            await saveUserGroupData(data);
+            return sock.sendMessage(chatId, { text: '❌ *Chatbot disabled.*' }, { quoted: message });
+        }
+
+        if (match.startsWith('pardon')) {
+            const mentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+            if (!mentioned) return sock.sendMessage(chatId, { text: '❌ Mention the user to pardon. Example: `.chatbot pardon @username`' }, { quoted: message });
+            await clearGrudge(chatId, mentioned, profileCache);
+            return sock.sendMessage(chatId, { text: `✅ Grudge cleared for @${mentioned.split('@')[0]}.`, mentions: [mentioned] }, { quoted: message });
+        }
+
+        if (match.startsWith('reset')) {
+            const mentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+            if (!mentioned) return sock.sendMessage(chatId, { text: '❌ Mention the user to reset. Example: `.chatbot reset @username`' }, { quoted: message });
+            await clearHistory(mentioned, chatId);
+            return sock.sendMessage(chatId, { text: `✅ History cleared for @${mentioned.split('@')[0]} 🧹`, mentions: [mentioned] }, { quoted: message });
+        }
+
+        if (match.startsWith('history')) {
+            const mentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+            if (!mentioned) return sock.sendMessage(chatId, { text: '❌ Mention the user. Example: `.chatbot history @username`' }, { quoted: message });
+            const hist = await loadHistory(mentioned, chatId);
+            if (hist.length === 0) return sock.sendMessage(chatId, { text: `📭 No history for @${mentioned.split('@')[0]}`, mentions: [mentioned] }, { quoted: message });
+            return sock.sendMessage(chatId, { text: `*📜 HISTORY — @${mentioned.split('@')[0]}*\n\n${hist.join('\n')}\n\n_(${hist.length} entries)_`, mentions: [mentioned] }, { quoted: message });
+        }
+
+        if (match === 'grudges') {
+            const now = Date.now();
+            const entries: string[] = [];
+            for (const [uid, profile] of profileCache.entries()) {
+                const g: GrudgeRecord | undefined = profile.grudges?.[chatId];
+                if (g && g.active && now < g.expiresAt) {
+                    const hoursLeft = ((g.expiresAt - now) / 3600000).toFixed(1);
+                    const name      = profile.name || uid.split('@')[0];
+                    entries.push(`• @${uid.split('@')[0]} (${name}) — ${hoursLeft}h [${g.severity}, strike ${g.strikes}]`);
+                }
+            }
+            if (entries.length === 0) return sock.sendMessage(chatId, { text: '✅ *No active grudges.* Everyone is behaving 🙂' }, { quoted: message });
+            return sock.sendMessage(chatId, { text: `*😒 ACTIVE GRUDGES (${entries.length})*\n\n${entries.join('\n')}\n\nUse \`.chatbot pardon @user\` to clear one.` }, { quoted: message });
+        }
+
+        if (match === 'stats') {
+            const now      = Date.now();
+            const apiLines = API_ENDPOINTS.map(api => {
+                const s       = apiStats[api.name];
+                const icon    = s.count === 0 ? '✅' : s.count < API_SKIP_THRESHOLD ? '⚠️' : '❌';
+                const skipped = !isApiHealthy(api.name) ? ' [SKIPPED]' : '';
+                const lastFail = s.lastFailAt   ? `fail ${Math.round((now - s.lastFailAt)  / 60000)}m ago` : 'no failures';
+                const lastOk   = s.lastSuccessAt ? `ok ${Math.round((now - s.lastSuccessAt) / 60000)}m ago`  : 'never';
+                return `${icon} *${api.name}*${skipped}: ${s.count} fail(s) · ${lastFail} · ${lastOk}`;
+            }).join('\n');
+
+            let totalGrudges = 0;
+            for (const [, profile] of profileCache.entries()) {
+                for (const g of Object.values(profile.grudges ?? {})) {
+                    if ((g as GrudgeRecord).active && Date.now() < (g as GrudgeRecord).expiresAt) totalGrudges++;
+                }
+            }
+
+            return sock.sendMessage(chatId, {
+                text:
+                    `*📊 CHATBOT STATS*\n\n` +
+                    `Storage: ${HAS_DB ? 'Database' : 'File'} · Users: ${profileCache.size} · History: ${historyCache.size} · Grudges: ${totalGrudges}\n\n` +
+                    `*API Health:*\n${apiLines}`
+            }, { quoted: message });
+        }
+
+        return sock.sendMessage(chatId, { text: '❌ Unknown command. Use: `.chatbot on/off/stats/pardon/grudges/reset/history`' }, { quoted: message });
+    },
+
+    handleChatbotResponse,
+    loadUserGroupData,
+    saveUserGroupData
+};

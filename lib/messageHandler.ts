@@ -17,6 +17,7 @@ import { handleAutoread } from '../plugins/autoread.js';
 import { handleAutotypingForMessage, showTypingAfterCommand } from '../plugins/autotyping.js';
 import { storeMessage, handleMessageRevocation } from '../plugins/antidelete.js';
 import { handleBadwordDetection } from './antibadword.js';
+import { handleAIToxicDetection } from '../plugins/antitoxic.js';
 import { handleLinkDetection } from '../plugins/antilink.js';
 import { handleTagDetection } from '../plugins/antitag.js';
 import { handleMentionDetection } from '../plugins/mention.js';
@@ -30,6 +31,11 @@ import { addCommandReaction } from './reactions.js';
 import { writeErrorLog } from './logger.js';
 
 import { channelInfo } from './messageConfig.js';
+import { handleAutoAttendance } from '../plugins/attendance.js';
+import { handleGroupAutoDownload } from '../plugins/group-autodownload.js';
+import { wcgOnMessage } from '../plugins/wrg.js';
+import { c4OnMessage } from '../plugins/connect4.js';
+import { invalidateGroupMetaCache } from '../plugins/chatbot.js';
 
 const MONGO_URL = process.env.MONGO_URL;
 const POSTGRES_URL = process.env.POSTGRES_URL;
@@ -37,6 +43,15 @@ const MYSQL_URL = process.env.MYSQL_URL;
 const SQLITE_URL = process.env.DB_URL;
 const HAS_DB = !!(MONGO_URL || POSTGRES_URL || MYSQL_URL || SQLITE_URL);
 const STICKER_FILE = dataFile('sticker_commands.json');
+
+const processedMessageIds = new Map<string, number>();
+const MESSAGE_DEDUP_TTL_MS = 5 * 60 * 1000;
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, ts] of processedMessageIds) {
+        if (now - ts > MESSAGE_DEDUP_TTL_MS) processedMessageIds.delete(id);
+    }
+}, 60_000);
 
 async function getStickerCommands() {
     if (HAS_DB) {
@@ -61,6 +76,12 @@ async function handleMessages(sock: any, messageUpdate: any) {
 
         const message = messages[0];
         if (!message?.message) return;
+
+        const msgId = message.key.id;
+        if (msgId) {
+            if (processedMessageIds.has(msgId)) return;
+            processedMessageIds.set(msgId, Date.now());
+        }
 
         await printMessage(message, sock);
 
@@ -280,8 +301,28 @@ async function handleMessages(sock: any, messageUpdate: any) {
         const messageText = rawText.trim();
         const userMessage = messageText.toLowerCase();
 
+// ── Fast-path: active game moves bypass all middleware ─────────────────
+const wcgEarly = await wcgOnMessage(sock, message, {
+    chatId, senderId, isGroup, channelInfo,
+    userMessage, messageText, rawText, config,
+    isSenderAdmin: false, isBotAdmin: false,
+    senderIsOwnerOrSudo: false, isOwnerOrSudoCheck: false,
+});
+if (wcgEarly) return;
+// ──────────────────────────────────────────────────────────────────────
+
         const senderIsSudo = await isSudo(senderId);
         startSchedulerEngine(sock);
+
+// ── Attendance auto-detection (groups only) ───────────────────────────────────
+        if (isGroup && !message.key.fromMe && /GIST\s+HQ/i.test(rawText)) {
+            try {
+                const handled = await handleAutoAttendance(message, sock);
+                if (handled) return;
+            } catch (e: any) {
+                printLog('error', `[ATTENDANCE] Auto-detection failed: ${e.message}`);
+            }
+        }
 
         if (!message.key.fromMe) {
             const replied = await handleAutoReply(sock, chatId, message, userMessage);
@@ -326,6 +367,33 @@ async function handleMessages(sock: any, messageUpdate: any) {
             return;
         }
 
+        // ── Download-group auto-downloader ─────────────────────────
+if (isGroup && !message.key.fromMe) {
+    const autoHandled = await handleGroupAutoDownload(sock, message, {
+        chatId, senderId, isGroup, config, channelInfo,
+        rawText, userMessage, messageText,
+        isSenderAdmin: false, isBotAdmin: false,
+        senderIsOwnerOrSudo: false, isOwnerOrSudoCheck: false,
+    });
+    if (autoHandled) return;
+}
+
+      const c4Handled = await c4OnMessage(sock, message, {
+            chatId,
+            senderId,
+            isGroup,
+            channelInfo,
+            userMessage,
+            messageText,
+            rawText,
+            config,
+            isSenderAdmin: false,
+            isBotAdmin: false,
+            senderIsOwnerOrSudo: false,
+            isOwnerOrSudoCheck: false,
+        });
+     if (c4Handled) return;
+
         if (/^[1-9]$/.test(userMessage) || userMessage === 'surrender') {
             await handleTicTacToeMove(sock, chatId, senderId, userMessage);
             return;
@@ -340,9 +408,33 @@ async function handleMessages(sock: any, messageUpdate: any) {
             await store.incrementMessageCount(chatId, ownJid, ownName);
         }
 
+        // After incrementMessageCount
+        if (!message.key.fromMe) {
+            try {
+                const { trackActivity } = await import('../lib/activitytracker.js');
+                await trackActivity(message);
+            } catch (e: any) {
+                printLog('error', `[ACTIVITY] Tracking error: ${e.message}`);
+            }
+
+            try {
+                const { trackInactivity } = await import('../plugins/inactive.js');
+                await trackInactivity(message);
+            } catch (e: any) {
+                printLog('error', `[INACTIVE] Tracking error: ${e.message}`);
+            }
+        }
+
         if (isGroup) {
             if (userMessage) {
                 await handleBadwordDetection(sock, chatId, message, userMessage, senderId);
+                // AI-powered toxic content filter (runs after static badword check)
+                try {
+                    const aiStopped = await handleAIToxicDetection(sock, chatId, message, userMessage, senderId);
+                    if (aiStopped) return;
+                } catch (e: any) {
+                    printLog('error', `[AI-MOD] ${e.message}`);
+                }
             }
             await handleLinkDetection(sock, chatId, message, userMessage, senderId);
         }
@@ -376,6 +468,17 @@ async function handleMessages(sock: any, messageUpdate: any) {
                 printLog('error', `PM blocker error: ${e.message}`);
             }
         }
+
+        // ── Inactive tracker reply interception (private messages only) ──────────────
+if (!isGroup && !message.key.fromMe) {
+    try {
+        const { handleInactiveReply } = await import('../plugins/inactive.js');
+        const handled = await handleInactiveReply(sock, message);
+        if (handled) return;
+    } catch (e: any) {
+        printLog('error', `[INACTIVE] Reply handler error: ${e.message}`);
+    }
+}
 
         const usedPrefix = config.prefixes.find(p => userMessage.startsWith(p));
 
@@ -567,6 +670,7 @@ async function handleGroupParticipantUpdate(sock: any, update: any) {
         const { id, participants, action, author } = update;
         // Invalidate antispam cache so admin changes take effect immediately
         invalidateGroupCache(id);
+        invalidateGroupMetaCache(id);
         if (!id.endsWith('@g.us')) return;
 
         printLog('info', `Group update: ${action} in ${id.split('@')[0]}`);
@@ -605,8 +709,14 @@ async function handleGroupParticipantUpdate(sock: any, update: any) {
                 if (participants && participants.length > 0) {
                     const _participant = Array.isArray(participants) ? participants[0] : participants;
                 }
-                const handleLeaveEvent = (await import('../plugins/goodbye.js')).default?.handleLeaveEvent;
-                await handleLeaveEvent(sock, id, participants);
+                {
+                    const handleLeaveEvent = (await import('../plugins/goodbye.js')).default?.handleLeaveEvent;
+                    if (handleLeaveEvent) await handleLeaveEvent(sock, id, participants);
+                }
+                {
+                    const handleLeaveFeedback = (await import('../plugins/leavefeedback.js')).default?.handleLeaveEvent;
+                    if (handleLeaveFeedback) await handleLeaveFeedback(sock, id, participants, author);
+                }
                 break;
 
             default:

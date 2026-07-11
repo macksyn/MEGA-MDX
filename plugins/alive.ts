@@ -8,7 +8,7 @@ export default {
   category: 'general',
   description: 'Check bot status and system info',
   usage: '.alive',
-  isPrefixless: true,
+  isPrefixless: false,
 
   async handler(sock: any, message: any, args: any, context: BotContext) {
     const { chatId, config } = context;
@@ -51,7 +51,7 @@ export default {
         text,
         contextInfo: {
           forwardingScore: 999,
-          isForwarded: true,
+          isForwarded: false,
           forwardedNewsletterMessageInfo: {
             newsletterJid: '120363319098372999@newsletter',
             newsletterName: 'GlobalTechInc',

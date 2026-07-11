@@ -1,0 +1,44 @@
+// @ts-nocheck
+import { transferCoins, formatNumber, withEconomyGuard } from '../lib/economy.js';
+import { cleanJid } from '../lib/isOwner.js';
+import { extractTargetId } from '../lib/resolveTarget.js';
+
+export const command = 'give';
+export const aliases = ['pay', 'sendcoins'];
+export const category = 'economy';
+export const cooldown = 3000;
+
+async function _handler(sock: any, message: any, args: string[], context: any) {
+  const { chatId, senderId, channelInfo } = context;
+  const fromId = cleanJid(senderId);
+
+  const targetId = extractTargetId(message, args);
+  const amountArg = args.find(a => /^\d+$/.test(a));
+  const amount = amountArg ? parseInt(amountArg, 10) : NaN;
+
+  if (!targetId || !amount || amount <= 0) {
+    return sock.sendMessage(chatId, {
+      text: `⚠️ Usage: *!give @user <amount>* or reply to their message with *!give <amount>*`,
+      ...channelInfo
+    }, { quoted: message });
+  }
+
+  const result = await transferCoins(fromId, targetId, amount);
+
+  if (!result.success) {
+    const reasonText = result.reason === 'insufficient_funds'
+      ? "You don't have enough coins for that."
+      : result.reason === 'self_transfer'
+      ? "You can't send coins to yourself."
+      : 'Something went wrong with that transfer.';
+    return sock.sendMessage(chatId, { text: `❌ ${reasonText}`, ...channelInfo }, { quoted: message });
+  }
+
+  await sock.sendMessage(chatId, {
+    text: `✅ Sent *${formatNumber(amount)} coins* to @${targetId}!`,
+    mentions: [`${targetId}@s.whatsapp.net`],
+    ...channelInfo
+  }, { quoted: message });
+}
+
+export const handler = withEconomyGuard(_handler);

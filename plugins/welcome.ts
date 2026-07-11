@@ -1,141 +1,131 @@
 import type { BotContext } from '../types.js';
 import { handleWelcome } from '../lib/welcome.js';
 import { isWelcomeOn, getWelcome } from '../lib/index.js';
+import { resolveParticipant, getCachedGroupMeta } from '../lib/contactUtil.js';
 
 export default {
   command: 'welcome',
   aliases: ['setwelcome'],
   category: 'admin',
   description: 'Configure welcome message for the group',
-  usage: '.welcome [on/off/message]',
+  usage: '.welcome [on/off/set/off]',
   groupOnly: true,
   adminOnly: true,
 
   async handler(sock: any, message: any, args: any, context: BotContext) {
     const { chatId } = context;
-
     const matchText = args.join(' ');
     await handleWelcome(sock, chatId, message, matchText);
   }
 };
 
+// ── Welcome join event ────────────────────────────────────────────────────────
+
 async function handleJoinEvent(sock: any, id: any, participants: any) {
   const isWelcomeEnabled = await isWelcomeOn(id);
   if (!isWelcomeEnabled) return;
 
-  const customMessage = await getWelcome(id);
+  const customMessage  = await getWelcome(id);
+  const groupMetadata  = await getCachedGroupMeta(sock, id);
+  if (!groupMetadata) return;
 
-  const groupMetadata = await sock.groupMetadata(id);
-  const groupName = groupMetadata.subject;
-  const groupDesc = groupMetadata.desc || 'No description available';
-
-  const channelInfo = {
-    contextInfo: {
-      forwardingScore: 1,
-      isForwarded: true,
-      forwardedNewsletterMessageInfo: {
-        newsletterJid: '120363319098372999@newsletter',
-        newsletterName: 'MEGA MD',
-        serverMessageId: -1
-      }
-    }
-  };
+  const groupName  = groupMetadata.subject;
+  const groupDesc  = groupMetadata.desc || 'No description available';
+  const memberCount = groupMetadata.participants.length;
 
   for (const participant of participants) {
     try {
-      const participantString = typeof participant === 'string' ? participant : (participant.id || participant.toString());
-      const user = participantString.split('@')[0];
+      const { jid: participantJid, name: displayName, phoneNumber } =
+        resolveParticipant(participant, sock);
 
-      let displayName = user;
-      try {
-        const contact = await sock.getBusinessProfile(participantString);
-        if (contact && contact.name) {
-          displayName = contact.name;
-        } else {
-          const groupParticipants = groupMetadata.participants;
-          const userParticipant = groupParticipants.find((p: any) => p.id === participantString);
-          if (userParticipant && userParticipant.name) {
-            displayName = userParticipant.name;
-          }
-        }
-      } catch(nameError: any) {
-        console.log('Could not fetch display name, using phone number');
-      }
+      const usePP = customMessage?.includes('{pp}');
 
-      let finalMessage;
+      let finalMessage: string;
       if (customMessage) {
+        // {user} → @phoneNumber so WhatsApp renders a tappable mention link
         finalMessage = customMessage
-          .replace(/{user}/g, `@${displayName}`)
-          .replace(/{group}/g, groupName)
-          .replace(/{description}/g, groupDesc);
+          .replace(/{pp}/g,          '')
+          .replace(/{user}/g,        `@${phoneNumber}`)
+          .replace(/{group}/g,       groupName)
+          .replace(/{description}/g, groupDesc)
+          .replace(/{count}/g,       String(memberCount))
+          .trim();
       } else {
         const now = new Date();
         const timeString = now.toLocaleString('en-US', {
-          month: '2-digit',
-          day: '2-digit',
-          year: 'numeric',
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit',
-          hour12: true
+          month: '2-digit', day: '2-digit', year: 'numeric',
+          hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
         });
-
-        finalMessage = `╭╼━≪•𝙽𝙴𝚆 𝙼𝙴𝙼𝙱𝙴𝚁•≫━╾╮\n┃𝚆𝙴𝙻𝙲𝙾𝙼𝙴: @${displayName} 👋\n┃Member count: #${groupMetadata.participants.length}\n┃𝚃𝙸𝙼𝙴: ${timeString}⏰\n╰━━━━━━━━━━━━━━━╯\n\n*@${displayName}* Welcome to *${groupName}*! 🎉\n*Group 𝙳𝙴𝚂𝙲𝚁𝙸𝙿𝚃𝙸𝙾𝙽*\n${groupDesc}\n\n> *ᴘᴏᴡᴇʀᴇᴅ ʙʏ MEGA-MD*`;
+        // Use @phoneNumber for the mention text — WhatsApp shows it as displayName
+        finalMessage =
+          `╭╼━≪•𝙽𝙴𝚆 𝙼𝙴𝙼𝙱𝙴𝚁•≫━╾╮\n` +
+          `┃𝚆𝙴𝙻𝙲𝙾𝙼𝙴: @${phoneNumber} 👋\n` +
+          `┃Member count: #${memberCount}\n` +
+          `┃𝚃𝙸𝙼𝙴: ${timeString}⏰\n` +
+          `╰━━━━━━━━━━━━━━━╯\n\n` +
+          `*@${phoneNumber}* Welcome to *${groupName}*! 🎉\n` +
+          `*Group 𝙳𝙴𝚂𝙲𝚁𝙸𝙿𝚃𝙸𝙾𝙽*\n${groupDesc}\n\n` +
+          `> *ᴘᴏᴡᴇʀᴇᴅ ʙʏ *GROQ-AI*`;
       }
 
+      let profilePicUrl = 'https://iili.io/BspSjGp.jpg';
       try {
-        let profilePicUrl = `https://img.pyrocdn.com/dbKUgahg.png`;
+        const pp = await sock.profilePictureUrl(participantJid, 'image');
+        if (pp) profilePicUrl = pp;
+      } catch { /* use default */ }
+
+      if (usePP) {
         try {
-          const profilePic = await sock.profilePictureUrl(participantString, 'image');
-          if (profilePic) {
-            profilePicUrl = profilePic;
-          }
-        } catch(profileError: any) {
-          console.log('Could not fetch profile picture, using default');
-        }
-
-        const apiUrl = `https://api.some-random-api.com/welcome/img/2/gaming3?type=join&textcolor=green&username=${encodeURIComponent(displayName)}&guildName=${encodeURIComponent(groupName)}&memberCount=${groupMetadata.participants.length}&avatar=${encodeURIComponent(profilePicUrl)}`;
-
-        const response = await fetch(apiUrl);
-        if (response.ok) {
-          const imageBuffer = Buffer.from(await response.arrayBuffer());
-
+          const buf = Buffer.from(
+            await (await fetch(profilePicUrl)).arrayBuffer()
+          );
           await sock.sendMessage(id, {
-            image: imageBuffer,
-            caption: finalMessage,
-            mentions: [participantString],
-            ...channelInfo
+            image:    buf,
+            caption:  finalMessage,
+            mentions: [participantJid]
+          });
+          continue;
+        } catch { /* fall through to generated image */ }
+      }
+
+      // Try the welcome banner API
+      try {
+        const apiUrl =
+          `https://api.some-random-api.com/welcome/img/2/gaming3` +
+          `?type=join&textcolor=green` +
+          `&username=${encodeURIComponent(displayName)}` +
+          `&guildName=${encodeURIComponent(groupName)}` +
+          `&memberCount=${memberCount}` +
+          `&avatar=${encodeURIComponent(profilePicUrl)}`;
+
+        const res = await fetch(apiUrl);
+        if (res.ok) {
+          const buf = Buffer.from(await res.arrayBuffer());
+          await sock.sendMessage(id, {
+            image:    buf,
+            caption:  finalMessage,
+            mentions: [participantJid]
           });
           continue;
         }
-      } catch(imageError: any) {
-        console.log('Image generation failed, falling back to text');
-      }
+      } catch { /* fall through to plain text */ }
 
+      // Plain-text fallback
       await sock.sendMessage(id, {
-        text: finalMessage,
-        mentions: [participantString],
-        ...channelInfo
+        text:     finalMessage,
+        mentions: [participantJid]
       });
-    } catch(error: any) {
+
+    } catch (error: any) {
       console.error('Error sending welcome message:', error);
-      const participantString = typeof participant === 'string' ? participant : (participant.id || participant.toString());
-      const user = participantString.split('@')[0];
-
-      let fallbackMessage;
-      if (customMessage) {
-        fallbackMessage = customMessage
-          .replace(/{user}/g, `@${user}`)
-          .replace(/{group}/g, groupName)
-          .replace(/{description}/g, groupDesc);
-      } else {
-        fallbackMessage = `Welcome @${user} to ${groupName}! 🎉`;
-      }
-
+      const jidStr: string =
+        typeof participant === 'string'
+          ? participant
+          : (participant?.id ?? String(participant));
+      const num = jidStr.split('@')[0];
       await sock.sendMessage(id, {
-        text: fallbackMessage,
-        mentions: [participantString],
-        ...channelInfo
+        text:     `Welcome @${num} to ${groupName}! 🎉`,
+        mentions: [jidStr]
       });
     }
   }

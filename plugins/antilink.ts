@@ -61,11 +61,11 @@ export async function handleLinkDetection(sock: any, chatId: string, message: an
         let linkType = '';
 
         const linkPatterns = {
-            whatsappGroup: /chat\.whatsapp\.com\/[A-Za-z0-9]{20,}/i,
-            whatsappChannel: /wa\.me\/channel\/[A-Za-z0-9]{20,}/i,
-            telegram: /t\.me\/[A-Za-z0-9_]+/i,
-            allLinks: /https?:\/\/\S+|www\.\S+|(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/\S*)?/i,
-        };
+        whatsappGroup:   /chat\.whatsapp\.com\/[A-Za-z0-9]{20,}/i,
+        whatsappChannel: /wa\.me\/channel\/[A-Za-z0-9]{20,}/i,
+        telegram:        /(?:t\.me|telegram\.me|telegram\.dog)\/[A-Za-z0-9_]{3,}/i,
+        allLinks:        /https?:\/\/[^\s]+|www\.[a-z0-9-]{2,}\.[a-z]{2,}[^\s]*/i,
+    };
 
         if (linkPatterns.whatsappGroup.test(userMessage)) {
             shouldAct = true;
@@ -78,7 +78,7 @@ export async function handleLinkDetection(sock: any, chatId: string, message: an
             linkType = 'Telegram';
         } else if (linkPatterns.allLinks.test(userMessage)) {
             shouldAct = true;
-            linkType = 'Link';
+            linkType = 'Scam';
         }
 
         if (!shouldAct) return;
@@ -103,7 +103,7 @@ export async function handleLinkDetection(sock: any, chatId: string, message: an
 
         if (action === 'warn' || action === 'delete') {
             await sock.sendMessage(chatId, {
-                text: `⚠️ *Antilink Warning*\n\n@${senderId.split('@')[0]}, posting ${linkType} links is not allowed!`,
+                text: `⚠️ *Warning!!!*\n\n@${senderId.split('@')[0]}, posting ${linkType} links is not allowed here!`,
                 mentions: [senderId]
             });
         }

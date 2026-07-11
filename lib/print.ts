@@ -79,12 +79,37 @@ async function printMessage(message: any, sock: any) {
             } else {
                 senderName = await getNameWithFallback(senderId, sock, m.pushName)
 
-                const phone = extractPhoneNumber(senderId)
-                if (phone && phone.length >= 10) {
-                    const pn = (PhoneNumber as any)('+' + phone)
-                    senderPhone = pn.valid ? pn.getNumber('international') : phone
+                if (senderId.includes('@lid')) {
+                    // LID sender — resolve to real phone via Baileys' internal mapping, then store lidToPhone
+                    const lidNorm = senderId.split('@')[0].split(':')[0]
+                    let resolvedPhone: string | null = null
+                    try {
+                        const lidMapping = sock?.signalRepository?.lidMapping
+                        const pnJid: string | null = lidMapping ? await lidMapping.getPNForLID(senderId) : null
+                        if (pnJid) {
+                            resolvedPhone = pnJid.split('@')[0].split(':')[0]
+                        }
+                    } catch(e: any) {}
+
+                    // Fall back to store.lidToPhone if signalRepository couldn't resolve
+                    if (!resolvedPhone) {
+                        resolvedPhone = sock.store?.lidToPhone?.[lidNorm] || null
+                    }
+
+                    if (resolvedPhone) {
+                        const pn: any = parsePhoneNumber('+' + resolvedPhone)
+                        senderPhone = pn.valid ? pn.number?.international || resolvedPhone : resolvedPhone
+                    } else {
+                        senderPhone = ''
+                    }
                 } else {
-                    senderPhone = senderId.split('@')[0].split(':')[0]
+                    const phone = extractPhoneNumber(senderId)
+                    if (phone && phone.length >= 10) {
+                        const pn: any = parsePhoneNumber('+' + phone)
+                        senderPhone = pn.valid ? pn.number?.international || phone : phone
+                    } else {
+                        senderPhone = senderId.split('@')[0].split(':')[0]
+                    }
                 }
             }
         } catch(e: any) {

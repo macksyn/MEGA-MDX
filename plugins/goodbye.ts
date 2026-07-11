@@ -1,114 +1,117 @@
 import type { BotContext } from '../types.js';
 import { handleGoodbye } from '../lib/welcome.js';
 import { isGoodByeOn, getGoodbye } from '../lib/index.js';
+import { resolveParticipant, getCachedGroupMeta } from '../lib/contactUtil.js';
+
+// ── Goodbye leave event ───────────────────────────────────────────────────────
 
 async function handleLeaveEvent(sock: any, id: any, participants: any) {
-    const isGoodbyeEnabled = await isGoodByeOn(id);
-    if (!isGoodbyeEnabled) return;
+  const isGoodbyeEnabled = await isGoodByeOn(id);
+  if (!isGoodbyeEnabled) return;
 
-    const customMessage = await getGoodbye(id);
-    const groupMetadata = await sock.groupMetadata(id);
-    const groupName = groupMetadata.subject;
+  const customMessage = await getGoodbye(id);
+  const groupMetadata  = await getCachedGroupMeta(sock, id);
+  if (!groupMetadata) return;
 
-    for (const participant of participants) {
+  const groupName   = groupMetadata.subject;
+  const memberCount = groupMetadata.participants.length;
+
+  for (const participant of participants) {
+    try {
+      const { jid: participantJid, name: displayName, phoneNumber } =
+        resolveParticipant(participant, sock);
+
+      const usePP = customMessage?.includes('{pp}');
+
+      let finalMessage: string;
+      if (customMessage) {
+        // {user} → @phoneNumber so WhatsApp renders a tappable mention link
+        finalMessage = customMessage
+          .replace(/{pp}/g,    '')
+          .replace(/{user}/g,  `@${phoneNumber}`)
+          .replace(/{group}/g, groupName)
+          .replace(/{count}/g, String(memberCount))
+          .trim();
+      } else {
+        finalMessage = `*@${phoneNumber}* just left *${groupName}*! 👋`;
+      }
+
+      let profilePicUrl = 'https://iili.io/BspSjGp.jpg';
+      try {
+        const pp = await sock.profilePictureUrl(participantJid, 'image');
+        if (pp) profilePicUrl = pp;
+      } catch { /* use default */ }
+
+      if (usePP) {
         try {
-            const participantString = typeof participant === 'string' ? participant : (participant.id || participant.toString());
-            const user = participantString.split('@')[0];
+          const buf = Buffer.from(
+            await (await fetch(profilePicUrl)).arrayBuffer()
+          );
+          await sock.sendMessage(id, {
+            image:    buf,
+            caption:  finalMessage,
+            mentions: [participantJid]
+          });
+          continue;
+        } catch { /* fall through */ }
+      }
 
-            let displayName = user;
-            try {
-                const contact = await sock.getBusinessProfile(participantString);
-                if (contact && contact.name) {
-                    displayName = contact.name;
-                } else {
-                    const groupParticipants = groupMetadata.participants;
-                    const userParticipant = groupParticipants.find((p: any) => p.id === participantString);
-                    if (userParticipant && userParticipant.name) {
-                        displayName = userParticipant.name;
-                    }
-                }
-            } catch(nameError: any) {
-                console.log('Could not fetch display name, using phone number');
-            }
+      // Try the goodbye banner API
+      try {
+        const apiUrl =
+          `https://api.some-random-api.com/welcome/img/2/gaming1` +
+          `?type=leave&textcolor=red` +
+          `&username=${encodeURIComponent(displayName)}` +
+          `&guildName=${encodeURIComponent(groupName)}` +
+          `&memberCount=${memberCount}` +
+          `&avatar=${encodeURIComponent(profilePicUrl)}`;
 
-            let finalMessage;
-            if (customMessage) {
-                finalMessage = customMessage
-                    .replace(/{user}/g, `@${displayName}`)
-                    .replace(/{group}/g, groupName);
-            } else {
-                finalMessage = `*@${displayName}* we will never miss you!`;
-            }
-
-            try {
-                let profilePicUrl = `https://img.pyrocdn.com/dbKUgahg.png`;
-                try {
-                    const profilePic = await sock.profilePictureUrl(participantString, 'image');
-                    if (profilePic) {
-                        profilePicUrl = profilePic;
-                    }
-                } catch(profileError: any) {
-                    console.log('Could not fetch profile picture, using default');
-                }
-
-                const apiUrl = `https://api.some-random-api.com/welcome/img/2/gaming1?type=leave&textcolor=red&username=${encodeURIComponent(displayName)}&guildName=${encodeURIComponent(groupName)}&memberCount=${groupMetadata.participants.length}&avatar=${encodeURIComponent(profilePicUrl)}`;
-
-                const response = await fetch(apiUrl);
-                if (response.ok) {
-                    const imageBuffer = Buffer.from(await response.arrayBuffer());
-
-                    await sock.sendMessage(id, {
-                        image: imageBuffer,
-                        caption: finalMessage,
-                        mentions: [participantString]
-                    });
-                    continue;
-                }
-            } catch(imageError: any) {
-                console.log('Image generation failed, falling back to text');
-            }
-
-            await sock.sendMessage(id, {
-                text: finalMessage,
-                mentions: [participantString]
-            });
-        } catch(error: any) {
-            console.error('Error sending goodbye message:', error);
-            const participantString = typeof participant === 'string' ? participant : (participant.id || participant.toString());
-            const user = participantString.split('@')[0];
-
-            let fallbackMessage;
-            if (customMessage) {
-                fallbackMessage = customMessage
-                    .replace(/{user}/g, `@${user}`)
-                    .replace(/{group}/g, groupName);
-            } else {
-                fallbackMessage = `Goodbye @${user}! 👋`;
-            }
-
-            await sock.sendMessage(id, {
-                text: fallbackMessage,
-                mentions: [participantString]
-            });
+        const res = await fetch(apiUrl);
+        if (res.ok) {
+          const buf = Buffer.from(await res.arrayBuffer());
+          await sock.sendMessage(id, {
+            image:    buf,
+            caption:  finalMessage,
+            mentions: [participantJid]
+          });
+          continue;
         }
+      } catch { /* fall through to plain text */ }
+
+      // Plain-text fallback
+      await sock.sendMessage(id, {
+        text:     finalMessage,
+        mentions: [participantJid]
+      });
+
+    } catch (error: any) {
+      console.error('Error sending goodbye message:', error);
+      const jidStr: string =
+        typeof participant === 'string'
+          ? participant
+          : (participant?.id ?? String(participant));
+      await sock.sendMessage(id, {
+        text:     `Goodbye @${jidStr.split('@')[0]} 👋`,
+        mentions: [jidStr]
+      });
     }
+  }
 }
 
 export default {
-    command: 'goodbye',
-    aliases: ['bye', 'leave'],
-    category: 'admin',
-    description: 'Configure goodbye messages for leaving members',
-    usage: '.goodbye <on|off|set message>',
-    groupOnly: true,
-    adminOnly: true,
+  command: 'goodbye',
+  aliases: ['bye', 'leave'],
+  category: 'admin',
+  description: 'Configure goodbye messages for leaving members',
+  usage: '.goodbye <on|off|set message>',
+  groupOnly: true,
+  adminOnly: true,
 
-    async handler(sock: any, message: any, args: any, context: BotContext) {
-        const chatId = context.chatId || message.key.remoteJid;
-        const matchText = args.join(' ');
+  async handler(sock: any, message: any, args: any, context: BotContext) {
+    const chatId    = context.chatId || message.key.remoteJid;
+    const matchText = args.join(' ');
+    await handleGoodbye(sock, chatId, message, matchText);
+  },
 
-        await handleGoodbye(sock, chatId, message, matchText);
-    },
-
-    handleLeaveEvent
+  handleLeaveEvent
 };

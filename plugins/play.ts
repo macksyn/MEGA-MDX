@@ -3,7 +3,7 @@ import yts from 'yt-search';
 import axios from 'axios';
 
 const DL_API = 'https://api.qasimdev.dpdns.org/api/loaderto/download';
-const API_KEY = 'qasim-dev';
+const API_KEY = 'xbps-install-Syu';
 
 const wait = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
 
@@ -75,15 +75,18 @@ export default {
                 audio: { url: songData.downloadUrl },
                 mimetype: 'audio/mpeg',
                 fileName: `${songData.title}.mp3`,
-                contextInfo: {
-                    externalAdReply: {
-                        title: songData.title,
-                        body: `${video.author.name} • ${video.timestamp}`,
-                        thumbnail: thumbnailBuffer,
-                        mediaType: 2,
-                        sourceUrl: video.url
+                ptt: false,
+                ...(thumbnailBuffer && {
+                    contextInfo: {
+                        externalAdReply: {
+                            title: songData.title,
+                            body: `${video.author.name} • ${video.timestamp}`,
+                            thumbnail: thumbnailBuffer,
+                            mediaType: 2,
+                            sourceUrl: video.url
+                        }
                     }
-                }
+                })
             }, { quoted: message });
 
         } catch (err: any) {

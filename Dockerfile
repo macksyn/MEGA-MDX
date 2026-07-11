@@ -2,7 +2,7 @@ FROM quay.io/qasimtech/mega-md:latest
 
 WORKDIR /root/mega-mdx
 
-RUN git clone https://github.com/GlobalTechInfo/MEGA-MDX . && \
+RUN git clone https://github.com/macksyn/MEGA-MDX . && \
     npm install && \
     npm run build
 

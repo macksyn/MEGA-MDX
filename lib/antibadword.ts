@@ -230,7 +230,7 @@ async function handleBadwordDetection(sock: any, chatId: string, message: any, u
     switch (antiBadwordConfig.action) {
         case 'delete':
             await sock.sendMessage(chatId, {
-                text: `*@${senderId.split('@')[0]} bad words are not allowed here*`,
+                text: `*@${senderId.split('@')[0]} negative comments are not allowed here*`,
                 mentions: [senderId]
             });
             break;
@@ -239,7 +239,7 @@ async function handleBadwordDetection(sock: any, chatId: string, message: any, u
             try {
                 await sock.groupParticipantsUpdate(chatId, [senderId], 'remove');
                 await sock.sendMessage(chatId, {
-                    text: `*@${senderId.split('@')[0]} has been kicked for using bad words*`,
+                    text: `*@${senderId.split('@')[0]} has been removed for using foul words*`,
                     mentions: [senderId]
                 });
             } catch(error: any) {
@@ -254,7 +254,7 @@ async function handleBadwordDetection(sock: any, chatId: string, message: any, u
                     await sock.groupParticipantsUpdate(chatId, [senderId], 'remove');
                     await resetWarningCount(chatId, senderId);
                     await sock.sendMessage(chatId, {
-                        text: `*@${senderId.split('@')[0]} has been kicked after 3 warnings*`,
+                        text: `*@${senderId.split('@')[0]} has been removed after 3 warnings*`,
                         mentions: [senderId]
                     });
                 } catch(error: any) {
