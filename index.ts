@@ -467,7 +467,7 @@ async function startQasimDev(): Promise<any> {
                     const ghostStatus = (ghostMode && ghostMode.enabled) ? '\n👻 Stealth Mode: ACTIVE' : '';
 
                     await QasimDev.sendMessage(botNumber, {
-                        text: `🤖 Bot Connected Successfully!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!${ghostStatus}\n\n✅Make sure to join below channel`,
+                        text: `🤖 Bot Connected Successfully!!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!${ghostStatus}\n\n✅Make sure to join below channel`,
                         contextInfo: {
                             forwardingScore: 1,
                             isForwarded: true,
