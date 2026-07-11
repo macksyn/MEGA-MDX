@@ -15,6 +15,7 @@ const __dirname = dirname(__filename);
 
 import { smsg } from './lib/myfunc.js';
 import { compileAll } from './lib/compile.js';
+import pluginLoader from './lib/pluginLoader.js';
 import makeWASocket, {
     useMultiFileAuthState,
     DisconnectReason,
@@ -40,6 +41,7 @@ import {
     handleCall
 } from './lib/messageHandler.js';
 import commandHandler from './lib/commandHandler.js';
+import { setBotJidsCache, invalidateGroupMetaCache } from './plugins/chatbot.js';
 
 store.readFromFile();
 setInterval(() => store.writeToFile(), config.storeWriteInterval || 10000);
@@ -94,7 +96,7 @@ try {
     owner = JSON.parse(fs.readFileSync('./data/owner.json', 'utf-8'));
 } catch { owner = []; }
 
-global.botname = config.botName || "MEGA-MD";
+global.botname = config.botName || "GROQ-AI";
 global.themeemoji = "•";
 
 const pairingCode = !process.argv.includes("--qr-code");
@@ -128,7 +130,7 @@ process.on('SIGINT', () => {
 });
 
 function ensureSessionDirectory(): string {
-    const sessionPath = path.join(__dirname, 'session');
+    const sessionPath = path.join(process.cwd(), 'session');
     if (!existsSync(sessionPath)) {
         mkdirSync(sessionPath, { recursive: true });
     }
@@ -137,7 +139,7 @@ function ensureSessionDirectory(): string {
 
 function hasValidSession(): boolean {
     try {
-        const credsPath = path.join(__dirname, 'session', 'creds.json');
+        const credsPath = path.join(process.cwd(), 'session', 'creds.json');
         if (!existsSync(credsPath)) return false;
 
         const fileContent = fs.readFileSync(credsPath, 'utf8');
@@ -154,7 +156,7 @@ function hasValidSession(): boolean {
             }
             if (creds.registered === false) {
                 printLog('warning', 'Session not registered. Clearing for fresh pairing...');
-                try { rmSync(path.join(__dirname, 'session'), { recursive: true, force: true }); } catch (_e: any) { /* ignore */ }
+                try { rmSync(path.join(process.cwd(), 'session'), { recursive: true, force: true }); } catch (_e: any) { /* ignore */ }
                 return false;
             }
             printLog('success', 'Valid and registered session credentials found');
@@ -213,7 +215,7 @@ async function startQasimDev(): Promise<any> {
         ensureSessionDirectory();
         await delay(1000);
 
-        const { state, saveCreds } = await useMultiFileAuthState(`./session`);
+        const { state, saveCreds } = await useMultiFileAuthState(path.join(process.cwd(), 'session'));
         const _saveCreds = async () => {
             ensureSessionDirectory();
             await saveCreds();
@@ -325,10 +327,10 @@ async function startQasimDev(): Promise<any> {
                             text: '❌ An error occurred while processing your message.',
                             contextInfo: {
                                 forwardingScore: 1,
-                                isForwarded: true,
+                                isForwarded: false,
                                 forwardedNewsletterMessageInfo: {
                                     newsletterJid: '120363319098372999@newsletter',
-                                    newsletterName: 'GlobalTechInc',
+                                    newsletterName: 'GROQ-AI',
                                     serverMessageId: -1
                                 }
                             }
@@ -348,10 +350,77 @@ async function startQasimDev(): Promise<any> {
             } else return jid;
         };
 
-        QasimDev.ev.on('contacts.update', (update: any[]) => {
+        /** Populate store.lidToPhone from a contact that has both a phone JID and a lid. */
+        function registerLidPhone(phoneJid: string, lid: string) {
+            if (!phoneJid || !lid) return;
+            if (!phoneJid.includes('@s.whatsapp.net')) return;
+            const phone = phoneJid.split('@')[0].split(':')[0];
+            const lidNorm = lid.split('@')[0].split(':')[0];
+            if (!phone || !lidNorm) return;
+            (store as any).lidToPhone[lidNorm] = phone;
+        }
+
+        QasimDev.ev.on('contacts.update', async (update: any[]) => {
             for (const contact of update) {
                 const id = QasimDev.decodeJid(contact.id);
-                if (store && store.contacts) (store.contacts as any)[id] = { id, name: contact.notify };
+                // If contact has a phone-based id + a lid, record the mapping
+                registerLidPhone(id, contact.lid);
+                if (contact.lid) registerLidPhone(contact.lid, id);
+
+                // Resolve phone for @lid contacts via signalRepository and persist
+                if (id.includes('@lid')) {
+                    try {
+                        const lidMapping = (QasimDev as any)?.signalRepository?.lidMapping;
+                        const pnJid: string | null = lidMapping ? await lidMapping.getPNForLID(id) : null;
+                        let phone = pnJid ? pnJid.split('@')[0].split(':')[0] : undefined;
+                        // Fall back to store.lidToPhone if signalRepository couldn't resolve
+                        if (!phone) {
+                            const lidNorm = id.split('@')[0].split(':')[0];
+                            phone = (store as any).lidToPhone?.[lidNorm] || undefined;
+                        }
+                        await (store as any).saveContact(id, {
+                            id,
+                            name: contact.notify || contact.name || contact.verifiedName || '',
+                            notify: contact.notify,
+                            verifiedName: contact.verifiedName,
+                            lid: id,
+                            phone: phone || undefined
+                        });
+                    } catch (_) {}
+                }
+            }
+        });
+
+        QasimDev.ev.on('contacts.set', (update: any) => {
+            const list: any[] = Array.isArray(update) ? update : (update?.contacts || []);
+            for (const contact of list) {
+                if (!contact?.id) continue;
+                const id = QasimDev.decodeJid(contact.id);
+                registerLidPhone(id, contact.lid);
+                if (contact.lid) registerLidPhone(contact.lid, id);
+            }
+        });
+
+        QasimDev.ev.on('groups.upsert', (groups: any[]) => {
+            for (const group of groups) {
+                if (!Array.isArray(group?.participants)) continue;
+                for (const p of group.participants) {
+                    const pid = p?.id || '';
+                    const plid = p?.lid || '';
+                    registerLidPhone(pid, plid);
+                    if (plid) registerLidPhone(plid, pid);
+                }
+            }
+        });
+
+        QasimDev.ev.on('groups.update', (groups: any[]) => {
+            for (const group of groups) {
+                if (!Array.isArray(group?.participants)) continue;
+                for (const p of group.participants) {
+                    const pid = p?.id || '';
+                    const plid = p?.lid || '';
+                    registerLidPhone(pid, plid);
+                }
             }
         });
 
@@ -387,7 +456,7 @@ async function startQasimDev(): Promise<any> {
             } else if (process.env.PAIRING_NUMBER) {
                 phoneNumberInput = process.env.PAIRING_NUMBER;
             } else if (rl && !rlClosed) {
-                phoneNumberInput = await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number 😍\nFormat: 923001234567 (without + or spaces) : `)));
+                phoneNumberInput = await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number 😍\nFormat: 2348012345678 (without + or spaces) : `)));
             } else {
                 phoneNumberInput = phoneNumber;
                 printLog('info', `Using default phone number: ${phoneNumberInput}`);
@@ -411,7 +480,7 @@ async function startQasimDev(): Promise<any> {
                     if (rl && !rlClosed) { rl.close(); rl = null; }
                 } catch (error: any) {
                     if (attempt < 3) {
-                        try { rmSync('./session', { recursive: true, force: true }); } catch (_e: any) { /* ignore */ }
+                        try { rmSync(path.join(process.cwd(), 'session'), { recursive: true, force: true }); } catch (_e: any) { /* ignore */ }
                         await delay(3000);
                         startQasimDev();
                     } else {
@@ -447,6 +516,15 @@ async function startQasimDev(): Promise<any> {
             if (connection === "open") {
                 printLog('success', 'Bot connected successfully!');
 
+                // Cache bot JIDs once — used by chatbot on every message
+                setBotJidsCache(QasimDev);
+
+                try {
+                    await pluginLoader.start(QasimDev);
+                } catch (e: any) {
+                    printLog('error', `Failed to start plugin lifecycle hooks: ${e.message}`);
+                }
+
                 try {
                     const setbioModule = await import('./plugins/setbio.js');
                     const startAutoBio = setbioModule.startAutoBio || (setbioModule.default as any)?.startAutoBio;
@@ -467,13 +545,13 @@ async function startQasimDev(): Promise<any> {
                     const ghostStatus = (ghostMode && ghostMode.enabled) ? '\n👻 Stealth Mode: ACTIVE' : '';
 
                     await QasimDev.sendMessage(botNumber, {
-                        text: `🤖 Bot Connected Successfully!!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!${ghostStatus}\n\n✅Make sure to join below channel`,
+                        text: `🤖 Bot Connected Successfully!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!${ghostStatus}\n\n✅Make sure to join our channel`,
                         contextInfo: {
                             forwardingScore: 1,
-                            isForwarded: true,
+                            isForwarded: false,
                             forwardedNewsletterMessageInfo: {
                                 newsletterJid: '120363319098372999@newsletter',
-                                newsletterName: 'GlobalTechInc',
+                                newsletterName: 'GROQ-AI',
                                 serverMessageId: -1
                             }
                         }
@@ -484,7 +562,7 @@ async function startQasimDev(): Promise<any> {
 
                 await delay(1999);
                 try { owner = JSON.parse(fs.readFileSync('./data/owner.json', 'utf-8')); } catch (_e: any) {}
-                printLog('info',    `[ ${config.botName || 'MEGA-MD'} ]`);
+                printLog('info',    `[ ${config.botName || 'GROQ-AI'} ]`);
                 printLog('info',    `WA NUMBER  : ${owner[0] || config.ownerNumber || ''}`);
                 printLog('success', `Bot Connected Successfully!`);
                 printLog('info',    `Plugins   : ${commandHandler.commands.size}`);
@@ -498,7 +576,7 @@ async function startQasimDev(): Promise<any> {
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401;
 
                 if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-                    try { rmSync('./session', { recursive: true, force: true }); } catch (_e: any) { /* ignore */ }
+                    try { rmSync(path.join(process.cwd(), 'session'), { recursive: true, force: true }); } catch (_e: any) { /* ignore */ }
                     await delay(3000);
                     startQasimDev();
                     return;
@@ -543,7 +621,7 @@ async function startQasimDev(): Promise<any> {
 async function main() {
     await compileAll();
     await commandHandler.loadCommands();
-    printLog('info', 'Starting MEGA MD BOT...');
+    printLog('info', 'Starting GROQ AI...');
     await initializeSession();
     await delay(3000);
     startQasimDev().catch((error: any) => {
@@ -556,7 +634,7 @@ async function main() {
 main();
 
 // Session cleanup interval
-const sessionDir = path.join(process.cwd(), 'session');
+const sessionDir = path.join(__dirname, 'session');
 setInterval(() => {
     if (!fs.existsSync(sessionDir)) return;
     fs.readdir(sessionDir, (err, files) => {
