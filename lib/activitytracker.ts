@@ -1,4 +1,4 @@
-// plugins/activitytracker.ts
+// lib/activitytracker.ts
 // Extends the bot's built-in message counting with activity type tracking.
 
 import { createRequire } from 'module';
@@ -17,6 +17,7 @@ const db              = createStore('activitytracker');
 const dbStats         = db.table!('stats');    // key: userId__groupId__YYYY-MM
 const dbGroupSettings = db.table!('groups');   // key: groupId
 const dbSettings      = db.table!('settings'); // key: 'config'
+const dbDaily         = db.table!('daily');    // key: groupId__YYYY-MM-DD -> { [userId]: rawMessageCount }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -89,6 +90,10 @@ function statKey(userId: string, groupId: string, month: string): string {
 
 function currentMonth(): string {
   return moment.tz(TZ).format('YYYY-MM');
+}
+
+function today(): string {
+  return moment.tz(TZ).format('YYYY-MM-DD');
 }
 
 function blankStats(): ActivityStats {
@@ -369,6 +374,36 @@ async function getInactiveMembers(groupId: string, limit = 10): Promise<Enriched
   }
 }
 
+// ── Daily raw activity (used by the economy plugin's top-3-most-active payout) ─
+// Separate from the monthly points system above — this is a plain per-day
+// message-count tally so a "most active today" reward resets daily instead
+// of just rewarding whoever's already ahead for the month.
+
+async function incrementDailyCount(userId: string, groupId: string): Promise<void> {
+  const key = `${groupId}__${today()}`;
+  try {
+    const bucket = (await dbDaily.get(key)) as Record<string, number> || {};
+    bucket[userId] = (bucket[userId] || 0) + 1;
+    await dbDaily.set(key, bucket);
+  } catch (error: any) {
+    console.error('[ACTIVITY] incrementDailyCount error:', error.message);
+  }
+}
+
+async function getDailyActivity(groupId: string, dateStr: string): Promise<Record<string, number>> {
+  try {
+    return (await dbDaily.get(`${groupId}__${dateStr}`)) as Record<string, number> || {};
+  } catch { return {}; }
+}
+
+async function getTopActiveForDay(groupId: string, dateStr: string, limit = 3): Promise<Array<{ userId: string; count: number }>> {
+  const bucket = await getDailyActivity(groupId, dateStr);
+  return Object.entries(bucket)
+    .map(([userId, count]) => ({ userId, count: count as number }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, limit);
+}
+
 // ── Core tracking (called from messageHandler.ts) ─────────────────────────────
 
 async function trackActivity(message: any): Promise<void> {
@@ -408,6 +443,7 @@ async function trackActivity(message: any): Promise<void> {
     const newPoints = (activity.points || 0) + pts;
 
     await updateActivityStats(senderId, chatId, { stats, points: newPoints });
+    await incrementDailyCount(senderId, chatId);
   } catch (error: any) {
     console.error('[ACTIVITY] trackActivity error:', error.message);
   }
@@ -452,7 +488,9 @@ const activityTrackerPlugin = {
   getMonthlyLeaderboard,
   getInactiveMembers,
   recordAttendance,
-  trackActivity
+  trackActivity,
+  getDailyActivity,
+  getTopActiveForDay
 };
 
 export default activityTrackerPlugin;
@@ -469,5 +507,7 @@ export {
   getMonthlyLeaderboard,
   getInactiveMembers,
   recordAttendance,
-  trackActivity
+  trackActivity,
+  getDailyActivity,
+  getTopActiveForDay
 };

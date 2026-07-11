@@ -192,7 +192,7 @@ export const getSizeMedia = (input: string | Buffer): Promise<string> => {
     return new Promise((resolve, reject) => {
         if (typeof input === 'string' && /http/.test(input)) {
             axios.get(input).then((res) => {
-                const length = parseInt(res.headers['content-length'], 10);
+                const length = parseInt(String(res.headers['content-length']), 10);
                 const size = bytesToSize(length, 3);
                 if (!isNaN(length)) resolve(size);
                 else reject('Invalid content-length');
