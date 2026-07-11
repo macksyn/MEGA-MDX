@@ -3,7 +3,7 @@ FROM quay.io/qasimtech/mega-md:latest
 WORKDIR /root/mega-mdx
 
 RUN git clone https://github.com/macksyn/MEGA-MDX . && \
-    npm install && \
+    npm install --legacy-peer-deps && \
     npm run build
 
 EXPOSE 5000
