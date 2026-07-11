@@ -72,6 +72,7 @@
     "mumaker": "^2.0.0",
     "mysql2": "^3.16.0",
     "node-cache": "^5.1.2",
+    "node-cron": "^4.6.0",
     "node-webpmux": "^3.1.0",
     "pg": "^8.16.3",
     "qrcode": "^1.5.4",
