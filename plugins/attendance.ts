@@ -583,9 +583,9 @@ async function handleSettingsCmd(
   if (args.length === 0) {
     const settingsMessage =
       `⚙️ *ATTENDANCE SETTINGS* ⚙️\n\n` +
-      `💰 Reward Amount: ₦${attendanceSettings.rewardAmount.toLocaleString()}\n` +
+      `🪙 Reward Amount: ${attendanceSettings.rewardAmount.toLocaleString()} coins\n` +
       `📸 Require Image: ${attendanceSettings.requireImage ? 'Yes ✅' : 'No ❌'}\n` +
-      `💎 Image Bonus: ₦${attendanceSettings.imageRewardBonus.toLocaleString()}\n` +
+      `💎 Image Bonus: ${attendanceSettings.imageRewardBonus.toLocaleString()} coins\n` +
       `📅 Date Format: ${attendanceSettings.preferredDateFormat}\n` +
       `🔧 *Change Settings:*\n` +
       `• *reward [amount]*\n• *requireimage on/off*\n• *imagebonus [amount]*\n• *dateformat MM/DD|DD/MM*`;
@@ -605,7 +605,7 @@ async function handleSettingsCmd(
       }
       attendanceSettings.rewardAmount = amount;
       await saveSettings();
-      await sock.sendMessage(chatId, { text: `✅ Reward amount set to ₦${amount.toLocaleString()}` }, { quoted: message });
+      await sock.sendMessage(chatId, { text: `✅ Reward amount set to 🪙 ${amount.toLocaleString()} coins` }, { quoted: message });
       break;
     }
     case 'requireimage': {
@@ -628,7 +628,7 @@ async function handleSettingsCmd(
       }
       attendanceSettings.imageRewardBonus = bonus;
       await saveSettings();
-      await sock.sendMessage(chatId, { text: `✅ Image bonus set to ₦${bonus.toLocaleString()}` }, { quoted: message });
+      await sock.sendMessage(chatId, { text: `✅ Image bonus set to 🪙 ${bonus.toLocaleString()} coins` }, { quoted: message });
       break;
     }
     case 'dateformat': {
@@ -721,7 +721,7 @@ async function handleAttendanceRecords(
     records.forEach((record, index) => {
       recordsText +=
         `${index + 1}. 📅 ${record.date}\n` +
-        `   💰 Reward: ₦${record.reward.toLocaleString()}\n` +
+        `   🪙 Reward: ${record.reward.toLocaleString()} coins\n` +
         `   🔥 Streak: ${record.streak} days\n` +
         `   📸 Image: ${record.hasImage ? 'Yes' : 'No'}\n` +
         (record.extractedData?.name ? `   👤 Name: ${record.extractedData.name}\n` : '') +
