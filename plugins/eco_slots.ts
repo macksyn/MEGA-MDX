@@ -14,6 +14,17 @@ export const cooldown = 3000;
 
 const ALLOWED_BETS = [5, 20, 50, 100];
 
+const SPIN_FRAMES = ['▰▱▱▱▱', '▰▰▱▱▱', '▰▰▰▱▱', '▰▰▰▰▱', '▰▰▰▰▰'];
+const SPIN_FRAME_DELAY_MS = 550;
+
+const WIN_BANNERS: Record<string, string> = {
+  big:       '『 🎉 Ｂ Ｉ Ｇ　Ｗ Ｉ Ｎ ！ 🎉 』',
+  mega:      '『 🔥 Ｍ Ｅ Ｇ Ａ　Ｗ Ｉ Ｎ ！ 🔥 』',
+  superMega: '『 👑 Ｓ Ｕ Ｐ Ｅ Ｒ　Ｍ Ｅ Ｇ Ａ　Ｗ Ｉ Ｎ ！ ！ 👑 』',
+};
+
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 async function _handler(sock: any, message: any, args: string[], context: any) {
   const { chatId, senderId, channelInfo } = context;
   const userId = cleanJid(senderId);
@@ -44,18 +55,41 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const outcome = resolveSpinOutcome(bet, economyPressure);
   const grid = spinGridForTier(outcome.tier);
 
+  const sent = await sock.sendMessage(chatId, {
+    text: `🎰 *JUNGLE HUNT SLOTS* 🎰\n\n🎰 Spinning${SPIN_FRAMES[0]}`,
+    ...channelInfo
+  }, { quoted: message });
+
+  for (let i = 1; i < SPIN_FRAMES.length; i++) {
+    await delay(SPIN_FRAME_DELAY_MS);
+    await sock.sendMessage(chatId, {
+      text: `🎰 *JUNGLE HUNT SLOTS* 🎰\n\n🎰 Spinning...\n\n${SPIN_FRAMES[i]}`,
+      edit: sent.key,
+      ...channelInfo
+    });
+  }
+  await delay(SPIN_FRAME_DELAY_MS);
+
   let winText = '';
+  let banner = '';
 
   if (outcome.tier === 'lose') {
     winText = `\n\n😬 No win this spin. Better luck next time!`;
   } else if (outcome.tier === 'mega') {
     const totalWin = await awardJackpotShare();
     await addCoins(userId, totalWin);
+    banner = WIN_BANNERS.mega;
     winText = `\n\n🦁🦁🐯 *MEGA WIN!* You snagged a slice of the jackpot: *${formatNumber(totalWin)} coins*!`;
   } else if (outcome.tier === 'superMega') {
     const totalWin = await awardFullJackpot();
     await addCoins(userId, totalWin);
+    banner = WIN_BANNERS.superMega;
     winText = `\n\n🦁🦁🦁 *SUPER MEGA — JACKPOT!!* You just won the ENTIRE pool: *${formatNumber(totalWin)} coins*!`;
+  } else if (outcome.tier === 'big') {
+    const totalWin = Math.round(bet * outcome.multiplier);
+    await addCoins(userId, totalWin);
+    banner = WIN_BANNERS.big;
+    winText = `\n\n🎉 *${outcome.label}!* Won *${formatNumber(totalWin)} coins* (${outcome.multiplier}x your bet)!`;
   } else {
     const totalWin = Math.round(bet * outcome.multiplier);
     await addCoins(userId, totalWin);
@@ -67,9 +101,11 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   await sock.sendMessage(chatId, {
     text:
       `🎰 *JUNGLE HUNT SLOTS* 🎰\n\n` +
+      (banner ? `${banner}\n\n` : '') +
       renderGrid(grid) +
       winText +
       `\n\n💶 Bet: ${formatNumber(bet)} coins  |  💰 Bal: ${formatNumber(wallet.coins)} coins`,
+    edit: sent.key,
     ...channelInfo
   }, { quoted: message });
 }
