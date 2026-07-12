@@ -6,6 +6,7 @@ import isAdmin       from '../lib/isAdmin.js';
 import isOwnerOrSudo from '../lib/isOwner.js';
 import { createStore } from '../lib/pluginStore.js';
 import bus           from '../lib/pluginBus.js';
+import { awardAttendanceBonus } from '../lib/economy.js';
 // Activity tracker is optional — loaded via dynamic import (ESM-safe)
 let activityTracker: any = null;
 import('../lib/activitytracker.js')
@@ -469,11 +470,30 @@ async function handleAutoAttendance(message: any, sock: any): Promise<boolean> {
       birthdayMessage = `\n🎂 Birthday saved/updated: ${validation.extractedData.parsedBirthday.displayDate}.`;
     }
 
+    let reward = 0;
+    let bonusMessage = '';
+    try {
+      const bonusResult = await awardAttendanceBonus(
+        senderId,
+        messageHasImage,
+        attendanceSettings.rewardAmount,
+        attendanceSettings.imageRewardBonus
+      );
+      if (bonusResult.success) {
+        reward = bonusResult.reward;
+        bonusMessage = `\n💰 Coins earned: ${reward.toLocaleString()}` +
+          (bonusResult.streakBonus > 0 ? ` (incl. ${bonusResult.streakBonus.toLocaleString()} streak bonus)` : '') +
+          (bonusResult.imageBonus > 0 ? ` (incl. ${bonusResult.imageBonus.toLocaleString()} image bonus)` : '');
+      }
+    } catch (error) {
+      console.error('[ATTENDANCE] Error awarding economy coins:', error);
+    }
+
     await saveAttendanceRecord(senderId, {
       date:          today,
       extractedData: validation.extractedData,
       hasImage:      messageHasImage,
-      reward:        0,
+      reward,
       streak:        currentStreak
     });
 
@@ -483,6 +503,7 @@ async function handleAutoAttendance(message: any, sock: any): Promise<boolean> {
 
     await sock.sendMessage(chatId, {
       text: `✅ *ATTENDANCE APPROVED!* ✅\n\n🔥 Current streak: ${currentStreak} days` +
+            bonusMessage +
             (birthdayMessage ? `\n${birthdayMessage}` : '') +
             `\n\n🎉 *Thank you for your participation!*`
     }, { quoted: message });

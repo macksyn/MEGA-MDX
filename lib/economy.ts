@@ -33,7 +33,6 @@ const TZ = config.timeZone || 'Africa/Lagos';
 interface EconomySettings {
   coinsPerGroqCoin:        number;   // how many coins convert into 1 Groq Coin
   groqCoinWithdrawThreshold: number; // min Groq Coins balance required to request withdrawal
-  dailyBase:           number;   // base coins for daily claim
   dailyStreakBonuses:  Record<string, number>; // streak-day -> bonus coins, e.g. { "7": 500 }
   workMin:             number;
   workMax:             number;
@@ -41,13 +40,11 @@ interface EconomySettings {
   top3Rewards:         [number, number, number]; // coins for 1st/2nd/3rd most active per day
   fineAmount:          number; // coins docked for bad-word/spam triggers (used by other plugins if wired up)
   economyGroupId:      string | null; // the ONE group JID (e.g. '1203xxxx@g.us') this economy is scoped to. null = unrestricted (any chat)
-  attendanceImageBonus: number; // extra coins for including an image with an attendance submission
 }
 
 const DEFAULT_SETTINGS: EconomySettings = {
   coinsPerGroqCoin: Number(process.env.ECONOMY_COINS_PER_GROQCOIN) || 100,
   groqCoinWithdrawThreshold: Number(process.env.ECONOMY_GROQCOIN_WITHDRAW_THRESHOLD) || 50,
-  dailyBase: Number(process.env.ECONOMY_DAILY_BASE) || 100,
   dailyStreakBonuses: { '3': 50, '7': 250, '14': 600, '30': 1500 },
   workMin: Number(process.env.ECONOMY_WORK_MIN) || 50,
   workMax: Number(process.env.ECONOMY_WORK_MAX) || 300,
@@ -55,7 +52,6 @@ const DEFAULT_SETTINGS: EconomySettings = {
   top3Rewards: [300, 200, 100],
   fineAmount: Number(process.env.ECONOMY_FINE_AMOUNT) || 20,
   economyGroupId: process.env.ECONOMY_GROUP_ID || null,
-  attendanceImageBonus: Number(process.env.ECONOMY_ATTENDANCE_IMAGE_BONUS) || 50,
 };
 
 export async function getSettings(): Promise<EconomySettings> {
@@ -257,8 +253,18 @@ export async function convertCoinsToGroqCoins(userId: string, coinsAmount: numbe
 // No more manual "!daily" claim — this is called once by attendance.ts right
 // after it approves a submission for the day. Same streak-milestone math as
 // before, just triggered by a real attendance form instead of a command.
+//
+// The base reward and image bonus amounts are NOT configured here — they live
+// in plugins/attendance.ts's own settings (.attendance settings) so there's a
+// single place admins adjust them. This function is only handed the resolved
+// numbers and applies the streak-milestone math + wallet crediting on top.
 
-export async function awardAttendanceBonus(userId: string, hasImage = false): Promise<
+export async function awardAttendanceBonus(
+  userId: string,
+  hasImage = false,
+  baseReward: number,
+  imageBonusAmount = 0
+): Promise<
   | { success: false; reason: 'already_awarded_today' }
   | { success: true; reward: number; streak: number; streakBonus: number; imageBonus: number }
 > {
@@ -285,8 +291,8 @@ export async function awardAttendanceBonus(userId: string, hasImage = false): Pr
     }
   }
 
-  const imageBonus = hasImage ? settings.attendanceImageBonus : 0;
-  const reward = settings.dailyBase + streakBonus + imageBonus;
+  const imageBonus = hasImage ? imageBonusAmount : 0;
+  const reward = baseReward + streakBonus + imageBonus;
 
   wallet.coins += reward;
   wallet.lifetimeCoinsEarned += reward;

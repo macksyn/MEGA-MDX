@@ -11,7 +11,7 @@
  *   !ecoadmin removegroqcoins @user 10
  *   !ecoadmin reset @user
  *   !ecoadmin settings                     -> show current settings
- *   !ecoadmin settings dailyBase 150        -> update a setting
+ *   !ecoadmin settings workMin 100          -> update a setting
  */
 import { addCoins, deductCoins, addGroqCoins, deductGroqCoins, resetWallet, getSettings, updateSettings, formatNumber } from '../lib/economy.js';
 import { extractTargetId } from '../lib/resolveTarget.js';
