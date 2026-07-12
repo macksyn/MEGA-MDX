@@ -1,6 +1,6 @@
 import type { BotContext } from '../types.js';
-import pkg from 'api-qasim';
-const QasimAny = pkg as any;
+import * as QasimPkg from 'api-qasim';
+const QasimAny = QasimPkg as any;
 export default {
   command: 'npmstalk',
   aliases: ['npmstlk'],
