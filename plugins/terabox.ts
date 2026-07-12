@@ -103,11 +103,13 @@ export default {
         );
       }
 
-      await sock.sendMessage(
-        chatId,
-        { text: '⏳ *Processing TeraBox link...*\n\nPlease wait, fetching file information...' },
-        { quoted: message }
-      );
+      if (!context.silent) {
+        await sock.sendMessage(
+          chatId,
+          { text: '⏳ *Processing TeraBox link...*\n\nPlease wait, fetching file information...' },
+          { quoted: message }
+        );
+      }
 
       // Fetch file information
       const apiUrl = `https://api.qasimdev.dpdns.org/api/terabox/download?apiKey=qasim-dev&url=${encodeURIComponent(url)}`;
@@ -133,11 +135,13 @@ export default {
       const fileType = file.type;
 
       // Show file info without thumbnail to avoid issues
-      await sock.sendMessage(
-        chatId,
-        { text: `📦 *TeraBox File*\n\n📄 *Name:* ${title}\n📊 *Size:* ${size}\n📁 *Type:* ${fileType}\n📂 *Total Files:* ${totalFiles}\n\n⏳ *Downloading...*\nPlease wait, this may take a while for large files...` },
-        { quoted: message }
-      );
+      if (!context.silent) {
+        await sock.sendMessage(
+          chatId,
+          { text: `📦 *TeraBox File*\n\n📄 *Name:* ${title}\n📊 *Size:* ${size}\n📁 *Type:* ${fileType}\n📂 *Total Files:* ${totalFiles}\n\n⏳ *Downloading...*\nPlease wait, this may take a while for large files...` },
+          { quoted: message }
+        );
+      }
 
       // Create temp directory
       const tempDir = path.join(process.cwd(), 'tmp');

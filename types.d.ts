@@ -33,6 +33,10 @@ export interface BotContext {
     userMessage: string;
     messageText: string;
     config: typeof config;
+    /** When true, individual plugins should skip their own "starting" reactions/status
+     *  text (e.g. download plugins delegated from the central auto-downloader, which
+     *  already shows its own animated progress). Optional — defaults to falsy. */
+    silent?: boolean;
 }
 
 export interface Plugin {

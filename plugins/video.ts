@@ -78,7 +78,9 @@ export default {
 
             await sock.sendMessage(chatId, {
                 image: { url: thumb },
-                caption: `🎬 *${videoTitle || query}*\n⬇️ Downloading... *(may take up to 30s)*`
+                caption: context.silent
+                    ? `🎬 *${videoTitle || query}*`
+                    : `🎬 *${videoTitle || query}*\n⬇️ Downloading... *(may take up to 30s)*`
             }, { quoted: message });
 
             const videoData = await downloadWithRetry(videoUrl);

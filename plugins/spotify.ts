@@ -28,7 +28,9 @@ export default {
         }
 
         try {
-            await sock.sendMessage(chatId, { react: { text: '🎵', key: message.key } });
+            if (!context.silent) {
+                await sock.sendMessage(chatId, { react: { text: '🎵', key: message.key } });
+            }
 
             const { data } = await axios.get(API, {
                 params: { apiKey: API_KEY, url },

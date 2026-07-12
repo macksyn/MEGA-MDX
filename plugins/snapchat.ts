@@ -25,10 +25,12 @@ export default {
     }
 
     try {
-      await sock.sendMessage(chatId, {
-        text: '⏳ Fetching Snapchat media...',
-        ...channelInfo
-      }, { quoted: message });
+      if (!context.silent) {
+        await sock.sendMessage(chatId, {
+          text: '⏳ Fetching Snapchat media...',
+          ...channelInfo
+        }, { quoted: message });
+      }
 
       const apiUrl = `https://discardapi.dpdns.org/api/dl/snapchat?apikey=guru&url=${encodeURIComponent(url)}`;
 

@@ -59,15 +59,18 @@ export default {
                 );
             }
 
-            const { key } = await sock.sendMessage(chatId, {
-                text: `🌩️ *MEGA DOWNLOAD*\n\n▢ *File:* ${file.name}\n▢ *Size:* ${formatBytes(((file.size as number) as number))}\n\n*Progress:* 0% [░░░░░░░░░░]`
-            }, { quoted: message });
+            const sent = context.silent
+                ? null
+                : await sock.sendMessage(chatId, {
+                    text: `🌩️ *MEGA DOWNLOAD*\n\n▢ *File:* ${file.name}\n▢ *Size:* ${formatBytes(((file.size as number) as number))}\n\n*Progress:* 0% [░░░░░░░░░░]`
+                }, { quoted: message });
 
             const stream = (file as any).download();
             const chunks: Buffer[] = [];
             let lastUpdate = Date.now();
 
             stream.on('progress', async (info: { bytesLoaded: number; bytesTotal: number }) => {
+                if (!sent) return; // central animation already covers this in silent mode
                 const { bytesLoaded, bytesTotal } = info;
                 const percentage = Math.floor((bytesLoaded / bytesTotal) * 100);
 
@@ -75,7 +78,7 @@ export default {
                     const bar = generateBar(percentage);
                     await sock.sendMessage(chatId, {
                         text: `🌩️ *MEGA DOWNLOAD*\n\n▢ *File:* ${file.name}\n▢ *Size:* ${formatBytes(bytesTotal)}\n\n*Progress:* ${percentage}% [${bar}]`,
-                        edit: key
+                        edit: sent.key
                     });
                     lastUpdate = Date.now();
                 }

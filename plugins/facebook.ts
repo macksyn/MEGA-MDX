@@ -36,9 +36,11 @@ export default {
         );
       }
 
-      await sock.sendMessage(chatId, {
-        react: { text: '🔄', key: message.key }
-      });
+      if (!context.silent) {
+        await sock.sendMessage(chatId, {
+          react: { text: '🔄', key: message.key }
+        });
+      }
 
       const apiUrl = `https://gtech-api-xtp1.onrender.com/api/download/fb?url=${encodeURIComponent(
         url
