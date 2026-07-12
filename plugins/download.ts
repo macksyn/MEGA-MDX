@@ -36,7 +36,7 @@ function extractUrl(text: string): string | null {
 
 const DETECTORS: Array<{ regex: RegExp; plugin: string; name: string }> = [
     { regex: /(?:(?:vt|vm)\.)?tiktok\.com/i,       plugin: './tiktok.js',    name: 'TikTok'    },
-    { regex: /(?:x\.com|twitter\.com)/i,            plugin: './twitter.js',   name: 'Twitter/X' },
+    { regex: /(?:x\.com|twitter\.com)/i,            plugin: './twitter.js',   name: 'Twitter' },
     { regex: /facebook\.com|fb\.watch/i,            plugin: './facebook.js',  name: 'Facebook'  },
     { regex: /instagram\.com|instagr\.am/i,         plugin: './instagram.js', name: 'Instagram' },
     { regex: /(?:youtube\.com|youtu\.be)/i,          plugin: './video.js',     name: 'YouTube'   },

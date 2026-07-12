@@ -7,6 +7,7 @@ import isOwnerOrSudo from '../lib/isOwner.js';
 import { createStore } from '../lib/pluginStore.js';
 import bus           from '../lib/pluginBus.js';
 import { awardAttendanceBonus } from '../lib/economy.js';
+import { cleanJid } from '../lib/isOwner.js';
 // Activity tracker is optional — loaded via dynamic import (ESM-safe)
 let activityTracker: any = null;
 import('../lib/activitytracker.js')
@@ -77,9 +78,9 @@ interface ValidationResult {
 // ── Defaults ──────────────────────────────────────────────────────────────────
 
 const defaultSettings: AttendanceSettings = {
-  rewardAmount:          500,
+  rewardAmount:          5,
   requireImage:          false,
-  imageRewardBonus:      200,
+  imageRewardBonus:      3,
   minFieldLength:        2,
   enableStreakBonus:     true,
   streakBonusMultiplier: 1.5,
@@ -474,7 +475,7 @@ async function handleAutoAttendance(message: any, sock: any): Promise<boolean> {
     let bonusMessage = '';
     try {
       const bonusResult = await awardAttendanceBonus(
-        senderId,
+        cleanJid(senderId),
         messageHasImage,
         attendanceSettings.rewardAmount,
         attendanceSettings.imageRewardBonus
