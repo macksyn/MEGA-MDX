@@ -1,7 +1,10 @@
 import type { BotContext } from '../types.js';
 import { igdl } from 'ruhend-scraper';
+import fetch from 'node-fetch';
 
 const processedMessages = new Set();
+const FALLBACK_API_URL = 'https://api.qasimdev.dpdns.org/api/instagram/download';
+const FALLBACK_API_KEY = 'xbps-install-Syu';
 
 function extractUniqueMedia(mediaData = []) {
   const seen = new Set();
@@ -10,6 +13,28 @@ function extractUniqueMedia(mediaData = []) {
     seen.add(m.url);
     return true;
   });
+}
+
+async function tryFallbackAPI(instagramUrl: string) {
+  try {
+    const response = await fetch(
+      `${FALLBACK_API_URL}?url=${encodeURIComponent(instagramUrl)}&apiKey=${FALLBACK_API_KEY}`
+    );
+    const data = await response.json() as any;
+    
+    if (data?.success && data?.data?.length) {
+      // Convert fallback API format to igdl format
+      return {
+        data: data.data.map((item: any) => ({
+          url: item.url,
+          type: item.title.toLowerCase().includes('video') ? 'video' : 'image'
+        }))
+      };
+    }
+  } catch (err: any) {
+    console.error('Fallback API error:', err);
+  }
+  return null;
 }
 
 export default {
@@ -55,7 +80,13 @@ export default {
         });
       }
 
-      const res = await igdl(text);
+      let res = await igdl(text);
+
+      // Try fallback API if primary API fails or returns no data
+      if (!res?.data?.length) {
+        console.log('Primary API failed, trying fallback API...');
+        res = await tryFallbackAPI(text);
+      }
 
       if (!res?.data?.length) {
         return await sock.sendMessage(
