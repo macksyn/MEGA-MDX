@@ -6,7 +6,7 @@ import isAdmin       from '../lib/isAdmin.js';
 import isOwnerOrSudo from '../lib/isOwner.js';
 import { createStore } from '../lib/pluginStore.js';
 import bus           from '../lib/pluginBus.js';
-import { awardAttendanceBonus } from '../lib/economy.js';
+import { awardAttendanceBonus, syncIdentity } from '../lib/economy.js';
 import { cleanJid } from '../lib/isOwner.js';
 // Activity tracker is optional — loaded via dynamic import (ESM-safe)
 let activityTracker: any = null;
@@ -480,6 +480,10 @@ async function handleAutoAttendance(message: any, sock: any): Promise<boolean> {
         attendanceSettings.rewardAmount,
         attendanceSettings.imageRewardBonus
       );
+      // Attendance forms often carry a real name field — prefer that, then
+      // fall back to WhatsApp's pushName, to keep the economy wallet
+      // recognizable in admin tooling and leaderboards.
+      void syncIdentity(cleanJid(senderId), sock, validation.extractedData.name || message.pushName);
       if (bonusResult.success) {
         reward = bonusResult.reward;
         bonusMessage = `\n💰 Coins earned: ${reward.toLocaleString()}` +

@@ -15,7 +15,7 @@
  *   ecoadmin settings                     -> show current settings
  *   ecoadmin settings workMin 100          -> update a setting
  */
-import { addCoins, deductCoins, addGroqCoins, deductGroqCoins, resetWallet, getSettings, updateSettings, formatNumber } from '../lib/economy.js';
+import { addCoins, deductCoins, addGroqCoins, deductGroqCoins, resetWallet, getSettings, updateSettings, formatNumber, syncIdentity, getWallet } from '../lib/economy.js';
 import { extractTargetId } from '../lib/resolveTarget.js';
 import config from '../config.js';
 
@@ -36,33 +36,43 @@ export async function handler(sock: any, message: any, args: string[], context: 
   const targetId = extractTargetId(message, args);
   const amount = parseInt(args.find(a => /^\d+$/.test(a)) || '', 10);
 
+  // Admin actions target another user's wallet — sync whatever contact info
+  // the bot already has cached for them, so the wallet stays recognizable.
+  if (targetId) void syncIdentity(targetId, sock);
+
+  // Tag a wallet's mention with its recognized name/phone, e.g. "@234...
+  // (Alex · 2348012345678)", so admins aren't just staring at raw JIDs.
+  const tag = (w: { name?: string | null; phone?: string | null } | null | undefined) =>
+    w?.name ? ` (${w.name}${w.phone ? ` · ${w.phone}` : ''})` : '';
+
   switch (sub) {
     case 'addcoins': {
       if (!targetId || !amount) return reply(`⚠️ Usage: *${prefix}eco settings addcoins @user <amount>*`);
       const wallet = await addCoins(targetId, amount);
-      return reply(`✅ Gave *${formatNumber(amount)} coins* to @${targetId}. New balance: ${formatNumber(wallet.coins)}.`, [`${targetId}@s.whatsapp.net`]);
+      return reply(`✅ Gave *${formatNumber(amount)} coins* to @${targetId}${tag(wallet)}. New balance: ${formatNumber(wallet.coins)}.`, [`${targetId}@s.whatsapp.net`]);
     }
     case 'removecoins': {
       if (!targetId || !amount) return reply(`⚠️ Usage: *${prefix}eco settings removecoins @user <amount>*`);
       const result = await deductCoins(targetId, amount);
-      if (!result.success) return reply(`❌ @${targetId} doesn't have that many coins.`, [`${targetId}@s.whatsapp.net`]);
-      return reply(`✅ Removed *${formatNumber(amount)} coins* from @${targetId}. New balance: ${formatNumber(result.wallet.coins)}.`, [`${targetId}@s.whatsapp.net`]);
+      if (!result.success) return reply(`❌ @${targetId}${tag(result.wallet)} doesn't have that many coins.`, [`${targetId}@s.whatsapp.net`]);
+      return reply(`✅ Removed *${formatNumber(amount)} coins* from @${targetId}${tag(result.wallet)}. New balance: ${formatNumber(result.wallet.coins)}.`, [`${targetId}@s.whatsapp.net`]);
     }
     case 'addgroqcoins': {
       if (!targetId || !amount) return reply(`⚠️ Usage: *${prefix}eco settings addgroqcoins @user <amount>*`);
       const wallet = await addGroqCoins(targetId, amount);
-      return reply(`✅ Gave *${formatNumber(amount)} Groq Coins* 💲 to @${targetId}. New balance: ${formatNumber(wallet.groqCoins)}.`, [`${targetId}@s.whatsapp.net`]);
+      return reply(`✅ Gave *${formatNumber(amount)} Groq Coins* 💲 to @${targetId}${tag(wallet)}. New balance: ${formatNumber(wallet.groqCoins)}.`, [`${targetId}@s.whatsapp.net`]);
     }
     case 'removegroqcoins': {
       if (!targetId || !amount) return reply(`⚠️ Usage: *${prefix}eco settings removegroqcoins @user <amount>*`);
       const result = await deductGroqCoins(targetId, amount);
-      if (!result.success) return reply(`❌ @${targetId} doesn't have that many Groq Coins.`, [`${targetId}@s.whatsapp.net`]);
-      return reply(`✅ Removed *${formatNumber(amount)} Groq Coins* from @${targetId}. New balance: ${formatNumber(result.wallet.groqCoins)}.`, [`${targetId}@s.whatsapp.net`]);
+      if (!result.success) return reply(`❌ @${targetId}${tag(result.wallet)} doesn't have that many Groq Coins.`, [`${targetId}@s.whatsapp.net`]);
+      return reply(`✅ Removed *${formatNumber(amount)} Groq Coins* from @${targetId}${tag(result.wallet)}. New balance: ${formatNumber(result.wallet.groqCoins)}.`, [`${targetId}@s.whatsapp.net`]);
     }
     case 'reset': {
       if (!targetId) return reply(`⚠️ Usage: *${prefix}eco settings reset @user*`);
+      const priorWallet = await getWallet(targetId);
       await resetWallet(targetId);
-      return reply(`♻️ Wallet reset for @${targetId}.`, [`${targetId}@s.whatsapp.net`]);
+      return reply(`♻️ Wallet reset for @${targetId}${tag(priorWallet)}.`, [`${targetId}@s.whatsapp.net`]);
     }
     case 'settings':      // legacy alias — kept so `!ecoadmin settings` still works standalone
     case 'config': {

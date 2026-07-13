@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { getLeaderboard, formatNumber, withEconomyGuard } from '../lib/economy.js';
+import { getLeaderboard, formatNumber, withEconomyGuard, getWallet } from '../lib/economy.js';
 
 export const command = 'leaderboard';
 export const aliases = ['lb', 'topcoins'];
@@ -18,7 +18,11 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   }
 
   const medals = ['🥇', '🥈', '🥉'];
-  const lines = top.map((entry, i) => `${medals[i] || `${i + 1}.`} @${entry.userId} — ${formatNumber(entry.amount)} ${emoji}`);
+  const wallets = await Promise.all(top.map(entry => getWallet(entry.userId)));
+  const lines = top.map((entry, i) => {
+    const name = wallets[i]?.name ? `${wallets[i].name} ` : '';
+    return `${medals[i] || `${i + 1}.`} ${name}@${entry.userId} — ${formatNumber(entry.amount)} ${emoji}`;
+  });
 
   await sock.sendMessage(chatId, {
     text: `🏆 *${type === 'coins' ? 'Coins' : 'Groq Coins'} Leaderboard*\n\n${lines.join('\n')}`,

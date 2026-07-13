@@ -18,9 +18,10 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const isSelf = targetId === cleanJid(senderId);
   const label = isSelf ? 'Your' : `@${targetId}'s`;
   const levelInfo = getLevelInfo(wallet.exchangeCount);
+  const recognized = wallet.name ? ` (${wallet.name}${wallet.phone ? ` · ${wallet.phone}` : ''})` : '';
 
   const text =
-    `💰 *${label} Wallet*\n\n` +
+    `💰 *${label} Wallet*${recognized}\n\n` +
     `🪙 Coins: *${formatNumber(wallet.coins)}*\n` +
     `💲 Groq Coins: *${formatNumber(wallet.groqCoins)}*\n` +
     `🏅 Level ${levelInfo.levelNumber}: *${levelInfo.levelName}*\n` +

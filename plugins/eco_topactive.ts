@@ -10,7 +10,7 @@
  *     to yesterday's top-3 most active members of every group the bot is in.
  */
 import moment from 'moment-timezone';
-import { payoutTopActive, formatNumber, getSettings, withEconomyGuard } from '../lib/economy.js';
+import { payoutTopActive, formatNumber, getSettings, withEconomyGuard, getWallet } from '../lib/economy.js';
 import { getTopActiveForDay, isGroupEnabled } from '../lib/activitytracker.js';
 import config from '../config.js';
 import { channelInfo } from '../lib/messageConfig.js';
@@ -42,9 +42,11 @@ async function _handler(sock: any, message: any, _args: string[], context: any) 
 
   const settings = await getSettings();
   const medals = ['🥇', '🥈', '🥉'];
-  const lines = top3.map((entry, i) =>
-    `${medals[i]} @${entry.userId} — ${entry.count} messages (would earn ${formatNumber(settings.top3Rewards[i] || 0)} coins)`
-  );
+  const wallets = await Promise.all(top3.map(entry => getWallet(entry.userId)));
+  const lines = top3.map((entry, i) => {
+    const name = wallets[i]?.name ? `${wallets[i].name} ` : '';
+    return `${medals[i]} ${name}@${entry.userId} — ${entry.count} messages (would earn ${formatNumber(settings.top3Rewards[i] || 0)} coins)`;
+  });
 
   await sock.sendMessage(chatId, {
     text: `📊 *Today's most active (so far)*\n\n${lines.join('\n')}\n\n_Payouts run automatically shortly after midnight._`,

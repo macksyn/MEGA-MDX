@@ -19,6 +19,7 @@ import moment from 'moment-timezone';
 import { createStore } from './pluginStore.js';
 import config from '../config.js';
 import { getTopActiveForDay, isGroupEnabled } from './activitytracker.js';
+import { cleanJid } from './isOwner.js';
 
 const root       = createStore('economy');
 const wallets     = root.table('wallets');
@@ -83,13 +84,16 @@ export async function isEconomyChat(chatId: string): Promise<boolean> {
  */
 export function withEconomyGuard(handler: (sock: any, message: any, args: string[], context: any) => Promise<any>) {
   return async (sock: any, message: any, args: string[], context: any) => {
-    const { chatId, channelInfo } = context;
+    const { chatId, channelInfo, senderId } = context;
     if (!await isEconomyChat(chatId)) {
       return sock.sendMessage(chatId, {
         text: `❌ The coins & Groq Coins economy only works in the designated group.`,
         ...channelInfo
       }, { quoted: message });
     }
+    // Fire-and-forget: keep the wallet's name/phone fresh from this live
+    // message without delaying the actual command response.
+    if (senderId) void syncIdentity(cleanJid(senderId), sock, message?.pushName);
     return handler(sock, message, args, context);
   };
 }
@@ -106,6 +110,9 @@ export interface Wallet {
   lifetimeGroqCoinsEarned: number;
   exchangeCount: number;
   createdAt: number;
+  name: string | null;    // best-known display first name (WhatsApp pushName/contact), for recognition
+  phone: string | null;   // best-known phone number, resolved from @lid where needed
+  identitySyncedAt: number | null;
 }
 
 const EMPTY_WALLET: Wallet = {
@@ -118,6 +125,9 @@ const EMPTY_WALLET: Wallet = {
   lifetimeGroqCoinsEarned: 0,
   exchangeCount: 0,
   createdAt: Date.now(),
+  name: null,
+  phone: null,
+  identitySyncedAt: null,
 };
 
 export async function getWallet(userId: string): Promise<Wallet> {
@@ -128,6 +138,91 @@ export async function getWallet(userId: string): Promise<Wallet> {
 async function saveWallet(userId: string, wallet: Wallet): Promise<Wallet> {
   await wallets.set(userId, wallet);
   return wallet;
+}
+
+// ── Identity recognition (name + phone) ──────────────────────────────────────
+// Every economy wallet is keyed by a normalized JID, which on its own is
+// unrecognizable (raw digits, or a @lid identifier that isn't even a real
+// phone number). To make wallets easy to recognize in admin tooling and
+// leaderboards, we opportunistically resolve and persist a real name +
+// phone number onto the wallet record — same approach used by
+// plugins/birthday.ts (phone from @lid) and plugins/chatbot.ts (first name
+// from pushName).
+
+/** Extract the first real name word from a WhatsApp pushName/contact name. */
+function extractFirstName(pushName: string | undefined | null): string | null {
+  if (!pushName) return null;
+  const tokens = pushName.trim().split(/\s+/);
+  for (const token of tokens) {
+    const letters = token.replace(/[^\p{L}'\-]/gu, '');
+    if (letters.length >= 2) {
+      return letters.charAt(0).toUpperCase() + letters.slice(1).toLowerCase();
+    }
+  }
+  return null;
+}
+
+/** Resolve a real phone number for a userId, unwrapping @lid identifiers when possible. */
+async function resolvePhone(userId: string, sock: any): Promise<string | null> {
+  const raw = userId.split('@')[0].split(':')[0];
+  if (!userId.includes('@lid')) return raw || null;
+  if (!sock) return null;
+
+  // 1. Check store contacts
+  const stored = sock.store?.contacts?.[userId]?.phone;
+  if (stored) return stored;
+
+  // 2. Check runtime lidToPhone map (populated from group events)
+  const fromMap = sock.store?.lidToPhone?.[raw];
+  if (fromMap) return fromMap;
+
+  // 3. Ask Baileys signal repository directly — works without cached mapping
+  try {
+    const lidMapping = sock?.signalRepository?.lidMapping;
+    const pnJid: string | null = lidMapping ? await lidMapping.getPNForLID(userId) : null;
+    if (pnJid) {
+      const phone = pnJid.split('@')[0].split(':')[0];
+      if (sock.store?.lidToPhone) sock.store.lidToPhone[raw] = phone;
+      return phone;
+    }
+  } catch (_) {}
+
+  return null;
+}
+
+/** Resolve a display first name, preferring a fresh pushName over a cached contact entry. */
+function resolveName(userId: string, sock: any, pushNameHint?: string | null): string | null {
+  const fromHint = extractFirstName(pushNameHint);
+  if (fromHint) return fromHint;
+
+  const contact = sock?.store?.contacts?.[userId];
+  const notify = contact?.notify || contact?.name || contact?.pushName;
+  return extractFirstName(notify);
+}
+
+/**
+ * Opportunistically fill in / refresh a wallet's name + phone so it's
+ * recognizable in admin tooling and leaderboards. Cheap, non-blocking,
+ * safe to call on every economy command — only writes when something
+ * actually changed. Never throws.
+ */
+export async function syncIdentity(userId: string, sock: any, pushName?: string | null): Promise<void> {
+  if (!userId || !sock) return;
+  try {
+    const wallet = await getWallet(userId);
+    const [phone, name] = [await resolvePhone(userId, sock), resolveName(userId, sock, pushName)];
+
+    const patch: Partial<Wallet> = {};
+    if (phone && phone !== wallet.phone) patch.phone = phone;
+    if (name && name !== wallet.name) patch.name = name;
+
+    if (Object.keys(patch).length > 0) {
+      patch.identitySyncedAt = Date.now();
+      await wallets.patch(userId, patch);
+    }
+  } catch (_) {
+    // Best-effort — identity recognition should never break an economy command.
+  }
 }
 
 export function todayStr(): string {

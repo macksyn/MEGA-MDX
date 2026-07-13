@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { transferCoins, formatNumber, withEconomyGuard } from '../lib/economy.js';
+import { transferCoins, formatNumber, withEconomyGuard, syncIdentity } from '../lib/economy.js';
 import { cleanJid } from '../lib/isOwner.js';
 import { extractTargetId } from '../lib/resolveTarget.js';
 
@@ -24,6 +24,10 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   }
 
   const result = await transferCoins(fromId, targetId, amount);
+
+  // Recipient may not have sent a live message here — fall back to whatever
+  // contact info the bot already has cached for them.
+  void syncIdentity(targetId, sock);
 
   if (!result.success) {
     const reasonText = result.reason === 'insufficient_funds'
