@@ -30,6 +30,8 @@ const db         = createStore('inactivetracker');
 const dbActivity = db.table!('activity');  // key: `groupId__userId`
 const dbSettings = db.table!('settings'); // key: groupId
 const dbReplies  = db.table!('replies');  // key: userId
+const dbQueue    = db.table!('queue');    // key: `groupId__userId` — pending DMs awaiting send
+const dbMeta     = db.table!('meta');     // key: 'global' — daily send counter
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -42,6 +44,20 @@ interface GroupSettings {
     reminderInterval: number;
     excludeAdmins:    boolean;
     dmDelayMs:        number;
+    // ── Anti-ban throttling ──
+    // DMs are queued, not sent immediately, and drip out across the day
+    // in small batches with randomized delays so WhatsApp never sees a
+    // burst of outbound messages to many distinct numbers at once.
+    maxDMsPerRun:     number; // cap on how many DMs one scheduler run may send
+    dmDelayMinMs:     number; // randomized delay floor between DMs in a run
+    dmDelayMaxMs:     number; // randomized delay ceiling between DMs in a run
+}
+
+interface QueuedDM {
+    groupId:   string;
+    userId:    string;
+    groupName: string;
+    queuedAt:  string;
 }
 
 interface ActivityRecord {
@@ -95,7 +111,16 @@ const DEFAULT_SETTINGS: GroupSettings = {
     reminderInterval: 7,
     excludeAdmins:    false,
     dmDelayMs:        2000,
+    maxDMsPerRun:     4,
+    dmDelayMinMs:     20_000, // 20s
+    dmDelayMaxMs:     55_000, // 55s
 };
+
+// Bot-wide (not per-group) ceiling on how many inactivity DMs go out in a
+// single rolling 24h window. This is the main safety valve — WhatsApp flags
+// the *number*, not the group, so this must stay conservative regardless of
+// how many groups/plugins are enabled or how many people go inactive at once.
+const GLOBAL_DAILY_DM_CAP = 25;
 
 // ── In-memory cache ───────────────────────────────────────────────────────────
 
@@ -133,6 +158,78 @@ async function saveGroupSettings(groupId: string, settings: GroupSettings): Prom
 async function isGroupEnabled(groupId: string): Promise<boolean> {
     const s = await getGroupSettings(groupId);
     return s?.enabled === true;
+}
+
+// ── Global daily send cap ─────────────────────────────────────────────────────
+// Tracks how many inactivity DMs have gone out today (server local date),
+// independent of group, so the bot number never bursts past a safe ceiling.
+
+function todayKey(): string {
+    return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+async function getDailySentCount(): Promise<number> {
+    try {
+        const meta = (await dbMeta.get('global')) as { date: string; count: number } | undefined;
+        if (!meta || meta.date !== todayKey()) return 0;
+        return meta.count || 0;
+    } catch {
+        return 0;
+    }
+}
+
+async function incrementDailySentCount(): Promise<void> {
+    try {
+        const date    = todayKey();
+        const meta    = (await dbMeta.get('global')) as { date: string; count: number } | undefined;
+        const current = (meta && meta.date === date) ? meta.count : 0;
+        await dbMeta.set('global', { date, count: current + 1 });
+    } catch (error: any) {
+        printLog('error', `[INACTIVE] incrementDailySentCount: ${error.message}`);
+    }
+}
+
+// ── Queue helpers ──────────────────────────────────────────────────────────────
+// Candidates are queued when discovered, then drained a few at a time by
+// processDMQueue on a separate, more frequent schedule. This is what actually
+// spreads sends across the day instead of firing them all in one run.
+
+function queueKey(groupId: string, userId: string): string {
+    return `${groupId}__${userId}`;
+}
+
+async function enqueueDM(groupId: string, userId: string, groupName: string): Promise<void> {
+    try {
+        const key = queueKey(groupId, userId);
+        const existing = await dbQueue.get(key);
+        if (existing) return; // already queued, don't duplicate
+        await dbQueue.set(key, {
+            groupId,
+            userId,
+            groupName,
+            queuedAt: new Date().toISOString(),
+        } satisfies QueuedDM);
+    } catch (error: any) {
+        printLog('error', `[INACTIVE] enqueueDM: ${error.message}`);
+    }
+}
+
+async function getQueuedDMs(): Promise<QueuedDM[]> {
+    try {
+        const all = await dbQueue.getAll() as Record<string, QueuedDM>;
+        return Object.values(all);
+    } catch (error: any) {
+        printLog('error', `[INACTIVE] getQueuedDMs: ${error.message}`);
+        return [];
+    }
+}
+
+async function dequeueDM(groupId: string, userId: string): Promise<void> {
+    try {
+        await dbQueue.del(queueKey(groupId, userId));
+    } catch (error: any) {
+        printLog('error', `[INACTIVE] dequeueDM: ${error.message}`);
+    }
 }
 
 // ── Activity record helpers ───────────────────────────────────────────────────
@@ -454,15 +551,19 @@ async function cleanupExpiredReplies(): Promise<void> {
     }
 }
 
-// ── Core inactivity check ─────────────────────────────────────────────────────
+// ── Core inactivity check — discovery phase ───────────────────────────────────
+// Finds everyone who currently qualifies for a reminder and drops them in the
+// queue. Sends nothing itself. This is what runs once a day; because it only
+// enqueues, it's safe to run even if hundreds of people are inactive at once.
 
-async function checkInactiveUsers(sock: any): Promise<void> {
+async function enqueueInactiveUsers(sock: any): Promise<number> {
     if (!sock) {
-        printLog('warning', '[INACTIVE] sock not ready, skipping check');
-        return;
+        printLog('warning', '[INACTIVE] sock not ready, skipping enqueue');
+        return 0;
     }
 
-    printLog('info', '[INACTIVE] Starting inactivity check...');
+    printLog('info', '[INACTIVE] Scanning for inactive members...');
+    let totalQueued = 0;
 
     try {
         const allSettings   = await dbSettings.getAll() as Record<string, GroupSettings>;
@@ -470,10 +571,8 @@ async function checkInactiveUsers(sock: any): Promise<void> {
 
         if (!enabledGroups.length) {
             printLog('info', '[INACTIVE] No groups with tracking enabled.');
-            return;
+            return 0;
         }
-
-        let totalDMsSent = 0;
 
         for (const [groupId, settings] of enabledGroups) {
             try {
@@ -487,10 +586,9 @@ async function checkInactiveUsers(sock: any): Promise<void> {
 
                 const groupName     = groupMetadata.subject as string;
                 const inactiveUsers = await getInactiveUsers(groupId, settings.inactiveDays);
-                printLog('info', `[INACTIVE] ${inactiveUsers.length} inactive in "${groupName}"`);
 
                 for (const activity of inactiveUsers) {
-                    const { userId, remindersSent = 0, lastReminderSent, lastActivity } = activity;
+                    const { userId, remindersSent = 0, lastReminderSent } = activity;
 
                     // Max reminders guard
                     if (remindersSent >= settings.maxReminders) continue;
@@ -509,52 +607,145 @@ async function checkInactiveUsers(sock: any): Promise<void> {
                         if (participant?.admin === 'admin' || participant?.admin === 'superadmin') continue;
                     }
 
-                    const daysInactive = Math.floor(
-                        (Date.now() - new Date(lastActivity).getTime()) / (1000 * 60 * 60 * 24)
-                    );
-                    const userName = await getUserName(sock, userId);
-
-                    const dmText = buildDMText(settings, {
-                        user:      userName,
-                        groupName,
-                        days:      friendlyDays(daysInactive),
-                    });
-
-                    try {
-                        await sock.sendMessage(userId, { text: dmText });
-                        await updateReminderSent(groupId, userId);
-                        totalDMsSent++;
-
-                        // Collect admin JIDs for possible alerts later
-                        const adminJids: string[] = groupMetadata.participants
-                            .filter((p: any) => p.admin === 'admin' || p.admin === 'superadmin')
-                            .map((p: any) => p.id);
-
-                        // Store pending reply state — window open for 7 days
-                        await dbReplies.set(userId, {
-                            userId,
-                            groupId,
-                            groupName,
-                            sentAt:    new Date().toISOString(),
-                            adminJids,
-                            stage:     'initial',
-                        } satisfies PendingReply);
-
-                        printLog('success', `[INACTIVE] DM sent → ${userName} (${daysInactive}d inactive in "${groupName}")`);
-                        await new Promise(r => setTimeout(r, settings.dmDelayMs ?? 2000));
-                    } catch (dmErr: any) {
-                        printLog('error', `[INACTIVE] Failed DM to ${userName}: ${dmErr.message}`);
-                    }
+                    await enqueueDM(groupId, userId, groupName);
+                    totalQueued++;
                 }
+
+                printLog('info', `[INACTIVE] ${inactiveUsers.length} inactive in "${groupName}", queued eligible members.`);
             } catch (groupErr: any) {
-                printLog('error', `[INACTIVE] Error processing group ${groupId}: ${groupErr.message}`);
+                printLog('error', `[INACTIVE] Error scanning group ${groupId}: ${groupErr.message}`);
             }
         }
 
-        printLog('success', `[INACTIVE] Check complete — ${totalDMsSent} DM(s) sent.`);
+        printLog('success', `[INACTIVE] Scan complete — ${totalQueued} member(s) newly queued.`);
+        return totalQueued;
     } catch (error: any) {
-        printLog('error', `[INACTIVE] checkInactiveUsers: ${error.message}`);
+        printLog('error', `[INACTIVE] enqueueInactiveUsers: ${error.message}`);
+        return totalQueued;
     }
+}
+
+// ── Core inactivity check — send phase ────────────────────────────────────────
+// Drains a small, randomized batch off the queue. This is what actually calls
+// sock.sendMessage, and it's deliberately conservative: a hard per-run cap, a
+// hard global 24h cap, and a randomized (not fixed) delay between each send.
+// Run this on several spaced-out schedule entries throughout the day rather
+// than all at once — that's what turns "30 DMs in 60 seconds" into
+// "30 DMs spread across 10+ hours", which is what avoids the WhatsApp ban.
+
+async function processDMQueue(sock: any): Promise<void> {
+    if (!sock) {
+        printLog('warning', '[INACTIVE] sock not ready, skipping queue drain');
+        return;
+    }
+
+    try {
+        const queued = await getQueuedDMs();
+        if (!queued.length) return;
+
+        const dailySent = await getDailySentCount();
+        if (dailySent >= GLOBAL_DAILY_DM_CAP) {
+            printLog('info', `[INACTIVE] Daily DM cap (${GLOBAL_DAILY_DM_CAP}) reached — deferring ${queued.length} queued DM(s) to tomorrow.`);
+            return;
+        }
+
+        // Shuffle so the same users/groups don't always win the race for a batch slot
+        const shuffled = [...queued].sort(() => Math.random() - 0.5);
+
+        // Per-run cap: smallest of (this group's configured max, remaining daily budget, a hard sane ceiling)
+        const remainingDailyBudget = GLOBAL_DAILY_DM_CAP - dailySent;
+        let sentThisRun = 0;
+
+        for (const item of shuffled) {
+            if (sentThisRun >= remainingDailyBudget) break;
+
+            const settings = await getGroupSettings(item.groupId);
+            const runCap   = Math.max(1, settings.maxDMsPerRun ?? DEFAULT_SETTINGS.maxDMsPerRun);
+            if (sentThisRun >= runCap) break;
+
+            // Re-validate: the user may have become active again, hit max reminders,
+            // or still be inside cooldown since they were queued.
+            const key      = activityKey(item.groupId, item.userId);
+            const activity = await dbActivity.get(key) as ActivityRecord | undefined;
+            if (!activity) { await dequeueDM(item.groupId, item.userId); continue; }
+
+            const remindersSent = activity.remindersSent || 0;
+            if (remindersSent >= settings.maxReminders) { await dequeueDM(item.groupId, item.userId); continue; }
+
+            if (activity.lastReminderSent) {
+                const daysSince = Math.floor(
+                    (Date.now() - new Date(activity.lastReminderSent).getTime()) / (1000 * 60 * 60 * 24)
+                );
+                if (daysSince < settings.reminderInterval) { await dequeueDM(item.groupId, item.userId); continue; }
+            }
+
+            const cutoff = Date.now() - settings.inactiveDays * 24 * 60 * 60 * 1000;
+            if (!activity.lastActivity || new Date(activity.lastActivity).getTime() >= cutoff) {
+                // They've been active since being queued — nothing to send.
+                await dequeueDM(item.groupId, item.userId);
+                continue;
+            }
+
+            const daysInactive = Math.floor(
+                (Date.now() - new Date(activity.lastActivity).getTime()) / (1000 * 60 * 60 * 24)
+            );
+            const userName = await getUserName(sock, item.userId);
+            const dmText   = buildDMText(settings, {
+                user:      userName,
+                groupName: item.groupName,
+                days:      friendlyDays(daysInactive),
+            });
+
+            try {
+                await sock.sendMessage(item.userId, { text: dmText });
+                await updateReminderSent(item.groupId, item.userId);
+                await incrementDailySentCount();
+                await dequeueDM(item.groupId, item.userId);
+                sentThisRun++;
+
+                let adminJids: string[] = [];
+                try {
+                    const groupMetadata = await sock.groupMetadata(item.groupId);
+                    adminJids = groupMetadata.participants
+                        .filter((p: any) => p.admin === 'admin' || p.admin === 'superadmin')
+                        .map((p: any) => p.id);
+                } catch { /* alerts just won't have admin JIDs this round */ }
+
+                await dbReplies.set(item.userId, {
+                    userId:    item.userId,
+                    groupId:   item.groupId,
+                    groupName: item.groupName,
+                    sentAt:    new Date().toISOString(),
+                    adminJids,
+                    stage:     'initial',
+                } satisfies PendingReply);
+
+                printLog('success', `[INACTIVE] DM sent → ${userName} (${daysInactive}d inactive in "${item.groupName}")`);
+
+                // Randomized human-like gap before the next send in this run
+                const min = settings.dmDelayMinMs ?? DEFAULT_SETTINGS.dmDelayMinMs;
+                const max = settings.dmDelayMaxMs ?? DEFAULT_SETTINGS.dmDelayMaxMs;
+                const delay = min + Math.random() * Math.max(0, max - min);
+                await new Promise(r => setTimeout(r, delay));
+            } catch (dmErr: any) {
+                printLog('error', `[INACTIVE] Failed DM to ${userName}: ${dmErr.message}`);
+                await dequeueDM(item.groupId, item.userId); // avoid retry-storming a bad JID
+            }
+        }
+
+        if (sentThisRun > 0) {
+            printLog('success', `[INACTIVE] Queue drain complete — ${sentThisRun} DM(s) sent this run, ${queued.length - sentThisRun} remaining queued.`);
+        }
+    } catch (error: any) {
+        printLog('error', `[INACTIVE] processDMQueue: ${error.message}`);
+    }
+}
+
+// Back-compat name, used by the manual `!inactive check` command — runs both
+// phases once, still capped, so an admin-triggered check can't burst-send either.
+async function checkInactiveUsers(sock: any): Promise<void> {
+    await enqueueInactiveUsers(sock);
+    await processDMQueue(sock);
 }
 
 // ── Reply handler ─────────────────────────────────────────────────────────────
@@ -790,10 +981,12 @@ async function showMenu(sock: any, chatId: string, message: any): Promise<void> 
             `• *${prefix}inactive maxreminders [n]* — Max DMs per user\n` +
             `• *${prefix}inactive interval [days]* — Days between DMs\n` +
             `• *${prefix}inactive excludeadmins on/off* — Skip admins\n` +
+            `• *${prefix}inactive batchsize [n]* — Max DMs per scheduled run (anti-ban throttle)\n` +
+            `• *${prefix}inactive queue* — View pending DM queue\n` +
             `• *${prefix}inactive stats* — List inactive users\n` +
             `• *${prefix}inactive status* — View current settings\n` +
             `• *${prefix}inactive reset @user* — Reset a user's activity\n` +
-            `• *${prefix}inactive check* — Trigger a manual check now\n\n` +
+            `• *${prefix}inactive check* — Trigger a manual check now (still throttled)\n\n` +
             `💡 *DM Message Variables:*\n` +
             `• {user} — User's display name\n` +
             `• {groupName} — Group name\n` +
@@ -891,6 +1084,57 @@ async function cmdMaxReminders(sock: any, chatId: string, message: any, senderId
     await sock.sendMessage(chatId, { text: `✅ Max reminders set to *${max}* per user` }, { quoted: message });
 }
 
+async function cmdBatchSize(sock: any, chatId: string, message: any, senderId: string, args: string[]): Promise<void> {
+    if (!await requireGroup(sock, chatId, message)) return;
+    if (!await requireAdmin(sock, chatId, message, senderId)) return;
+
+    const size = parseInt(args[0]);
+    // Hard ceiling — this is what keeps a single scheduled run from ever
+    // bursting many DMs at once, so it isn't left unbounded even for admins.
+    const HARD_CAP = 10;
+    if (isNaN(size) || size < 1 || size > HARD_CAP) {
+        await sock.sendMessage(chatId, {
+            text: `⚠️ Provide a number between 1 and ${HARD_CAP}.\n\nThis controls how many inactivity DMs can go out in a single scheduled run — kept low on purpose to avoid the bot number getting flagged for bulk messaging.`
+        }, { quoted: message });
+        return;
+    }
+
+    const settings          = await getGroupSettings(chatId);
+    settings.maxDMsPerRun   = size;
+    await saveGroupSettings(chatId, settings);
+    await sock.sendMessage(chatId, {
+        text: `✅ Max DMs per scheduled run set to *${size}*.\n\nWith several drain runs spread across the day, larger backlogs will clear over a day or two instead of all at once.`
+    }, { quoted: message });
+}
+
+async function cmdQueue(sock: any, chatId: string, message: any, senderId: string): Promise<void> {
+    if (!await requireGroup(sock, chatId, message)) return;
+    if (!await requireAdmin(sock, chatId, message, senderId)) return;
+
+    const queued    = await getQueuedDMs();
+    const dailySent = await getDailySentCount();
+
+    if (!queued.length) {
+        await sock.sendMessage(chatId, { text: '📭 The DM queue is empty — no one is currently waiting on a reminder.' }, { quoted: message });
+        return;
+    }
+
+    const byGroup = new Map<string, number>();
+    for (const q of queued) byGroup.set(q.groupName, (byGroup.get(q.groupName) || 0) + 1);
+
+    let text = `📬 *DM QUEUE*\n\n` +
+        `Total queued: *${queued.length}*\n` +
+        `Sent today: *${dailySent}* / *${GLOBAL_DAILY_DM_CAP}* (global cap)\n\n`;
+
+    for (const [groupName, count] of byGroup) {
+        text += `• ${groupName}: *${count}* pending\n`;
+    }
+
+    text += `\n_These drain in small randomized batches across the day rather than all at once._`;
+
+    await sock.sendMessage(chatId, { text }, { quoted: message });
+}
+
 async function cmdInterval(sock: any, chatId: string, message: any, senderId: string, args: string[]): Promise<void> {
     if (!await requireGroup(sock, chatId, message)) return;
     if (!await requireAdmin(sock, chatId, message, senderId)) return;
@@ -974,6 +1218,10 @@ async function cmdStatus(sock: any, chatId: string, message: any, senderId: stri
         groupName  = meta.subject;
     } catch {}
 
+    const queued     = await getQueuedDMs();
+    const queuedHere = queued.filter(q => q.groupId === chatId).length;
+    const dailySent  = await getDailySentCount();
+
     await sock.sendMessage(chatId, {
         text:
             `📊 *INACTIVITY TRACKER STATUS*\n\n` +
@@ -983,6 +1231,11 @@ async function cmdStatus(sock: any, chatId: string, message: any, senderId: stri
             `📧 Max reminders: *${settings.maxReminders}* per user\n` +
             `⏰ Reminder interval: *${settings.reminderInterval} day(s)*\n` +
             `👑 Exclude admins: ${settings.excludeAdmins ? '✅ Yes' : '❌ No'}\n\n` +
+            `🐢 *Anti-ban throttling*\n` +
+            `   Max DMs/run: *${settings.maxDMsPerRun}*\n` +
+            `   Delay between DMs: *${Math.round(settings.dmDelayMinMs / 1000)}–${Math.round(settings.dmDelayMaxMs / 1000)}s* (randomized)\n` +
+            `   Global daily cap: *${GLOBAL_DAILY_DM_CAP}* DMs/day (${dailySent} sent today)\n` +
+            `   Queued in this group: *${queuedHere}* / total queued: *${queued.length}*\n\n` +
             `💬 *DM Message:*\n${settings.dmMessage}`
     }, { quoted: message });
 }
@@ -1012,9 +1265,16 @@ async function cmdCheck(sock: any, chatId: string, message: any, senderId: strin
     if (!await requireGroup(sock, chatId, message)) return;
     if (!await requireAdmin(sock, chatId, message, senderId)) return;
 
-    await sock.sendMessage(chatId, { text: '🔍 Running manual inactivity check...' }, { quoted: message });
+    await sock.sendMessage(chatId, {
+        text: '🔍 Running manual inactivity check... (throttled — sends a small capped batch, same as the automated runs, to stay safe for the bot number)'
+    }, { quoted: message });
     await checkInactiveUsers(sock);
-    await sock.sendMessage(chatId, { text: '✅ Manual check complete!' }, { quoted: message });
+    const remaining = (await getQueuedDMs()).length;
+    await sock.sendMessage(chatId, {
+        text: remaining > 0
+            ? `✅ Batch sent. *${remaining}* more still queued — they'll go out on the next scheduled drain(s) rather than all at once.`
+            : `✅ Manual check complete! Queue is empty.`
+    }, { quoted: message });
 }
 
 // ── Passive tracking ──────────────────────────────────────────────────────────
@@ -1038,6 +1298,12 @@ export async function trackInactivity(message: any): Promise<void> {
 }
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────
+// Discovery (enqueueInactiveUsers) and sending (processDMQueue) are split
+// across separate schedule entries on purpose. Discovery just writes to the
+// queue and is cheap to run once a day. Sending is capped per-run, so it's
+// spread across many spaced-out entries throughout the day/evening — that's
+// what prevents 30+ simultaneously-inactive members from becoming 30 DMs
+// fired back-to-back (the pattern that gets bot numbers flagged/suspended).
 
 export async function runInactivityScheduler(sock: any): Promise<void> {
     printLog('info', '[INACTIVE] Running scheduled inactivity check...');
@@ -1047,14 +1313,26 @@ export async function runInactivityScheduler(sock: any): Promise<void> {
 // ── Schedules — managed by pluginLoader.start() ───────────────────────────────
 
 export const schedules = [
+    // Discovery — populates the queue once a day. Sends nothing itself.
     {
-        at: '10:00',
+        at: '09:00',
         handler: async (sock: any) => {
-            await runInactivityScheduler(sock).catch((e: any) =>
-                printLog('error', `[INACTIVE] Scheduler error: ${e.message}`)
+            await enqueueInactiveUsers(sock).catch((e: any) =>
+                printLog('error', `[INACTIVE] Enqueue scheduler error: ${e.message}`)
             );
         },
     },
+    // Sending — several spaced-out drains through the day, each capped at
+    // maxDMsPerRun and the global daily cap. Adjust these times/count to
+    // taste, but keep them spread out rather than clustered.
+    ...['10:30', '12:30', '14:30', '16:30', '18:30', '20:30', '22:00'].map((at) => ({
+        at,
+        handler: async (sock: any) => {
+            await processDMQueue(sock).catch((e: any) =>
+                printLog('error', `[INACTIVE] Queue drain scheduler error: ${e.message}`)
+            );
+        },
+    })),
     {
         at: '02:00',
         handler: async (_sock: any) => {
@@ -1133,6 +1411,15 @@ export default {
                 break;
             }
 
+            case 'batchsize':
+            case 'perrun':
+                await cmdBatchSize(sock, chatId, message, senderId, subArgs);
+                break;
+
+            case 'queue':
+                await cmdQueue(sock, chatId, message, senderId);
+                break;
+
             case 'stats':
                 await cmdStats(sock, chatId, message, senderId);
                 break;
@@ -1165,5 +1452,7 @@ export default {
     trackInactivity,
     runInactivityScheduler,
     checkInactiveUsers,
+    enqueueInactiveUsers,
+    processDMQueue,
     handleInactiveReply,
 };
