@@ -70,7 +70,7 @@ async function _handler(sock: any, message: any, _args: string[], context: any) 
     text:
       `📊 *This month's top 3 — ${currentMonth}*\n\n${lines.join('\n')}\n\n` +
       `_Paid out automatically every day just after midnight, for as long as you hold your spot._`,
-    mentions: resolved.map(r => `${r.phoneNumber}@s.whatsapp.net`),
+    mentions: resolved.map(r => r.jid),
     ...channelInfo
   }, { quoted: message });
 }
@@ -99,7 +99,7 @@ export const schedules = [
             text:
               `🎉 *Today's top 3 on the monthly leaderboard!*\n\n${lines.join('\n')}\n\n` +
               `_Keep your spot to keep earning daily!_`,
-            mentions: resolved.map(r => `${r.phoneNumber}@s.whatsapp.net`),
+            mentions: resolved.map(r => r.jid),
             ...channelInfo
           });
         }

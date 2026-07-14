@@ -39,7 +39,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
   await sock.sendMessage(chatId, {
     text,
-    mentions: isSelf ? [] : [`${phoneNumber}@s.whatsapp.net`],
+    mentions: isSelf ? [] : [resolvedJid],
     ...channelInfo
   }, { quoted: message });
 }
