@@ -18,7 +18,7 @@
 import moment from 'moment-timezone';
 import { createStore } from './pluginStore.js';
 import config from '../config.js';
-import { getTopActiveForDay, isGroupEnabled } from './activitytracker.js';
+import { getMonthlyLeaderboard, isGroupEnabled } from './activitytracker.js';
 import { cleanJid } from './isOwner.js';
 
 const root       = createStore('economy');
@@ -26,6 +26,7 @@ const wallets     = root.table('wallets');
 const withdrawals = root.table('withdrawals');
 const settingsTbl = root.table('settings');
 const processed   = root.table('processed');
+const feePool     = root.table('feePool'); // accumulated fees from peer-to-peer exchanges
 
 const TZ = config.timeZone || 'Africa/Lagos';
 
@@ -38,7 +39,8 @@ interface EconomySettings {
   workMin:             number;
   workMax:             number;
   workCooldownMs:      number;
-  top3Rewards:         [number, number, number]; // coins for 1st/2nd/3rd most active per day
+  top3Rewards:         [number, number, number]; // daily coins for whoever holds rank 1st/2nd/3rd on the monthly activity leaderboard, paid every day they hold that spot
+  exchangeFeePercent:  number; // % cut taken from the Groq Coins side of a peer-to-peer !exchange, routed to the fee pool
   fineAmount:          number; // coins docked for bad-word/spam triggers (used by other plugins if wired up)
   economyGroupId:      string | null; // the ONE group JID (e.g. '1203xxxx@g.us') this economy is scoped to. null = unrestricted (any chat)
 }
@@ -51,6 +53,7 @@ const DEFAULT_SETTINGS: EconomySettings = {
   workMax: Number(process.env.ECONOMY_WORK_MAX) || 300,
   workCooldownMs: Number(process.env.ECONOMY_WORK_COOLDOWN_MS) || 60 * 60 * 1000, // 1hr
   top3Rewards: [300, 200, 100],
+  exchangeFeePercent: Number(process.env.ECONOMY_EXCHANGE_FEE_PERCENT) || 15,
   fineAmount: Number(process.env.ECONOMY_FINE_AMOUNT) || 20,
   economyGroupId: process.env.ECONOMY_GROUP_ID || null,
 };
@@ -344,6 +347,68 @@ export async function convertCoinsToGroqCoins(userId: string, coinsAmount: numbe
   return { success: true, groqCoinsGained };
 }
 
+// ── Peer-to-peer exchange (Taka-style "beans" trade) ─────────────────────────
+// Unlike convertCoinsToGroqCoins (self-service conversion, kept above for any
+// other callers), THIS is the mechanic behind the !exchange command: you
+// spend your own coins, but the resulting Groq Coins land in the TARGET
+// member's wallet, minus a fee that's routed to the fee pool rather than
+// disappearing or going to either party. To get your own Groq Coins, someone
+// else has to run !exchange targeting you.
+
+/** Add to the persistent fee pool (Groq Coins collected from !exchange fees). */
+export async function addToFeePool(amount: number): Promise<number> {
+  if (amount <= 0) return getFeePoolBalance();
+  const current = (await feePool.get('groqCoins')) || 0;
+  const updated = current + amount;
+  await feePool.set('groqCoins', updated);
+  return updated;
+}
+
+/** Current fee pool balance, in Groq Coins. */
+export async function getFeePoolBalance(): Promise<number> {
+  return (await feePool.get('groqCoins')) || 0;
+}
+
+/** Owner-only: drain the fee pool (e.g. after spending it on something), returning what was drained. */
+export async function drainFeePool(): Promise<number> {
+  const current = await getFeePoolBalance();
+  await feePool.set('groqCoins', 0);
+  return current;
+}
+
+export async function exchangeWithMember(senderId: string, targetId: string, coinsAmount: number): Promise<
+  | { success: false; reason: 'invalid_amount' | 'self_exchange' | 'below_minimum' | 'insufficient_funds' }
+  | { success: true; coinsSpent: number; groqCoinsGained: number; fee: number }
+> {
+  if (!coinsAmount || coinsAmount <= 0) return { success: false, reason: 'invalid_amount' };
+  if (senderId === targetId) return { success: false, reason: 'self_exchange' };
+
+  const settings = await getSettings();
+  if (coinsAmount < settings.coinsPerGroqCoin) {
+    return { success: false, reason: 'below_minimum' };
+  }
+
+  // Only the portion of coinsAmount that converts evenly is actually spent
+  // (same rounding behavior as convertCoinsToGroqCoins).
+  const groqCoinsGross = Math.floor(coinsAmount / settings.coinsPerGroqCoin);
+  const coinsToSpend = groqCoinsGross * settings.coinsPerGroqCoin;
+
+  const spend = await deductCoins(senderId, coinsToSpend);
+  if (!spend.success) return { success: false, reason: 'insufficient_funds' };
+
+  const feePercent = settings.exchangeFeePercent;
+  const fee = Math.floor(groqCoinsGross * feePercent / 100);
+  const netGroqCoins = groqCoinsGross - fee;
+
+  if (netGroqCoins > 0) await addGroqCoins(targetId, netGroqCoins);
+  if (fee > 0) await addToFeePool(fee);
+
+  // Counts toward the SENDER's exchange-level progress, same as self-conversion did.
+  await addExchange(senderId, 1);
+
+  return { success: true, coinsSpent: coinsToSpend, groqCoinsGained: netGroqCoins, fee };
+}
+
 // ── Attendance-triggered daily bonus (streak-based) ──────────────────────────
 // No more manual "!daily" claim — this is called once by attendance.ts right
 // after it approves a submission for the day. Same streak-milestone math as
@@ -422,33 +487,40 @@ export async function doWork(userId: string): Promise<
   return { success: true, reward };
 }
 
-// ── Top-3-most-active payout ─────────────────────────────────────────────────
-// Raw daily message counts come from your existing lib/activitytracker.ts
-// (same hook already wired into messageHandler.ts — nothing new tracked here).
+// ── Top-3-on-the-monthly-leaderboard payout ──────────────────────────────────
+// Rank comes from lib/activitytracker.ts's cumulative monthly POINTS
+// leaderboard (messages, stickers, videos, etc. — whatever's weighted in
+// !activity settings), NOT a daily-reset counter. This is re-evaluated fresh
+// every time it runs: whoever holds rank 1/2/3 *right now* gets paid for
+// today. No streak state to track — if someone gets overtaken, they simply
+// aren't in the top 3 next time this runs, and stop earning; the person who
+// overtook them starts earning immediately. The leaderboard position IS the
+// streak.
 
 /**
- * Pays out coins to the top-3 most active users for a given group+date.
- * Idempotent — safe to call more than once for the same chat+date (e.g. if
- * the bot restarts near the scheduled time), it will only pay out once.
- * Skips groups that don't have activity tracking enabled (via !activity enable).
+ * Pays out coins to whoever holds the top-3 spots on the monthly activity
+ * leaderboard for a given group+date. Idempotent — safe to call more than
+ * once for the same chat+date (e.g. if the bot restarts near the scheduled
+ * time), it will only pay out once. Skips groups that don't have activity
+ * tracking enabled (via !activity enable).
  */
-export async function payoutTopActive(chatId: string, dateStr: string): Promise<Array<{ userId: string; count: number; reward: number; rank: number }>> {
+export async function payoutMonthlyTop3(chatId: string, dateStr: string): Promise<Array<{ userId: string; points: number; reward: number; rank: number }>> {
   if (!await isEconomyChat(chatId)) return [];
   if (!await isGroupEnabled(chatId)) return [];
 
-  const processedKey = `${dateStr}:${chatId}`;
+  const processedKey = `monthlyTop3:${dateStr}:${chatId}`;
   if (await processed.get(processedKey)) return [];
 
   const settings = await getSettings();
-  const top3 = await getTopActiveForDay(chatId, dateStr, 3);
+  const top3 = await getMonthlyLeaderboard(chatId, null, 3);
 
-  const results: Array<{ userId: string; count: number; reward: number; rank: number }> = [];
+  const results: Array<{ userId: string; points: number; reward: number; rank: number }> = [];
   for (let i = 0; i < top3.length; i++) {
     const reward = settings.top3Rewards[i] || 0;
     if (reward > 0) {
       await addCoins(top3[i].userId, reward);
     }
-    results.push({ ...top3[i], reward, rank: i + 1 });
+    results.push({ userId: top3[i].userId, points: top3[i].points, reward, rank: i + 1 });
   }
 
   await processed.set(processedKey, true);
