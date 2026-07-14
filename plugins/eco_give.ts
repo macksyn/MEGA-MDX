@@ -39,8 +39,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   }
 
   await sock.sendMessage(chatId, {
-    text: `✅ Transfer Succefull ✅ \n\n` +
-      'Sent *${formatNumber(amount)} coins* to @${targetId}!',
+    text: `✅ *TRANSFER SUCCESSFUL* ✅ \n\n Sent *${formatNumber(amount)} coins* to @${targetId}!`,
     mentions: [`${targetId}@s.whatsapp.net`],
     ...channelInfo
   }, { quoted: message });
