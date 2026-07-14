@@ -3,8 +3,8 @@ import { transferCoins, formatNumber, withEconomyGuard, syncIdentity } from '../
 import { cleanJid } from '../lib/isOwner.js';
 import { extractTargetId } from '../lib/resolveTarget.js';
 
-export const command = 'give';
-export const aliases = ['pay', 'sendcoins'];
+export const command = 'transfer';
+export const aliases = ['give', 'send'];
 export const category = 'economy';
 export const cooldown = 3000;
 
@@ -18,7 +18,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
   if (!targetId || !amount || amount <= 0) {
     return sock.sendMessage(chatId, {
-      text: `⚠️ Usage: *!give @user <amount>* or reply to their message with *!give <amount>*`,
+      text: `⚠️ Usage: *.transfer @user <amount>* or reply to their message with *.transfer <amount>*`,
       ...channelInfo
     }, { quoted: message });
   }
@@ -39,7 +39,8 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   }
 
   await sock.sendMessage(chatId, {
-    text: `✅ Sent *${formatNumber(amount)} coins* to @${targetId}!`,
+    text: `✅ Transfer Succefull ✅ \n\n` +
+      'Sent *${formatNumber(amount)} coins* to @${targetId}!',
     mentions: [`${targetId}@s.whatsapp.net`],
     ...channelInfo
   }, { quoted: message });
