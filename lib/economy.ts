@@ -35,7 +35,6 @@ const TZ = config.timeZone || 'Africa/Lagos';
 interface EconomySettings {
   coinsPerGroqCoin:        number;   // how many coins convert into 1 Groq Coin
   groqCoinWithdrawThreshold: number; // min Groq Coins balance required to request withdrawal
-  dailyStreakBonuses:  Record<string, number>; // streak-day -> bonus coins, e.g. { "7": 500 }
   workMin:             number;
   workMax:             number;
   workCooldownMs:      number;
@@ -48,7 +47,6 @@ interface EconomySettings {
 const DEFAULT_SETTINGS: EconomySettings = {
   coinsPerGroqCoin: Number(process.env.ECONOMY_COINS_PER_GROQCOIN) || 100,
   groqCoinWithdrawThreshold: Number(process.env.ECONOMY_GROQCOIN_WITHDRAW_THRESHOLD) || 50,
-  dailyStreakBonuses: { '3': 50, '7': 250, '14': 600, '30': 1500 },
   workMin: Number(process.env.ECONOMY_WORK_MIN) || 50,
   workMax: Number(process.env.ECONOMY_WORK_MAX) || 300,
   workCooldownMs: Number(process.env.ECONOMY_WORK_COOLDOWN_MS) || 60 * 60 * 1000, // 1hr
@@ -232,10 +230,6 @@ export function todayStr(): string {
   return moment().tz(TZ).format('YYYY-MM-DD');
 }
 
-function yesterdayOf(dateStr: string): string {
-  return moment.tz(dateStr, 'YYYY-MM-DD', TZ).subtract(1, 'day').format('YYYY-MM-DD');
-}
-
 export async function addCoins(userId: string, amount: number): Promise<Wallet> {
   const wallet = await getWallet(userId);
   wallet.coins += amount;
@@ -409,26 +403,27 @@ export async function exchangeWithMember(senderId: string, targetId: string, coi
   return { success: true, coinsSpent: coinsToSpend, groqCoinsGained: netGroqCoins, fee };
 }
 
-// ── Attendance-triggered daily bonus (streak-based) ──────────────────────────
+// ── Attendance-triggered daily bonus ──────────────────────────────────────────
 // No more manual "!daily" claim — this is called once by attendance.ts right
-// after it approves a submission for the day. Same streak-milestone math as
-// before, just triggered by a real attendance form instead of a command.
+// after it approves a submission for the day.
 //
-// The base reward and image bonus amounts are NOT configured here — they live
-// in plugins/attendance.ts's own settings (.attendance settings) so there's a
-// single place admins adjust them. This function is only handed the resolved
-// numbers and applies the streak-milestone math + wallet crediting on top.
+// All reward math (base amount, streak multiplier, image bonus) is resolved
+// entirely inside plugins/attendance.ts using ITS OWN settings (.attendance
+// settings) — attendance already tracks streak independently (dbUsers /
+// userData.streak), so it's the single source of truth for that number. This
+// function does not read economy settings and does not recompute anything;
+// it just credits the final amount attendance already worked out, and mirrors
+// the streak value onto the wallet purely for display in economy commands
+// (e.g. !balance) that may want to show it.
 
 export async function awardAttendanceBonus(
   userId: string,
-  hasImage = false,
-  baseReward: number,
-  imageBonusAmount = 0
+  totalReward: number,
+  streak: number
 ): Promise<
   | { success: false; reason: 'already_awarded_today' }
-  | { success: true; reward: number; streak: number; streakBonus: number; imageBonus: number }
+  | { success: true; reward: number }
 > {
-  const settings = await getSettings();
   const wallet = await getWallet(userId);
   const today = todayStr();
 
@@ -438,29 +433,13 @@ export async function awardAttendanceBonus(
     return { success: false, reason: 'already_awarded_today' };
   }
 
-  const wasYesterday = wallet.lastDailyDate === yesterdayOf(today);
-  const newStreak = wasYesterday ? wallet.dailyStreak + 1 : 1;
-
-  // Find the highest streak-bonus milestone reached (checked in descending order)
-  let streakBonus = 0;
-  const milestones = Object.keys(settings.dailyStreakBonuses).map(Number).sort((a, b) => b - a);
-  for (const m of milestones) {
-    if (newStreak >= m && newStreak % m === 0) {
-      streakBonus = settings.dailyStreakBonuses[String(m)];
-      break;
-    }
-  }
-
-  const imageBonus = hasImage ? imageBonusAmount : 0;
-  const reward = baseReward + streakBonus + imageBonus;
-
-  wallet.coins += reward;
-  wallet.lifetimeCoinsEarned += reward;
-  wallet.dailyStreak = newStreak;
+  wallet.coins += totalReward;
+  if (totalReward > 0) wallet.lifetimeCoinsEarned += totalReward;
+  wallet.dailyStreak = streak;
   wallet.lastDailyDate = today;
   await saveWallet(userId, wallet);
 
-  return { success: true, reward, streak: newStreak, streakBonus, imageBonus };
+  return { success: true, reward: totalReward };
 }
 
 // ── Work command (cooldown-based random payout) ──────────────────────────────

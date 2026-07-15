@@ -37,6 +37,7 @@ interface AttendanceSettings {
   minFieldLength:         number;
   enableStreakBonus:      boolean;
   streakBonusMultiplier:  number;
+  streakBonusThreshold:   number; // streak (in days) at/above which the multiplier kicks in
   adminNumbers:           string[];
   autoDetection:          boolean;
   preferredDateFormat:    string;
@@ -84,6 +85,7 @@ const defaultSettings: AttendanceSettings = {
   minFieldLength:        2,
   enableStreakBonus:     true,
   streakBonusMultiplier: 1.5,
+  streakBonusThreshold:  3,
   adminNumbers:          [],
   autoDetection:         true,
   preferredDateFormat:   'DD/MM',
@@ -471,14 +473,27 @@ async function handleAutoAttendance(message: any, sock: any): Promise<boolean> {
       birthdayMessage = `\n🎂 Birthday saved/updated: ${validation.extractedData.parsedBirthday.displayDate}.`;
     }
 
+    // Resolve the full reward right here — attendance owns its own streak
+    // number (currentStreak, computed above) and its own bonus settings, so
+    // there's no need to hand raw ingredients to economy and let it recompute
+    // anything from a separate copy of the streak.
+    let baseAward = attendanceSettings.rewardAmount;
+    let streakBonus = 0;
+    if (attendanceSettings.enableStreakBonus && currentStreak >= attendanceSettings.streakBonusThreshold) {
+      const boosted = Math.round(attendanceSettings.rewardAmount * attendanceSettings.streakBonusMultiplier);
+      streakBonus = boosted - attendanceSettings.rewardAmount;
+      baseAward = boosted;
+    }
+    const imageBonus = messageHasImage ? attendanceSettings.imageRewardBonus : 0;
+    const totalReward = baseAward + imageBonus;
+
     let reward = 0;
     let bonusMessage = '';
     try {
       const bonusResult = await awardAttendanceBonus(
         cleanJid(senderId),
-        messageHasImage,
-        attendanceSettings.rewardAmount,
-        attendanceSettings.imageRewardBonus
+        totalReward,
+        currentStreak
       );
       // Attendance forms often carry a real name field — prefer that, then
       // fall back to WhatsApp's pushName, to keep the economy wallet
@@ -487,8 +502,8 @@ async function handleAutoAttendance(message: any, sock: any): Promise<boolean> {
       if (bonusResult.success) {
         reward = bonusResult.reward;
         bonusMessage = `\n💰 Coins earned: ${reward.toLocaleString()}` +
-          (bonusResult.streakBonus > 0 ? ` (incl. ${bonusResult.streakBonus.toLocaleString()} streak bonus)` : '') +
-          (bonusResult.imageBonus > 0 ? ` (incl. ${bonusResult.imageBonus.toLocaleString()} image bonus)` : '');
+          (streakBonus > 0 ? ` (incl. ${streakBonus.toLocaleString()} streak bonus, x${attendanceSettings.streakBonusMultiplier})` : '') +
+          (imageBonus > 0 ? ` (incl. ${imageBonus.toLocaleString()} image bonus)` : '');
       }
     } catch (error) {
       console.error('[ATTENDANCE] Error awarding economy coins:', error);
@@ -590,9 +605,14 @@ async function handleSettingsCmd(
       `🪙 Reward Amount: ${attendanceSettings.rewardAmount.toLocaleString()} coins\n` +
       `📸 Require Image: ${attendanceSettings.requireImage ? 'Yes ✅' : 'No ❌'}\n` +
       `💎 Image Bonus: ${attendanceSettings.imageRewardBonus.toLocaleString()} coins\n` +
+      `🔥 Streak Bonus: ${attendanceSettings.enableStreakBonus ? 'Yes ✅' : 'No ❌'}\n` +
+      `✖️ Streak Multiplier: x${attendanceSettings.streakBonusMultiplier}\n` +
+      `📶 Streak Threshold: ${attendanceSettings.streakBonusThreshold} day(s)\n` +
       `📅 Date Format: ${attendanceSettings.preferredDateFormat}\n` +
       `🔧 *Change Settings:*\n` +
-      `• *reward [amount]*\n• *requireimage on/off*\n• *imagebonus [amount]*\n• *dateformat MM/DD|DD/MM*`;
+      `• *reward [amount]*\n• *requireimage on/off*\n• *imagebonus [amount]*\n` +
+      `• *streakbonus on/off*\n• *streakmultiplier [number]*\n• *streakthreshold [days]*\n` +
+      `• *dateformat MM/DD|DD/MM*`;
     await sock.sendMessage(chatId, { text: settingsMessage }, { quoted: message });
     return;
   }
@@ -633,6 +653,40 @@ async function handleSettingsCmd(
       attendanceSettings.imageRewardBonus = bonus;
       await saveSettings();
       await sock.sendMessage(chatId, { text: `✅ Image bonus set to 🪙 ${bonus.toLocaleString()} coins` }, { quoted: message });
+      break;
+    }
+    case 'streakbonus': {
+      if (!['on', 'off'].includes(value.toLowerCase())) {
+        await sock.sendMessage(chatId, { text: '⚠️ Please specify: *on* or *off*' }, { quoted: message });
+        return;
+      }
+      attendanceSettings.enableStreakBonus = value.toLowerCase() === 'on';
+      await saveSettings();
+      await sock.sendMessage(chatId, {
+        text: `✅ Streak bonus ${attendanceSettings.enableStreakBonus ? 'enabled' : 'disabled'}`
+      }, { quoted: message });
+      break;
+    }
+    case 'streakmultiplier': {
+      const multiplier = parseFloat(value);
+      if (isNaN(multiplier) || multiplier < 1) {
+        await sock.sendMessage(chatId, { text: '⚠️ Please specify a valid multiplier (e.g. 1.5), must be at least 1.' }, { quoted: message });
+        return;
+      }
+      attendanceSettings.streakBonusMultiplier = multiplier;
+      await saveSettings();
+      await sock.sendMessage(chatId, { text: `✅ Streak multiplier set to x${multiplier}` }, { quoted: message });
+      break;
+    }
+    case 'streakthreshold': {
+      const days = parseInt(value);
+      if (isNaN(days) || days < 1) {
+        await sock.sendMessage(chatId, { text: '⚠️ Please specify a valid number of days (at least 1).' }, { quoted: message });
+        return;
+      }
+      attendanceSettings.streakBonusThreshold = days;
+      await saveSettings();
+      await sock.sendMessage(chatId, { text: `✅ Streak bonus now kicks in at ${days} day(s) streak` }, { quoted: message });
       break;
     }
     case 'dateformat': {
