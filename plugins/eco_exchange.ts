@@ -9,7 +9,7 @@
  *
  * Usage: .exchange <coins> @user   (or reply to their message instead of tagging)
  */
-import { exchangeWithMember, getSettings, formatNumber, withEconomyGuard } from '../lib/economy.js';
+import { exchangeWithMember, getSettings, formatNumber, withEconomyGuard, syncIdentity } from '../lib/economy.js';
 import { cleanJid } from '../lib/isOwner.js';
 import { extractTargetJid } from '../lib/resolveTarget.js';
 import { resolveParticipant } from '../lib/contactUtil.js';
@@ -42,6 +42,11 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const targetId = cleanJid(resolvedTargetJid);
 
   const result = await exchangeWithMember(userId, targetId, amount);
+
+  // Recipient receives Groq Coins here but may not have sent a live message
+  // in this chat — sync whatever contact info the bot already has cached for
+  // them, same as eco_give.ts does for transfer recipients.
+  void syncIdentity(targetId, sock);
 
   if (!result.success) {
     const reasonText =

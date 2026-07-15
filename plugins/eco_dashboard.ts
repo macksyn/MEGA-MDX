@@ -49,6 +49,12 @@ async function showStats(sock: any, message: any, context: any) {
   const small = getStakeProfile(10);
   const mid = getStakeProfile(100);
   const large = getStakeProfile(1000);
+
+  // Slots' actual gameplay (resolveSpinOutcome, see eco_slots.ts) clamps
+  // pressure to [0.8, 1.2]; coinflip/dice clamp to [0.85, 1.15]. Use the
+  // matching range for each so this preview reflects what players actually
+  // see live, rather than one shared value borrowed from the wrong game.
+  const slotsPressure = Math.max(0.8, Math.min(1.2, 1 + (pool - 500) / 10000));
   const pressure = Math.max(0.85, Math.min(1.15, 1 + (pool - 500) / 10000));
 
   const text =
@@ -57,9 +63,9 @@ async function showStats(sock: any, message: any, context: any) {
     `📈 Economy pressure: *${pressure.toFixed(2)}x*\n` +
     `🎯 House bias: *slots 16% / coinflip 32% / dice 28%*\n\n` +
     `🎰 Slots profile\n` +
-    `• Small stake big-win chance: *${(small.bigWinChance * 100).toFixed(2)}%*\n` +
-    `• Mid stake big-win chance: *${(mid.bigWinChance * 100).toFixed(2)}%*\n` +
-    `• Large stake big-win chance: *${(large.bigWinChance * 100).toFixed(2)}%*\n\n` +
+    `• Small stake big-win chance: *${((small.bigWinChance / slotsPressure) * 100).toFixed(2)}%*\n` +
+    `• Mid stake big-win chance: *${((mid.bigWinChance / slotsPressure) * 100).toFixed(2)}%*\n` +
+    `• Large stake big-win chance: *${((large.bigWinChance / slotsPressure) * 100).toFixed(2)}%*\n\n` +
     `🪙 Coinflip profile\n` +
     `• Base win rate: *${(0.48 * 100).toFixed(0)}%*\n` +
     `• Current pressure-adjusted win rate: *${Math.min(70, Math.max(28, (0.48 / pressure) * 100)).toFixed(0)}%*\n\n` +
