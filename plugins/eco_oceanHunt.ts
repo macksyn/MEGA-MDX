@@ -20,7 +20,7 @@ export const category = 'economy-games';
 export const cooldown = 3000;
 
 // Supported wager sizes matching your calibrated system
-const ALLOWED_BETS = [5, 20, 50, 100];
+const ALLOWED_BETS = [5, 10, 20, 50, 100];
 
 const SPIN_FRAMES = ['🌊░░░░', '🌊🌊░░░', '🌊🌊🌊░░', '🌊🌊🌊🌊░', '🌊🌊🌊🌊🌊'];
 const SPIN_FRAME_DELAY_MS = 550;
@@ -42,8 +42,8 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     const pool = await getJackpotPool();
     return sock.sendMessage(chatId, {
       text:
-        `🐠 *OCEAN HUNT SLOTS* 🐠\n\n` +
-        `Usage: *!ocean <bet>*\n` +
+        `🐠 *OCEAN HUNT* 🐠\n\n` +
+        `Usage: *.ocean <bet>*\n` +
         `Allowed bets: ${ALLOWED_BETS.map(b => `*${b}*`).join(', ')} coins\n\n` +
         `👑 Ocean Jackpot: *${formatNumber(pool)} coins* 👑\n` +
         `_Land 🐋🐋🦈 for a slice, 🐋🐋🐋 takes the WHOLE ocean jackpot!_`,
@@ -69,7 +69,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
   // Send initial spinning animation frame
   const sent = await sock.sendMessage(chatId, {
-    text: `🐠 *OCEAN HUNT SLOTS* 🐠\n\n🌊 Bubbling... ${SPIN_FRAMES[0]}`,
+    text: `🐠 *OCEAN HUNT* 🐠\n\n🌊 Bubbling... ${SPIN_FRAMES[0]}`,
     ...channelInfo
   }, { quoted: message });
 
@@ -77,7 +77,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   for (let i = 1; i < SPIN_FRAMES.length; i++) {
     await delay(SPIN_FRAME_DELAY_MS);
     await sock.sendMessage(chatId, {
-      text: `🐠 *OCEAN HUNT SLOTS* 🐠\n\n🐟 Swimming deep...\n\n${SPIN_FRAMES[i]}`,
+      text: `🐠 *OCEAN HUNT* 🐠\n\n🐟 Swimming deep...\n\n${SPIN_FRAMES[i]}`,
       edit: sent.key,
       ...channelInfo
     });
@@ -114,7 +114,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
   await sock.sendMessage(chatId, {
     text:
-      `🐠 *OCEAN HUNT SLOTS* 🐠\n\n` +
+      `🐠 *OCEAN HUNT* 🐠\n\n` +
       (banner ? `${banner}\n\n` : '') +
       renderGrid(grid) +
       winText +

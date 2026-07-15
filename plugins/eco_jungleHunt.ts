@@ -34,8 +34,8 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     const pool = await getJackpotPool();
     return sock.sendMessage(chatId, {
       text:
-        `🎰 *JUNGLE HUNT SLOTS* 🎰\n\n` +
-        `Usage: *!slots <bet>*\n` +
+        `🎰 *JUNGLE HUNT* 🎰\n\n` +
+        `Usage: *.jungle <bet>*\n` +
         `Allowed bets: ${ALLOWED_BETS.map(b => `*${b}*`).join(', ')} coins\n\n` +
         `👑 Jackpot pool: *${formatNumber(pool)} coins* 👑\n` +
         `_Land 🦁🦁🐯 for a slice, 🦁🦁🦁 takes it ALL._`,
@@ -56,14 +56,14 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const grid = spinGridForTier(outcome.tier);
 
   const sent = await sock.sendMessage(chatId, {
-    text: `🎰 *JUNGLE HUNT SLOTS* 🎰\n\n🎰 Spinning${SPIN_FRAMES[0]}`,
+    text: `🎰 *JUNGLE HUNT* 🎰\n\n🎰 Spinning${SPIN_FRAMES[0]}`,
     ...channelInfo
   }, { quoted: message });
 
   for (let i = 1; i < SPIN_FRAMES.length; i++) {
     await delay(SPIN_FRAME_DELAY_MS);
     await sock.sendMessage(chatId, {
-      text: `🎰 *JUNGLE HUNT SLOTS* 🎰\n\n🎰 Spinning...\n\n${SPIN_FRAMES[i]}`,
+      text: `🎰 *JUNGLE HUNT* 🎰\n\n🎰 Spinning...\n\n${SPIN_FRAMES[i]}`,
       edit: sent.key,
       ...channelInfo
     });
@@ -100,7 +100,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
   await sock.sendMessage(chatId, {
     text:
-      `🎰 *JUNGLE HUNT SLOTS* 🎰\n\n` +
+      `🎰 *JUNGLE HUNT* 🎰\n\n` +
       (banner ? `${banner}\n\n` : '') +
       renderGrid(grid) +
       winText +
