@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { deductCoins, addCoins, getWallet, formatNumber, withEconomyGuard } from '../lib/economy.js';
-import { contributeToJackpot, resolveCoinflipOutcome } from '../lib/slotMachine.js';
+import { contributeToJackpot, getJackpotPool, resolveCoinflipOutcome } from '../lib/slotMachine.js';
 import { cleanJid } from '../lib/isOwner.js';
 
 export const command = 'coinflip';
@@ -22,31 +22,32 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     }, { quoted: message });
   }
 
-  const deducted = await deductCoins(userId, amount);
+  const deducted = await deductCoins(userId, amount, { type: 'coinflip' });
   if (!deducted.success) {
     return sock.sendMessage(chatId, { text: "❌ You don't have that many coins.", ...channelInfo }, { quoted: message });
   }
 
   await contributeToJackpot(amount);
 
-  const newPool = Math.max(500, amount * 10);
-  const economyPressure = Math.max(0.85, Math.min(1.15, 1 + (newPool - 500) / 10000));
+  // Pressure is driven by the REAL shared jackpot pool, same as slots —
+  // not a fabricated per-bet number.
+  const pool = await getJackpotPool();
+  const economyPressure = Math.max(0.85, Math.min(1.15, 1 + (pool - 500) / 10000));
   const outcome = resolveCoinflipOutcome(amount, economyPressure);
   const result = outcome.win ? guess : (guess === 'heads' ? 'tails' : 'heads');
 
-  const wallet = await getWallet(userId);
   if (outcome.win) {
     const payout = Math.round(amount * outcome.multiplier);
-    await addCoins(userId, payout);
+    await addCoins(userId, payout, { type: 'coinflip' });
     const updatedWallet = await getWallet(userId);
     return sock.sendMessage(chatId, {
-      text: `🪙 The coin landed on *${result}*! ${outcome.label} *${formatNumber(payout)} coins*!\n\n💵 Bet: ${formatNumber(bet)} coins  |  💰 Bal: ${formatNumber(newPool)} coins`,
+      text: `🪙 The coin landed on *${result}*! ${outcome.label} *${formatNumber(payout)} coins*!\n\n💵 Bet: ${formatNumber(amount)} coins  |  💰 Bal: ${formatNumber(updatedWallet.coins)} coins`,
       ...channelInfo
     }, { quoted: message });
   }
 
   await sock.sendMessage(chatId, {
-    text: `🪙 The coin landed on *${result}*. ${outcome.label} *${formatNumber(amount)} coins*. Better luck next time!\n\n💵 Bet: ${formatNumber(bet)} coins  |  💰 Bal: ${formatNumber(newPool)} coins`,
+    text: `🪙 The coin landed on *${result}*. ${outcome.label} *${formatNumber(amount)} coins*. Better luck next time!\n\n💵 Bet: ${formatNumber(amount)} coins  |  💰 Bal: ${formatNumber(deducted.wallet.coins)} coins`,
     ...channelInfo
   }, { quoted: message });
 }

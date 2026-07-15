@@ -1,74 +1,69 @@
 // @ts-nocheck
 /***
- * lib/slotMachine.ts
+ * lib/oceanSlotMachine.ts
  *
- * "Jungle Hunt" slot machine engine + the shared jackpot pool that
- * coinflip/dice/slots all feed. Pure game logic — no WhatsApp/sock code
- * here, so plugins just call these and handle the messaging themselves.
+ * "Ocean Hunt" slot machine engine + the shared jackpot pool.
+ * Pure game logic based on the verified Jungle Hunt engine.
  *
  * Payout is fully tier-driven: resolveSpinOutcome() is the single source of
  * truth for what a spin wins. spinGridForTier() then draws a grid that
- * matches that result — it never decides the outcome itself. All symbols
- * are animals; the payline signature escalates by how many 🦁/🐯 appear:
+ * matches that result. All symbols are marine life; the payline signature
+ * escalates by how many 🐋/🦈 appear:
  *
- *   lose       — no lion, no tiger
- *   recover30  — 1 tiger
- *   recover70  — 1 lion
- *   double     — 1 lion + 1 tiger
- *   triple     — 2 tiger
- *   big        — 1 lion + 2 tiger
- *   mega       — 2 lion + 1 tiger   (pays a bounded SHARE of the jackpot pool)
- *   superMega  — 3 lion             (pays the ENTIRE jackpot pool)
+ *   lose       — no whale, no shark
+ *   recover30  — 1 shark
+ *   recover70  — 1 whale
+ *   double     — 1 whale + 1 shark
+ *   triple     — 2 sharks
+ *   big        — 1 whale + 2 sharks
+ *   mega       — 2 whales + 1 shark  (pays a bounded SHARE of the ocean jackpot pool)
+ *   superMega  — 3 whales            (pays the ENTIRE ocean jackpot pool)
  *
- * The jackpot pool is only ever funded by a small cut of bets, and the
- * mega-tier payout takes a bounded share (not a fixed jump), so the house
- * is never on the hook for more than what's actually in the pool.
- *
- * Re-run the Monte Carlo sim (tune2.mjs) whenever SYMBOL_WEIGHTS, the
- * StakeProfile chances, or the JACKPOT_* constants change.
+ * Newbie grace period boosts chances at stakes strictly under 20 coins,
+ * scaling down linearly to 0.0 at stakes of 20 or more.
  */
 
 import { createStore } from './pluginStore.js';
 
 const store      = createStore('slotmachine');
-const jackpotTbl = store.table('jackpot'); // single key 'pool' -> number
+const jackpotTbl = store.table('jackpot'); // single key 'ocean_pool' -> number
 
 const JACKPOT_SEED               = 500;   // pool never drops below this
 const JACKPOT_CONTRIBUTION_RATE  = 0.05;  // 5% of every gambling bet feeds the pool
-const JACKPOT_MEGA_SHARE         = 0.25;  // mega tier (2 lion + 1 tiger) wins 25% of the current pool
+const JACKPOT_MEGA_SHARE         = 0.25;  // mega tier (2 whale + 1 shark) wins 25% of the current pool
 const JACKPOT_MEGA_FLOOR         = 100;   // ...but never less than this many coins
 
 export async function getJackpotPool(): Promise<number> {
-  const val = await jackpotTbl.get('pool');
+  const val = await jackpotTbl.get('ocean_pool');
   return typeof val === 'number' ? val : JACKPOT_SEED;
 }
 
-/** Called on every gambling bet (slots, coinflip, dice) — grows the shared pool. */
+/** Called on every gambling bet — grows the shared ocean pool. */
 export async function contributeToJackpot(bet: number): Promise<number> {
   const contribution = Math.max(1, Math.round(bet * JACKPOT_CONTRIBUTION_RATE));
   const pool = await getJackpotPool();
   const newPool = pool + contribution;
-  await jackpotTbl.set('pool', newPool);
+  await jackpotTbl.set('ocean_pool', newPool);
   return newPool;
 }
 
-/** Mega tier win (2 lion + 1 tiger): takes a bounded slice of the pool, pool keeps the rest. */
+/** Mega tier win (2 whale + 1 shark): takes a bounded slice of the pool. */
 export async function awardJackpotShare(): Promise<number> {
   const pool = await getJackpotPool();
   const amount = Math.max(JACKPOT_MEGA_FLOOR, Math.round(pool * JACKPOT_MEGA_SHARE));
   const newPool = Math.max(JACKPOT_SEED, pool - amount);
-  await jackpotTbl.set('pool', newPool);
+  await jackpotTbl.set('ocean_pool', newPool);
   return Math.min(amount, pool); // never pay out more than the pool actually had
 }
 
-/** Super mega tier win (3 lion): takes the ENTIRE pool, which resets back to the seed. */
+/** Super mega tier win (3 whale): takes the ENTIRE pool, resetting it to seed. */
 export async function awardFullJackpot(): Promise<number> {
   const pool = await getJackpotPool();
-  await jackpotTbl.set('pool', JACKPOT_SEED);
+  await jackpotTbl.set('ocean_pool', JACKPOT_SEED);
   return pool;
 }
 
-// ── Weighted payout engine for Jungle Hunt ───────────────────────────────────
+// ── Weighted payout engine for Ocean Hunt ───────────────────────────────────
 
 export interface StakeProfile {
   stake: number;
@@ -113,8 +108,7 @@ export function getStakeProfile(stake: number, spinsPlayed: number = 100): Stake
 
   if (gracePhase > 0) {
     // 1. HIGH TIER ACCESSIBILITY (Big / Mega / Super Mega)
-    // We only boost high-tier outcomes if their stake is low to prevent house exploits.
-    // At stake >= 20, the boost is exactly 0. Under 20, it scales up smoothly.
+    // Boosted only when stake is strictly under 20. At 20+, boost is exactly 0.
     const lowStakeFactor = Math.max(0, 1 - (stake / 20));
     const newbieHighTierBoost = gracePhase * lowStakeFactor;
 
@@ -124,26 +118,24 @@ export function getStakeProfile(stake: number, spinsPlayed: number = 100): Stake
       const baseSuper = superMegaWinChance;
 
       // Multiply the chances safely based on the newbie/stake matrix
-      bigWinChance       *= (1 + 1.8 * newbieHighTierBoost); // Up to +180% (2.8x base chance)
-      megaWinChance      *= (1 + 2.5 * newbieHighTierBoost); // Up to +250% (3.5x base chance)
-      superMegaWinChance *= (1 + 3.0 * newbieHighTierBoost); // Up to +300% (4.0x base chance)
+      bigWinChance       *= (1 + 1.8 * newbieHighTierBoost); // Up to +180%
+      megaWinChance      *= (1 + 2.5 * newbieHighTierBoost); // Up to +250%
+      superMegaWinChance *= (1 + 3.0 * newbieHighTierBoost); // Up to +300%
 
-      // Calculate total extra chance given to these high tiers
+      // Subtract the added probability from lose chance to maintain structural math integrity
       const totalAddedHighTier = (bigWinChance - baseBig) + (megaWinChance - baseMega) + (superMegaWinChance - baseSuper);
-      
-      // Subtract it directly from the lose chance to maintain exact mathematical coherence
       loseChance = Math.max(0.20, loseChance - totalAddedHighTier);
     }
 
     // 2. SOFT LANDING COMPENSATION (Recoveries & Minor wins)
-    // Reduce the remaining lose chance by up to another 30% for general feel-good vibes.
+    // Reduce remaining loss chance by up to 30% for high player retention.
     const loseReduction = loseChance * 0.3 * gracePhase;
     loseChance -= loseReduction;
 
     // Distribute this remainder into standard recoveries and doubles
-    recover70Chance += loseReduction * 0.4; // 40% of standard recovery
-    doubleChance    += loseReduction * 0.3; // 30% of double
-    tripleChance    += loseReduction * 0.3; // 30% of triple
+    recover70Chance += loseReduction * 0.4; // 40% to standard recovery
+    doubleChance    += loseReduction * 0.3; // 30% to double
+    tripleChance    += loseReduction * 0.3; // 30% to triple
   }
 
   return {
@@ -222,9 +214,9 @@ export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spins
   const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
   const baseChance = Math.max(0.34, 0.48 - (stake > 100 ? 0.02 : 0));
   
-  // Apply beginner grace period: up to +20% flat win probability for new users on low bets
+  // Newbie grace period: up to +20% flat win probability for low bets under 20 coins
   const gracePhase = Math.max(0, 1 - (spinsPlayed / 25));
-  const lowStakeFactor = Math.max(0, 1 - (stake / 20)); // Adjusted threshold to 20
+  const lowStakeFactor = Math.max(0, 1 - (stake / 20));
   const beginnerBoost = 0.20 * gracePhase * lowStakeFactor; 
 
   const winChance = Math.min(0.85, Math.max(0.28, baseChance / pressureFactor) + beginnerBoost);
@@ -238,13 +230,13 @@ export function resolveDiceOutcome(stake: number, economyPressure = 1, spinsPlay
   const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
   const baseWinChance = Math.max(0.28, 0.42 - (stake > 100 ? 0.015 : 0));
   
-  // Apply beginner grace period: up to +18% flat win probability for new users on low bets
+  // Newbie grace period: up to +18% flat win probability for low bets under 20 coins
   const gracePhase = Math.max(0, 1 - (spinsPlayed / 25));
-  const lowStakeFactor = Math.max(0, 1 - (stake / 20)); // Adjusted threshold to 20
+  const lowStakeFactor = Math.max(0, 1 - (stake / 20));
   const beginnerBoost = 0.18 * gracePhase * lowStakeFactor;
 
   const winChance = Math.min(0.75, Math.max(0.2, baseWinChance / pressureFactor) + beginnerBoost);
-  const tieChance = Math.max(0.08, Math.min(0.2, 0.16 / pressureFactor)); // Tie chance unaffected
+  const tieChance = Math.max(0.08, Math.min(0.2, 0.16 / pressureFactor));
 
   const roll = Math.random();
   if (roll <= tieChance) {
@@ -258,16 +250,16 @@ export function resolveDiceOutcome(stake: number, economyPressure = 1, spinsPlay
 
 // ── Symbols & weighted RNG ────────────────────────────────────────────────────
 
-export const LION  = '🦁';
-export const TIGER = '🐯';
+export const WHALE = '🐋';
+export const SHARK = '🦈';
 
 const SYMBOL_WEIGHTS: Array<{ symbol: string; weight: number }> = [
-  { symbol: '🐍',  weight: 0.30 },
-  { symbol: '🦏',  weight: 0.22 },
-  { symbol: '🐘',  weight: 0.16 },
-  { symbol: '🐒',  weight: 0.14 },
-  { symbol: LION,  weight: 0.10 },
-  { symbol: TIGER, weight: 0.08 },
+  { symbol: '🐠',  weight: 0.30 }, // Clownfish
+  { symbol: '🐙',  weight: 0.22 }, // Octopus
+  { symbol: '🦀',  weight: 0.16 }, // Crab
+  { symbol: '🐢',  weight: 0.14 }, // Sea Turtle
+  { symbol: WHALE,  weight: 0.10 }, // Blue Whale (Special)
+  { symbol: SHARK, weight: 0.08 }, // Great White Shark (Special)
 ];
 
 function rollSymbol(): string {
@@ -280,10 +272,10 @@ function rollSymbol(): string {
   return SYMBOL_WEIGHTS[0].symbol;
 }
 
-/** A filler animal that's never lion or tiger — used to pad tier paylines and non-payline rows. */
+/** A filler ocean animal that is never Whale or Shark — used to pad non-payout lines. */
 function rollFillerSymbol(): string {
   let symbol = rollSymbol();
-  while (symbol === LION || symbol === TIGER) symbol = rollSymbol();
+  while (symbol === WHALE || symbol === SHARK) symbol = rollSymbol();
   return symbol;
 }
 
@@ -301,27 +293,19 @@ export function spinGrid(): string[][] {
   return grid;
 }
 
-/**
- * Fixed lion/tiger prefix for each tier's payline, left to right. Columns
- * beyond the prefix are filled with a random non-special animal. Because
- * fillers can never roll lion or tiger, every tier's signature is exact —
- * no tier can ever accidentally display another tier's pattern.
- */
 const TIER_PAYLINE: Record<SpinOutcome['tier'], string[]> = {
   lose:      [],
-  recover30: [TIGER],
-  recover70: [LION],
-  double:    [LION, TIGER],
-  triple:    [TIGER, TIGER],
-  big:       [LION, TIGER, TIGER],
-  mega:      [LION, LION, TIGER],
-  superMega: [LION, LION, LION],
+  recover30: [SHARK],
+  recover70: [WHALE],
+  double:    [WHALE, SHARK],
+  triple:    [SHARK, SHARK],
+  big:       [WHALE, SHARK, SHARK],
+  mega:      [WHALE, WHALE, SHARK],
+  superMega: [WHALE, WHALE, WHALE],
 };
 
 /**
- * Tier-aware grid: resolveSpinOutcome() is the single source of truth for
- * whether the player wins, so the grid is generated to match it rather than
- * decide it independently. The other two rows are pure decoration.
+ * Tier-aware grid matching: populates the main payline according to the resolved outcome.
  */
 export function spinGridForTier(tier: SpinOutcome['tier']): string[][] {
   const grid = spinGrid();
@@ -346,15 +330,13 @@ export function scorePayline(row: string[]): { symbol: string; count: number } {
   return { symbol: target, count };
 }
 
-// Multiplier paytable for same-symbol paylines (currently unused by payout —
-// payout is fully tier-driven — kept for a possible future non-tier win path).
 const PAYTABLE: Record<string, { 3?: number; 4?: number }> = {
-  '🐍':  { 3: 2.5, 4: 5 },
-  '🦏':  { 3: 4,   4: 8 },
-  '🐘':  { 3: 6,   4: 12 },
-  '🐒':  { 3: 5,   4: 10 },
-  [TIGER]: { 3: 8,  4: 16 },
-  [LION]:  { 3: 10, 4: 20 },
+  '🐠':  { 3: 2.5, 4: 5 },
+  '🐙':  { 3: 4,   4: 8 },
+  '🦀':  { 3: 6,   4: 12 },
+  '🐢':  { 3: 5,   4: 10 },
+  [SHARK]: { 3: 8,  4: 16 },
+  [WHALE]: { 3: 10, 4: 20 },
 };
 
 export function getMultiplier(symbol: string, count: number): number {

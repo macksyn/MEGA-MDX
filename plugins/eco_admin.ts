@@ -17,6 +17,7 @@
  */
 import { addCoins, deductCoins, addGroqCoins, deductGroqCoins, resetWallet, getSettings, updateSettings, formatNumber, syncIdentity, getWallet } from '../lib/economy.js';
 import { extractTargetId } from '../lib/resolveTarget.js';
+import { cleanJid } from '../lib/isOwner.js';
 import config from '../config.js';
 
 export const command = 'ecoadmin';
@@ -35,6 +36,7 @@ export async function handler(sock: any, message: any, args: string[], context: 
 
   const targetId = extractTargetId(message, args);
   const amount = parseInt(args.find(a => /^\d+$/.test(a)) || '', 10);
+  const adminId = cleanJid(context.senderId || message.key.participant || message.key.remoteJid);
 
   // Admin actions target another user's wallet — sync whatever contact info
   // the bot already has cached for them, so the wallet stays recognizable.
@@ -48,23 +50,23 @@ export async function handler(sock: any, message: any, args: string[], context: 
   switch (sub) {
     case 'addcoins': {
       if (!targetId || !amount) return reply(`⚠️ Usage: *${prefix}eco settings addcoins @user <amount>*`);
-      const wallet = await addCoins(targetId, amount);
+      const wallet = await addCoins(targetId, amount, { type: 'admin_credit', counterpartyId: adminId, note: 'ecoadmin addcoins' });
       return reply(`✅ Gave *${formatNumber(amount)} coins* to @${targetId}${tag(wallet)}. New balance: ${formatNumber(wallet.coins)}.`, [`${targetId}@s.whatsapp.net`]);
     }
     case 'removecoins': {
       if (!targetId || !amount) return reply(`⚠️ Usage: *${prefix}eco settings removecoins @user <amount>*`);
-      const result = await deductCoins(targetId, amount);
+      const result = await deductCoins(targetId, amount, { type: 'admin_debit', counterpartyId: adminId, note: 'ecoadmin removecoins' });
       if (!result.success) return reply(`❌ @${targetId}${tag(result.wallet)} doesn't have that many coins.`, [`${targetId}@s.whatsapp.net`]);
       return reply(`✅ Removed *${formatNumber(amount)} coins* from @${targetId}${tag(result.wallet)}. New balance: ${formatNumber(result.wallet.coins)}.`, [`${targetId}@s.whatsapp.net`]);
     }
     case 'addgroqcoins': {
       if (!targetId || !amount) return reply(`⚠️ Usage: *${prefix}eco settings addgroqcoins @user <amount>*`);
-      const wallet = await addGroqCoins(targetId, amount);
+      const wallet = await addGroqCoins(targetId, amount, { type: 'admin_credit', counterpartyId: adminId, note: 'ecoadmin addgroqcoins' });
       return reply(`✅ Gave *${formatNumber(amount)} Groq Coins* 💲 to @${targetId}${tag(wallet)}. New balance: ${formatNumber(wallet.groqCoins)}.`, [`${targetId}@s.whatsapp.net`]);
     }
     case 'removegroqcoins': {
       if (!targetId || !amount) return reply(`⚠️ Usage: *${prefix}eco settings removegroqcoins @user <amount>*`);
-      const result = await deductGroqCoins(targetId, amount);
+      const result = await deductGroqCoins(targetId, amount, { type: 'admin_debit', counterpartyId: adminId, note: 'ecoadmin removegroqcoins' });
       if (!result.success) return reply(`❌ @${targetId}${tag(result.wallet)} doesn't have that many Groq Coins.`, [`${targetId}@s.whatsapp.net`]);
       return reply(`✅ Removed *${formatNumber(amount)} Groq Coins* from @${targetId}${tag(result.wallet)}. New balance: ${formatNumber(result.wallet.groqCoins)}.`, [`${targetId}@s.whatsapp.net`]);
     }

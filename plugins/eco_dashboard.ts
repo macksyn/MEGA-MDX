@@ -29,13 +29,15 @@ async function showMenu(sock: any, message: any, context: any) {
     `🎰 *Games:*\n` +
     `• *${prefix}slots <amount>* - Spin the jungle slot machine\n` +
     `• *${prefix}coinflip <amount> <heads|tails>* - Flip for double or nothing\n` +
+    `• *${prefix}dice <amount>* - Roll for 1.9x, a tie refund, or nothing\n` +
     `• *${prefix}jackpot* - Check the shared jackpot pool\n\n` +
     `🏆 *Leaderboards:*\n` +
     `• *${prefix}leaderboard* - Top coin holders\n` +
     `• *${prefix}leaderboard groqcoins* - Top Groq Coin holders\n` +
     `• *${prefix}topactive* - Most active members today\n\n` +
     `📊 *Info:*\n` +
-    `• *${prefix}eco stats* - Live jungle economy stats & odds\n\n` +
+    `• *${prefix}eco stats* - Live jungle economy stats & odds\n` +
+    `• *${prefix}history* - Your recent transaction history\n\n` +
     `⚙️ *Admin:* *${prefix}eco settings* (owner/admin only)`;
 
   await sock.sendMessage(chatId, { text, ...channelInfo }, { quoted: message });

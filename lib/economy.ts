@@ -27,6 +27,7 @@ const withdrawals = root.table('withdrawals');
 const settingsTbl = root.table('settings');
 const processed   = root.table('processed');
 const feePool     = root.table('feePool'); // accumulated fees from peer-to-peer exchanges
+const transactionsTbl = root.table('transactions'); // per-user ledger, keyed by userId -> array
 
 const TZ = config.timeZone || 'Africa/Lagos';
 
@@ -230,32 +231,107 @@ export function todayStr(): string {
   return moment().tz(TZ).format('YYYY-MM-DD');
 }
 
-export async function addCoins(userId: string, amount: number): Promise<Wallet> {
+// ── Transaction ledger ────────────────────────────────────────────────────────
+// Every coin/Groq Coin movement gets an entry here so balances are auditable
+// after the fact ("I never got that transfer!"). Logged automatically inside
+// addCoins/deductCoins/addGroqCoins/deductGroqCoins — callers just pass a
+// `meta` describing WHY the money moved; if they don't, it still gets logged
+// under a generic type rather than silently skipped.
+
+export type TransactionType =
+  | 'attendance' | 'work' | 'top3'
+  | 'transfer_out' | 'transfer_in'
+  | 'exchange_out' | 'exchange_in'
+  | 'convert'
+  | 'slots' | 'coinflip' | 'dice'
+  | 'admin_credit' | 'admin_debit' | 'admin_reset'
+  | 'withdrawal_hold' | 'withdrawal_refund'
+  | 'other';
+
+export interface Transaction {
+  id: string;
+  type: TransactionType;
+  currency: 'coins' | 'groqCoins';
+  amount: number;       // signed: positive = credit, negative = debit
+  balanceAfter: number;
+  counterpartyId: string | null; // other user involved (transfer/exchange partner, admin who acted), if any
+  note: string | null;
+  timestamp: number;
+}
+
+export interface TransactionMeta {
+  type?: TransactionType;
+  counterpartyId?: string | null;
+  note?: string | null;
+}
+
+const MAX_TRANSACTIONS_PER_USER = 200;
+
+async function logTransaction(
+  userId: string,
+  entry: { currency: 'coins' | 'groqCoins'; amount: number; balanceAfter: number } & TransactionMeta
+): Promise<void> {
+  if (!entry.amount) return; // no-op movements aren't worth a ledger line
+  try {
+    const record: Transaction = {
+      id: `tx_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      type: entry.type || 'other',
+      currency: entry.currency,
+      amount: entry.amount,
+      balanceAfter: entry.balanceAfter,
+      counterpartyId: entry.counterpartyId || null,
+      note: entry.note || null,
+      timestamp: Date.now(),
+    };
+    const existing: Transaction[] = (await transactionsTbl.get(userId)) || [];
+    existing.unshift(record);
+    if (existing.length > MAX_TRANSACTIONS_PER_USER) existing.length = MAX_TRANSACTIONS_PER_USER;
+    await transactionsTbl.set(userId, existing);
+  } catch (_) {
+    // Ledger writes are best-effort — never let logging break the underlying economy action.
+  }
+}
+
+/** Most recent transactions for a user, newest first. */
+export async function getTransactions(userId: string, limit = 20): Promise<Transaction[]> {
+  const existing: Transaction[] = (await transactionsTbl.get(userId)) || [];
+  return existing.slice(0, Math.max(1, Math.min(limit, MAX_TRANSACTIONS_PER_USER)));
+}
+
+export async function addCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<Wallet> {
   const wallet = await getWallet(userId);
   wallet.coins += amount;
   if (amount > 0) wallet.lifetimeCoinsEarned += amount;
-  return saveWallet(userId, wallet);
+  const saved = await saveWallet(userId, wallet);
+  await logTransaction(userId, { currency: 'coins', amount, balanceAfter: saved.coins, type: meta.type || 'admin_credit', ...meta });
+  return saved;
 }
 
-export async function addGroqCoins(userId: string, amount: number): Promise<Wallet> {
+export async function addGroqCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<Wallet> {
   const wallet = await getWallet(userId);
   wallet.groqCoins += amount;
   if (amount > 0) wallet.lifetimeGroqCoinsEarned += amount;
-  return saveWallet(userId, wallet);
+  const saved = await saveWallet(userId, wallet);
+  await logTransaction(userId, { currency: 'groqCoins', amount, balanceAfter: saved.groqCoins, type: meta.type || 'admin_credit', ...meta });
+  return saved;
 }
 
-export async function deductCoins(userId: string, amount: number): Promise<{ success: boolean; wallet: Wallet }> {
+export async function deductCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<{ success: boolean; wallet: Wallet }> {
   const wallet = await getWallet(userId);
   if (wallet.coins < amount) return { success: false, wallet };
   wallet.coins -= amount;
-  return { success: true, wallet: await saveWallet(userId, wallet) };
+  const saved = await saveWallet(userId, wallet);
+  await logTransaction(userId, { currency: 'coins', amount: -amount, balanceAfter: saved.coins, type: meta.type || 'admin_debit', ...meta });
+  return { success: true, wallet: saved };
 }
 
-export async function deductGroqCoins(userId: string, amount: number): Promise<{ success: boolean; wallet: Wallet }> {
+export async function deductGroqCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<{ success: boolean; wallet: Wallet }> {
   const wallet = await getWallet(userId);
   if (wallet.groqCoins < amount) return { success: false, wallet };
   wallet.groqCoins -= amount;
-  return { success: true, wallet: await saveWallet(userId, wallet) };
+  const saved = await saveWallet(userId, wallet);
+  await logTransaction(userId, { currency: 'groqCoins', amount: -amount, balanceAfter: saved.groqCoins, type: meta.type || 'admin_debit', ...meta });
+  return { success: true, wallet: saved };
 }
 
 export async function addExchange(userId: string, amount = 1): Promise<Wallet> {
@@ -318,10 +394,10 @@ export async function transferCoins(fromId: string, toId: string, amount: number
   if (amount <= 0) return { success: false, reason: 'invalid_amount' };
   if (fromId === toId) return { success: false, reason: 'self_transfer' };
 
-  const from = await deductCoins(fromId, amount);
+  const from = await deductCoins(fromId, amount, { type: 'transfer_out', counterpartyId: toId });
   if (!from.success) return { success: false, reason: 'insufficient_funds' };
 
-  await addCoins(toId, amount);
+  await addCoins(toId, amount, { type: 'transfer_in', counterpartyId: fromId });
   return { success: true };
 }
 
@@ -333,10 +409,10 @@ export async function convertCoinsToGroqCoins(userId: string, coinsAmount: numbe
   const groqCoinsGained = Math.floor(coinsAmount / settings.coinsPerGroqCoin);
   const coinsToSpend = groqCoinsGained * settings.coinsPerGroqCoin;
 
-  const result = await deductCoins(userId, coinsToSpend);
+  const result = await deductCoins(userId, coinsToSpend, { type: 'convert', note: 'coins → Groq Coins' });
   if (!result.success) return { success: false, reason: 'insufficient_funds' };
 
-  await addGroqCoins(userId, groqCoinsGained);
+  await addGroqCoins(userId, groqCoinsGained, { type: 'convert', note: 'coins → Groq Coins' });
   await addExchange(userId, 1);
   return { success: true, groqCoinsGained };
 }
@@ -387,14 +463,14 @@ export async function exchangeWithMember(senderId: string, targetId: string, coi
   const groqCoinsGross = Math.floor(coinsAmount / settings.coinsPerGroqCoin);
   const coinsToSpend = groqCoinsGross * settings.coinsPerGroqCoin;
 
-  const spend = await deductCoins(senderId, coinsToSpend);
+  const spend = await deductCoins(senderId, coinsToSpend, { type: 'exchange_out', counterpartyId: targetId });
   if (!spend.success) return { success: false, reason: 'insufficient_funds' };
 
   const feePercent = settings.exchangeFeePercent;
   const fee = Math.floor(groqCoinsGross * feePercent / 100);
   const netGroqCoins = groqCoinsGross - fee;
 
-  if (netGroqCoins > 0) await addGroqCoins(targetId, netGroqCoins);
+  if (netGroqCoins > 0) await addGroqCoins(targetId, netGroqCoins, { type: 'exchange_in', counterpartyId: senderId });
   if (fee > 0) await addToFeePool(fee);
 
   // Counts toward the SENDER's exchange-level progress, same as self-conversion did.
@@ -437,7 +513,8 @@ export async function awardAttendanceBonus(
   if (totalReward > 0) wallet.lifetimeCoinsEarned += totalReward;
   wallet.dailyStreak = streak;
   wallet.lastDailyDate = today;
-  await saveWallet(userId, wallet);
+  const saved = await saveWallet(userId, wallet);
+  await logTransaction(userId, { currency: 'coins', amount: totalReward, balanceAfter: saved.coins, type: 'attendance', note: `streak: ${streak}` });
 
   return { success: true, reward: totalReward };
 }
@@ -461,7 +538,8 @@ export async function doWork(userId: string): Promise<
   wallet.coins += reward;
   wallet.lifetimeCoinsEarned += reward;
   wallet.lastWorkTs = now;
-  await saveWallet(userId, wallet);
+  const saved = await saveWallet(userId, wallet);
+  await logTransaction(userId, { currency: 'coins', amount: reward, balanceAfter: saved.coins, type: 'work' });
 
   return { success: true, reward };
 }
@@ -497,7 +575,7 @@ export async function payoutMonthlyTop3(chatId: string, dateStr: string): Promis
   for (let i = 0; i < top3.length; i++) {
     const reward = settings.top3Rewards[i] || 0;
     if (reward > 0) {
-      await addCoins(top3[i].userId, reward);
+      await addCoins(top3[i].userId, reward, { type: 'top3', note: `rank ${i + 1}, ${top3[i].points} pts` });
     }
     results.push({ userId: top3[i].userId, points: top3[i].points, reward, rank: i + 1 });
   }
@@ -616,6 +694,9 @@ export async function getLeaderboard(type: 'coins' | 'groqcoins', limit = 10): P
 // ── Admin utilities ───────────────────────────────────────────────────────────
 
 export async function resetWallet(userId: string): Promise<void> {
+  const prior = await getWallet(userId);
+  if (prior.coins) await logTransaction(userId, { currency: 'coins', amount: -prior.coins, balanceAfter: 0, type: 'admin_reset' });
+  if (prior.groqCoins) await logTransaction(userId, { currency: 'groqCoins', amount: -prior.groqCoins, balanceAfter: 0, type: 'admin_reset' });
   await wallets.set(userId, { ...EMPTY_WALLET, createdAt: Date.now() });
 }
 
