@@ -17,26 +17,20 @@
  *   double     — 1 lion + 1 tiger
  *   triple     — 2 tiger
  *   big        — 1 lion + 2 tiger
- *   mega       — 2 lion + 1 tiger   (pays a bounded SHARE of the jackpot pool)
- *   superMega  — 3 lion             (pays the ENTIRE jackpot pool)
- *
- * The jackpot pool is only ever funded by a small cut of bets, and the
- * mega-tier payout takes a bounded share (not a fixed jump), so the house
- * is never on the hook for more than what's actually in the pool.
- *
- * Re-run the Monte Carlo sim (tune2.mjs) whenever SYMBOL_WEIGHTS, the
- * StakeProfile chances, or the JACKPOT_* constants change.
+ *   mega       — 2 lion + 1 tiger   (pays stake multiplier 10-12 based on pool/profits)
+ *   superMega  — 3 lion             (pays stake multiplier 16-18 based on pool/profits)
  */
 
 import { createStore } from './pluginStore.js';
 
-const store      = createStore('slotmachine');
-const jackpotTbl = store.table('jackpot'); // single key 'pool' -> number
+const store          = createStore('slotmachine');
+const jackpotTbl     = store.table('jackpot'); // single key 'pool' -> number
+const playerStatsTbl = store.table('playerStats'); // tracks individual player spins
+const houseStatsTbl  = store.table('houseStats'); // tracks daily bets/wins for profit calculation
 
 const JACKPOT_SEED               = 500;   // pool never drops below this
 const JACKPOT_CONTRIBUTION_RATE  = 0.05;  // 5% of every gambling bet feeds the pool
-const JACKPOT_MEGA_SHARE         = 0.25;  // mega tier (2 lion + 1 tiger) wins 25% of the current pool
-const JACKPOT_MEGA_FLOOR         = 100;   // ...but never less than this many coins
+
 
 export async function getJackpotPool(): Promise<number> {
   const val = await jackpotTbl.get('pool');
@@ -52,20 +46,46 @@ export async function contributeToJackpot(bet: number): Promise<number> {
   return newPool;
 }
 
-/** Mega tier win (2 lion + 1 tiger): takes a bounded slice of the pool, pool keeps the rest. */
-export async function awardJackpotShare(): Promise<number> {
+/** Deducts a high-tier payout from the jackpot pool, respecting the floor seed. */
+export async function deductFromJackpot(amount: number): Promise<number> {
   const pool = await getJackpotPool();
-  const amount = Math.max(JACKPOT_MEGA_FLOOR, Math.round(pool * JACKPOT_MEGA_SHARE));
   const newPool = Math.max(JACKPOT_SEED, pool - amount);
   await jackpotTbl.set('pool', newPool);
-  return Math.min(amount, pool); // never pay out more than the pool actually had
+  return newPool;
 }
 
-/** Super mega tier win (3 lion): takes the ENTIRE pool, which resets back to the seed. */
-export async function awardFullJackpot(): Promise<number> {
-  const pool = await getJackpotPool();
-  await jackpotTbl.set('pool', JACKPOT_SEED);
-  return pool;
+/** Track how many spins a user has made to calculate their grace period */
+export async function incrementAndGetSpins(userId: string): Promise<number> {
+  const current = (await playerStatsTbl.get(userId)) || 0;
+  const updated = (current as number) + 1;
+  await playerStatsTbl.set(userId, updated);
+  return updated;
+}
+
+
+/** Retrieves today's net profit (bets - payouts) */
+export async function getTodayProfit(): Promise<number> {
+  const todayStr = new Date().toISOString().split('T')[0];
+  const betKey = `${todayStr}_bet`;
+  const wonKey = `${todayStr}_won`;
+
+  const todayBet = ((await houseStatsTbl.get(betKey)) as number) || 0;
+  const todayWon = ((await houseStatsTbl.get(wonKey)) as number) || 0;
+
+  return todayBet - todayWon;
+}
+
+/** Records house activity for a specific spin or game */
+export async function recordHouseActivity(bet: number, payout: number): Promise<void> {
+  const todayStr = new Date().toISOString().split('T')[0];
+  const betKey = `${todayStr}_bet`;
+  const wonKey = `${todayStr}_won`;
+
+  const currentBet = ((await houseStatsTbl.get(betKey)) as number) || 0;
+  const currentWon = ((await houseStatsTbl.get(wonKey)) as number) || 0;
+
+  await houseStatsTbl.set(betKey, currentBet + bet);
+  await houseStatsTbl.set(wonKey, currentWon + payout);
 }
 
 // ── Weighted payout engine for Jungle Hunt ───────────────────────────────────
@@ -88,15 +108,20 @@ export interface SpinOutcome {
   label: string;
 }
 
+
 /**
  * Calculates win probabilities based on stake size and historical games.
- * @param stake The amount wagered.
- * @param spinsPlayed Used to determine if the user is a "newbie". Defaults to 100 (normal odds).
+ * Allowed stakes (5, 20, 50, 100) are mapped smoothly onto a 0.2 to 1.0 risk profile.
  */
 export function getStakeProfile(stake: number, spinsPlayed: number = 100): StakeProfile {
-  const normalized = Math.min(1, Math.max(0.2, stake / 1000));
-  
-  // Base probabilities
+  const minBet = 5;
+  const maxBet = 100;
+
+  const clampedStake = Math.max(minBet, Math.min(maxBet, stake));
+  // Maps 5 -> 0.2 (low-stake retention heaven) and 100 -> 1.0 (strict house-defending risk)
+  const normalized = 0.2 + 0.8 * ((clampedStake - minBet) / (maxBet - minBet));
+
+  // Base probabilities scale dynamically against the normalized value
   let bigWinChance = Math.max(0.012, 0.03 - 0.018 * normalized);
   let megaWinChance = Math.max(0.003, 0.008 - 0.005 * normalized);
   let superMegaWinChance = Math.max(0.0006, 0.002 - 0.0014 * normalized);
@@ -107,15 +132,12 @@ export function getStakeProfile(stake: number, spinsPlayed: number = 100): Stake
   let tripleChance = Math.max(0.03, 0.07 - 0.04 * normalized);
 
   // --- BEGINNER GRACE PERIOD (Soft Landing & High-Tier Hooking) ---
-  // Tapers off smoothly over the first 25 spins.
-  // 0 spins = 1.0 (max boost), 25+ spins = 0.0 (normal house odds).
   const gracePhase = Math.max(0, 1 - (spinsPlayed / 25));
 
   if (gracePhase > 0) {
-    // 1. HIGH TIER ACCESSIBILITY (Big / Mega / Super Mega)
-    // We only boost high-tier outcomes if their stake is low to prevent house exploits.
-    // At stake >= 20, the boost is exactly 0. Under 20, it scales up smoothly.
-    const lowStakeFactor = Math.max(0, 1 - (stake / 20));
+    // 1. HIGH TIER ACCESSIBILITY (The Bait)
+    // Only boost low stakes (threshold is strictly under 20)
+    const lowStakeFactor = Math.max(0, 1 - ((clampedStake - 5) / 15));
     const newbieHighTierBoost = gracePhase * lowStakeFactor;
 
     if (newbieHighTierBoost > 0) {
@@ -123,43 +145,37 @@ export function getStakeProfile(stake: number, spinsPlayed: number = 100): Stake
       const baseMega = megaWinChance;
       const baseSuper = superMegaWinChance;
 
-      // Multiply the chances safely based on the newbie/stake matrix
-      bigWinChance       *= (1 + 1.8 * newbieHighTierBoost); // Up to +180% (2.8x base chance)
-      megaWinChance      *= (1 + 2.5 * newbieHighTierBoost); // Up to +250% (3.5x base chance)
-      superMegaWinChance *= (1 + 3.0 * newbieHighTierBoost); // Up to +300% (4.0x base chance)
+      bigWinChance       *= (1 + 1.8 * newbieHighTierBoost);
+      megaWinChance      *= (1 + 2.5 * newbieHighTierBoost);
+      superMegaWinChance *= (1 + 3.0 * newbieHighTierBoost);
 
-      // Calculate total extra chance given to these high tiers
       const totalAddedHighTier = (bigWinChance - baseBig) + (megaWinChance - baseMega) + (superMegaWinChance - baseSuper);
-      
-      // Subtract it directly from the lose chance to maintain exact mathematical coherence
       loseChance = Math.max(0.20, loseChance - totalAddedHighTier);
     }
 
-    // 2. SOFT LANDING COMPENSATION (Recoveries & Minor wins)
-    // Reduce the remaining lose chance by up to another 30% for general feel-good vibes.
+    // 2. SOFT LANDING COMPENSATION (Retention)
     const loseReduction = loseChance * 0.3 * gracePhase;
     loseChance -= loseReduction;
 
-    // Distribute this remainder into standard recoveries and doubles
-    recover70Chance += loseReduction * 0.4; // 40% of standard recovery
-    doubleChance    += loseReduction * 0.3; // 30% of double
-    tripleChance    += loseReduction * 0.3; // 30% of triple
+    recover70Chance += loseReduction * 0.4;
+    doubleChance    += loseReduction * 0.3;
+    tripleChance    += loseReduction * 0.3;
   }
 
   return {
-    stake,
-    bigWinChance,
-    megaWinChance,
-    superMegaWinChance,
-    loseChance,
-    recover30Chance,
-    recover70Chance,
-    doubleChance,
-    tripleChance,
+    stake, bigWinChance, megaWinChance, superMegaWinChance,
+    loseChance, recover30Chance, recover70Chance, doubleChance, tripleChance,
   };
 }
 
-export function resolveSpinOutcome(stake: number, economyPressure = 1, spinsPlayed = 100): SpinOutcome {
+
+export function resolveSpinOutcome(
+  stake: number, 
+  economyPressure = 1, 
+  spinsPlayed = 100,
+  todayProfit = 0,
+  pool = 500
+): SpinOutcome {
   const profile = getStakeProfile(stake, spinsPlayed);
   const pressureFactor = Math.max(0.8, Math.min(1.2, economyPressure));
 
@@ -182,35 +198,55 @@ export function resolveSpinOutcome(stake: number, economyPressure = 1, spinsPlay
   for (const entry of normalized) {
     cumulative += entry.weight;
     if (roll <= cumulative) {
-      const tierMap: Record<SpinOutcome['tier'], number> = {
-        lose: 0,
-        recover30: 0.3,
-        recover70: 0.7,
-        double: 2,
-        triple: 3,
-        big: 5,
-        mega: 8,
-        superMega: 15,
-      };
+
+      // Calculate dynamic profit metrics on the fly to protect house balance
+      let healthScore = 0.5; // neutral starting state
+
+      if (todayProfit > 0) healthScore += 0.25; // house is in profit today
+      else if (todayProfit < 0) healthScore -= 0.25; // house is down today
+
+      if (pool > 2000) healthScore += 0.25; // robust reserve
+      else if (pool < 800) healthScore -= 0.25; // critical reserve level
+
+      healthScore = Math.max(0, Math.min(1, healthScore));
+
+      let resolvedMultiplier = 0;
+
+      // Handle default low-tier multipliers
+      if (entry.tier === 'lose') resolvedMultiplier = 0;
+      else if (entry.tier === 'recover30') resolvedMultiplier = 0.3;
+      else if (entry.tier === 'recover70') resolvedMultiplier = 0.7;
+      else if (entry.tier === 'double') resolvedMultiplier = 2;
+      else if (entry.tier === 'triple') resolvedMultiplier = 3;
+
+      // Dynamic High-Tiers: Higher house health increases odds of top-tier multipliers
+      else if (entry.tier === 'big') {
+        if (healthScore > 0.7) resolvedMultiplier = 6;
+        else if (healthScore < 0.3) resolvedMultiplier = 4;
+        else resolvedMultiplier = [4, 5, 6][Math.floor(Math.random() * 3)];
+      } 
+      else if (entry.tier === 'mega') {
+        if (healthScore > 0.7) resolvedMultiplier = 12;
+        else if (healthScore < 0.3) resolvedMultiplier = 10;
+        else resolvedMultiplier = [10, 11, 12][Math.floor(Math.random() * 3)];
+      } 
+      else if (entry.tier === 'superMega') {
+        if (healthScore > 0.7) resolvedMultiplier = 18;
+        else if (healthScore < 0.3) resolvedMultiplier = 16;
+        else resolvedMultiplier = [16, 17, 18][Math.floor(Math.random() * 3)];
+      }
 
       return {
         tier: entry.tier,
-        multiplier: tierMap[entry.tier],
-        label: entry.tier === 'lose'
-          ? 'No win'
-          : entry.tier === 'recover30'
-            ? 'Recovery'
-            : entry.tier === 'recover70'
-              ? 'Recovery'
-              : entry.tier === 'double'
-                ? 'Double'
-                : entry.tier === 'triple'
-                  ? 'Triple'
-                  : entry.tier === 'big'
-                    ? 'Big win'
-                    : entry.tier === 'mega'
-                      ? 'Mega win'
-                      : 'Super mega win',
+        multiplier: resolvedMultiplier,
+        label: entry.tier === 'lose' ? 'No win'
+          : entry.tier === 'recover30' ? 'Recovery'
+          : entry.tier === 'recover70' ? 'Recovery'
+          : entry.tier === 'double' ? 'Double'
+          : entry.tier === 'triple' ? 'Triple'
+          : entry.tier === 'big' ? 'Big win'
+          : entry.tier === 'mega' ? 'Mega win'
+          : 'Super mega win',
       };
     }
   }
@@ -218,17 +254,18 @@ export function resolveSpinOutcome(stake: number, economyPressure = 1, spinsPlay
   return { tier: 'lose', multiplier: 0, label: 'No win' };
 }
 
+
 export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spinsPlayed = 100) {
   const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
-  const baseChance = Math.max(0.34, 0.48 - (stake > 100 ? 0.02 : 0));
-  
-  // Apply beginner grace period: up to +20% flat win probability for new users on low bets
+  const riskFactor = (Math.max(5, Math.min(100, stake)) - 5) / 95; 
+  const baseChance = Math.max(0.34, 0.48 - (riskFactor * 0.10));
+
   const gracePhase = Math.max(0, 1 - (spinsPlayed / 25));
-  const lowStakeFactor = Math.max(0, 1 - (stake / 20)); // Adjusted threshold to 20
+  const lowStakeFactor = Math.max(0, 1 - ((Math.max(5, stake) - 5) / 15));
   const beginnerBoost = 0.20 * gracePhase * lowStakeFactor; 
 
   const winChance = Math.min(0.85, Math.max(0.28, baseChance / pressureFactor) + beginnerBoost);
-  
+
   return Math.random() <= winChance
     ? { multiplier: 2, label: 'You won', win: true }
     : { multiplier: 0, label: 'You lost', win: false };
@@ -236,15 +273,15 @@ export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spins
 
 export function resolveDiceOutcome(stake: number, economyPressure = 1, spinsPlayed = 100) {
   const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
-  const baseWinChance = Math.max(0.28, 0.42 - (stake > 100 ? 0.015 : 0));
-  
-  // Apply beginner grace period: up to +18% flat win probability for new users on low bets
+  const riskFactor = (Math.max(5, Math.min(100, stake)) - 5) / 95;
+  const baseWinChance = Math.max(0.28, 0.42 - (riskFactor * 0.10));
+
   const gracePhase = Math.max(0, 1 - (spinsPlayed / 25));
-  const lowStakeFactor = Math.max(0, 1 - (stake / 20)); // Adjusted threshold to 20
+  const lowStakeFactor = Math.max(0, 1 - ((Math.max(5, stake) - 5) / 15));
   const beginnerBoost = 0.18 * gracePhase * lowStakeFactor;
 
   const winChance = Math.min(0.75, Math.max(0.2, baseWinChance / pressureFactor) + beginnerBoost);
-  const tieChance = Math.max(0.08, Math.min(0.2, 0.16 / pressureFactor)); // Tie chance unaffected
+  const tieChance = Math.max(0.08, Math.min(0.2, 0.16 / pressureFactor)); 
 
   const roll = Math.random();
   if (roll <= tieChance) {
@@ -280,7 +317,6 @@ function rollSymbol(): string {
   return SYMBOL_WEIGHTS[0].symbol;
 }
 
-/** A filler animal that's never lion or tiger — used to pad tier paylines and non-payline rows. */
 function rollFillerSymbol(): string {
   let symbol = rollSymbol();
   while (symbol === LION || symbol === TIGER) symbol = rollSymbol();
@@ -289,7 +325,7 @@ function rollFillerSymbol(): string {
 
 const ROWS = 3;
 const COLS = 4;
-export const PAYLINE_INDEX = 1; // middle row, 0-indexed
+export const PAYLINE_INDEX = 1; 
 
 export function spinGrid(): string[][] {
   const grid: string[][] = [];
@@ -301,12 +337,6 @@ export function spinGrid(): string[][] {
   return grid;
 }
 
-/**
- * Fixed lion/tiger prefix for each tier's payline, left to right. Columns
- * beyond the prefix are filled with a random non-special animal. Because
- * fillers can never roll lion or tiger, every tier's signature is exact —
- * no tier can ever accidentally display another tier's pattern.
- */
 const TIER_PAYLINE: Record<SpinOutcome['tier'], string[]> = {
   lose:      [],
   recover30: [TIGER],
@@ -318,11 +348,6 @@ const TIER_PAYLINE: Record<SpinOutcome['tier'], string[]> = {
   superMega: [LION, LION, LION],
 };
 
-/**
- * Tier-aware grid: resolveSpinOutcome() is the single source of truth for
- * whether the player wins, so the grid is generated to match it rather than
- * decide it independently. The other two rows are pure decoration.
- */
 export function spinGridForTier(tier: SpinOutcome['tier']): string[][] {
   const grid = spinGrid();
   const payline = grid[PAYLINE_INDEX];
@@ -335,7 +360,6 @@ export function spinGridForTier(tier: SpinOutcome['tier']): string[][] {
   return grid;
 }
 
-/** Scores a row: how many symbols match consecutively from the left. */
 export function scorePayline(row: string[]): { symbol: string; count: number } {
   const target = row[0];
   let count = 0;
@@ -346,8 +370,6 @@ export function scorePayline(row: string[]): { symbol: string; count: number } {
   return { symbol: target, count };
 }
 
-// Multiplier paytable for same-symbol paylines (currently unused by payout —
-// payout is fully tier-driven — kept for a possible future non-tier win path).
 const PAYTABLE: Record<string, { 3?: number; 4?: number }> = {
   '🐍':  { 3: 2.5, 4: 5 },
   '🦏':  { 3: 4,   4: 8 },
@@ -363,7 +385,6 @@ export function getMultiplier(symbol: string, count: number): number {
   return entry?.[count] || 0;
 }
 
-/** Renders the grid as a text block, with the payline row visually marked. */
 export function renderGrid(grid: string[][]): string {
   return grid
     .map((row, i) => {
