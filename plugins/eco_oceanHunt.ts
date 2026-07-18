@@ -10,7 +10,7 @@ import { deductCoins, addCoins, getWallet, withEconomyGuard, formatNumber } from
 import {
   spinGridForTier, renderGrid,
   contributeToJackpot, getJackpotPool, resolveSpinOutcome,
-  awardJackpotShare, awardFullJackpot
+  incrementAndGetSpins, getTodayProfit, recordHouseActivity, deductFromJackpot
 } from '../lib/oceanSlotMachine.js';
 import { cleanJid } from '../lib/isOwner.js';
 
@@ -20,7 +20,7 @@ export const category = 'economy-games';
 export const cooldown = 3000;
 
 // Supported wager sizes matching your calibrated system
-const ALLOWED_BETS = [5, 10, 20, 50, 100];
+const ALLOWED_BETS = [5, 20, 50, 100];
 
 const SPIN_FRAMES = ['🌊░░░░', '🌊🌊░░░', '🌊🌊🌊░░', '🌊🌊🌊🌊░', '🌊🌊🌊🌊🌊'];
 const SPIN_FRAME_DELAY_MS = 550;
@@ -46,7 +46,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
         `Usage: *.ocean <bet>*\n` +
         `Allowed bets: ${ALLOWED_BETS.map(b => `*${b}*`).join(', ')} coins\n\n` +
         `👑 Ocean Jackpot: *${formatNumber(pool)} coins* 👑\n` +
-        `_Land 🐋🐋🦈 for a slice, 🐋🐋🐋 takes the WHOLE ocean jackpot!_`,
+        `_Land 🐋🐋🦈 for a Mega catch, 🐋🐋🐋 for a Super Mega payout!_`,
       ...channelInfo
     }, { quoted: message });
   }
@@ -57,14 +57,17 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     return sock.sendMessage(chatId, { text: "❌ You don't have enough coins in your wallet.", ...channelInfo }, { quoted: message });
   }
 
+  // Increment player's spin count
+  const spinsPlayed = await incrementAndGetSpins(userId);
   // Grow the dedicated ocean jackpot
   await contributeToJackpot(bet);
 
   const newPool = await getJackpotPool();
+  const todayProfit = await getTodayProfit();
   const economyPressure = Math.max(0.8, Math.min(1.2, 1 + (newPool - 500) / 10000));
   
-  // Resolve outcome. (Optional: You can fetch 'spinsPlayed' from user profile DB if tracked, or leave standard)
-  const outcome = resolveSpinOutcome(bet, economyPressure);
+  // Resolve outcome based on dynamic tracking
+  const outcome = resolveSpinOutcome(bet, economyPressure, spinsPlayed, todayProfit, newPool);
   const grid = spinGridForTier(outcome.tier);
 
   // Send initial spinning animation frame
@@ -84,31 +87,35 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   }
   await delay(SPIN_FRAME_DELAY_MS);
 
+  await delay(SPIN_FRAME_DELAY_MS);
+
   let winText = '';
   let banner = '';
+  const totalWin = Math.round(bet * outcome.multiplier);
 
   if (outcome.tier === 'lose') {
     winText = `\n\n😬 Splashed! No luck on this dive. Better luck next time!`;
   } else if (outcome.tier === 'mega') {
-    const totalWin = await awardJackpotShare();
     await addCoins(userId, totalWin, { type: 'slots' });
+    await deductFromJackpot(totalWin);
     banner = WIN_BANNERS.mega;
-    winText = `\n\n🐋🐋🦈 *MEGA CATCH!* You caught a slice of the ocean jackpot: *${formatNumber(totalWin)} coins*!`;
+    winText = `\n\n🐋🐋🦈 *MEGA CATCH!* You got a *${outcome.multiplier}x* multiplier! Reeled in *${formatNumber(totalWin)} coins*!`;
   } else if (outcome.tier === 'superMega') {
-    const totalWin = await awardFullJackpot();
     await addCoins(userId, totalWin, { type: 'slots' });
+    await deductFromJackpot(totalWin);
     banner = WIN_BANNERS.superMega;
-    winText = `\n\n🐋🐋🐋 *GREAT WHITE WHALE!!* You captured the entire ocean jackpot: *${formatNumber(totalWin)} coins*!`;
+    winText = `\n\n🐋🐋🐋 *GREAT WHITE WHALE!!* Epic *${outcome.multiplier}x* jackpot hit! Reeled in *${formatNumber(totalWin)} coins*!`;
   } else if (outcome.tier === 'big') {
-    const totalWin = Math.round(bet * outcome.multiplier);
     await addCoins(userId, totalWin, { type: 'slots' });
     banner = WIN_BANNERS.big;
     winText = `\n\n🎉 *${outcome.label}!* Reeled in *${formatNumber(totalWin)} coins* (${outcome.multiplier}x your bet)!`;
   } else {
-    const totalWin = Math.round(bet * outcome.multiplier);
     await addCoins(userId, totalWin, { type: 'slots' });
     winText = `\n\n🎉 *${outcome.label}!* Reeled in *${formatNumber(totalWin)} coins* (${outcome.multiplier}x your bet)!`;
   }
+
+  // Log today's results to the daily profit table
+  await recordHouseActivity(bet, totalWin);
 
   const wallet = await getWallet(userId);
 
