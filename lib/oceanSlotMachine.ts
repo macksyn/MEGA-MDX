@@ -63,6 +63,79 @@ export async function incrementAndGetSpins(userId: string): Promise<number> {
   return updated;
 }
 
+/** Track consecutive losses for the pity timer */
+export async function getConsecutiveLosses(userId: string): Promise<number> {
+  return ((await playerStatsTbl.get(`${userId}_streak`)) as number) || 0;
+}
+
+export async function incrementConsecutiveLosses(userId: string): Promise<number> {
+  const current = await getConsecutiveLosses(userId);
+  const updated = current + 1;
+  await playerStatsTbl.set(`${userId}_streak`, updated);
+  return updated;
+}
+
+export async function resetConsecutiveLosses(userId: string): Promise<void> {
+  await playerStatsTbl.set(`${userId}_streak`, 0);
+}
+
+/** Track consecutive wins to potentially detect hot streaks or limit payouts */
+export async function getConsecutiveWins(userId: string): Promise<number> {
+  return ((await playerStatsTbl.get(`${userId}_winStreak`)) as number) || 0;
+}
+
+export async function incrementConsecutiveWins(userId: string): Promise<number> {
+  const current = await getConsecutiveWins(userId);
+  const updated = current + 1;
+  await playerStatsTbl.set(`${userId}_winStreak`, updated);
+  return updated;
+}
+
+export async function resetConsecutiveWins(userId: string): Promise<void> {
+  await playerStatsTbl.set(`${userId}_winStreak`, 0);
+}
+
+/** Record lifetime betting and payout totals for a specific player */
+export async function recordPlayerActivity(userId: string, bet: number, payout: number): Promise<void> {
+  const currentBet = ((await playerStatsTbl.get(`${userId}_totalBet`)) as number) || 0;
+  const currentWon = ((await playerStatsTbl.get(`${userId}_totalWon`)) as number) || 0;
+
+  await playerStatsTbl.set(`${userId}_totalBet`, currentBet + bet);
+  await playerStatsTbl.set(`${userId}_totalWon`, currentWon + payout);
+}
+
+/** Record the exact timestamp of a player's last major jackpot/super-mega win */
+export async function recordPlayerJackpot(userId: string): Promise<void> {
+  await playerStatsTbl.set(`${userId}_lastJackpot`, new Date().toISOString());
+}
+
+/** 
+ * Compiles a full player profile including calculated metrics like RTP 
+ * (Return To Player) and Average Stake.
+ */
+export async function getPlayerProfile(userId: string) {
+  const spins = ((await playerStatsTbl.get(userId)) as number) || 0;
+  const totalBet = ((await playerStatsTbl.get(`${userId}_totalBet`)) as number) || 0;
+  const totalWon = ((await playerStatsTbl.get(`${userId}_totalWon`)) as number) || 0;
+  const lastJackpot = ((await playerStatsTbl.get(`${userId}_lastJackpot`)) as string) || null;
+  const winStreak = await getConsecutiveWins(userId);
+  const lossStreak = await getConsecutiveLosses(userId);
+
+  const rtp = totalBet > 0 ? (totalWon / totalBet) : 0;
+  const averageStake = spins > 0 ? (totalBet / spins) : 0;
+
+  return {
+    spins,
+    totalBet,
+    totalWon,
+    rtp,
+    averageStake,
+    lastJackpot,
+    winStreak,
+    lossStreak
+  };
+}
+
 /** Retrieves today's net profit (bets - payouts) */
 export async function getTodayProfit(): Promise<number> {
   const todayStr = new Date().toISOString().split('T')[0];
@@ -88,6 +161,38 @@ export async function recordHouseActivity(bet: number, payout: number): Promise<
   await houseStatsTbl.set(wonKey, currentWon + payout);
 }
 
+/**
+ * Calculates a dynamic economy pressure multiplier based on house profits and jackpot reserves.
+ * Plugin wrappers should call this and pass the result to the game resolvers.
+ * < 1.0 = Loose/Generous (House is rich, give back to players)
+ * > 1.0 = Tight/Strict (House is losing money, protect the bank)
+ */
+export async function getEconomyPressure(): Promise<number> {
+  let pressure = 1.0;
+
+  // 1. House Profit Factor
+  const todayProfit = await getTodayProfit();
+  
+  // If house is in profit, loosen the economy. If in loss, tighten it.
+  if (todayProfit > 0) {
+    pressure -= Math.min(0.15, (todayProfit / 1000) * 0.02);
+  } else {
+    pressure += Math.min(0.20, (Math.abs(todayProfit) / 1000) * 0.05);
+  }
+
+  // 2. Jackpot Pool Factor
+  const pool = await getJackpotPool();
+  const poolBaseline = 1500;
+  
+  if (pool > poolBaseline) {
+    pressure -= Math.min(0.1, ((pool - poolBaseline) / 1000) * 0.02);
+  } else {
+    pressure += Math.min(0.1, ((poolBaseline - pool) / 1000) * 0.04);
+  }
+
+  return Math.max(0.75, Math.min(1.25, pressure));
+}
+
 // ── Weighted payout engine for Ocean Hunt ───────────────────────────────────
 
 export interface StakeProfile {
@@ -111,7 +216,7 @@ export interface SpinOutcome {
 /**
  * Calculates win probabilities based on stake size and historical games.
  */
-export function getStakeProfile(stake: number, spinsPlayed: number = 100): StakeProfile {
+export function getStakeProfile(stake: number, spinsPlayed: number = 100, consecutiveLosses: number = 0): StakeProfile {
   const minBet = 5;
   const maxBet = 100;
   
@@ -160,6 +265,21 @@ export function getStakeProfile(stake: number, spinsPlayed: number = 100): Stake
     tripleChance    += loseReduction * 0.3;
   }
 
+  // --- DRY STREAK BREAKER (Pity Timer) ---
+  // Secretly improves odds after 5 consecutive losses to prevent player churn
+  if (consecutiveLosses >= 5) {
+    // Caps out at 14 consecutive losses (max multiplier 10)
+    const streakFactor = Math.min(10, consecutiveLosses - 4); 
+    // Reduces the chance to lose by up to 40% based on the streak severity
+    const lossReduction = loseChance * (0.04 * streakFactor); 
+
+    loseChance -= lossReduction;
+    // Distribute the improved odds heavily towards a satisfying recovery and exciting wins
+    recover70Chance += lossReduction * 0.50; 
+    doubleChance    += lossReduction * 0.30; 
+    bigWinChance    += lossReduction * 0.20; 
+  }
+
   return {
     stake, bigWinChance, megaWinChance, superMegaWinChance,
     loseChance, recover30Chance, recover70Chance, doubleChance, tripleChance,
@@ -171,9 +291,10 @@ export function resolveSpinOutcome(
   economyPressure = 1, 
   spinsPlayed = 100,
   todayProfit = 0,
-  pool = 500
+  pool = 500,
+  consecutiveLosses = 0
 ): SpinOutcome {
-  const profile = getStakeProfile(stake, spinsPlayed);
+  const profile = getStakeProfile(stake, spinsPlayed, consecutiveLosses);
   const pressureFactor = Math.max(0.8, Math.min(1.2, economyPressure));
 
   const weights = [
@@ -211,8 +332,9 @@ export function resolveSpinOutcome(
 
       // Handle default low-tier multipliers
       if (entry.tier === 'lose') resolvedMultiplier = 0;
-      else if (entry.tier === 'recover30') resolvedMultiplier = 0.3;
-      else if (entry.tier === 'recover70') resolvedMultiplier = 0.7;
+      // Randomize recovery values to prevent predictability 
+      else if (entry.tier === 'recover30') resolvedMultiplier = [0.2, 0.3, 0.4][Math.floor(Math.random() * 3)];
+      else if (entry.tier === 'recover70') resolvedMultiplier = [0.6, 0.7, 0.8][Math.floor(Math.random() * 3)];
       else if (entry.tier === 'double') resolvedMultiplier = 2;
       else if (entry.tier === 'triple') resolvedMultiplier = 3;
       
@@ -251,7 +373,7 @@ export function resolveSpinOutcome(
   return { tier: 'lose', multiplier: 0, label: 'No win' };
 }
 
-export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spinsPlayed = 100) {
+export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spinsPlayed = 100, consecutiveLosses = 0) {
   const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
   const riskFactor = (Math.max(5, Math.min(100, stake)) - 5) / 95; 
   const baseChance = Math.max(0.34, 0.48 - (riskFactor * 0.10));
@@ -260,14 +382,17 @@ export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spins
   const lowStakeFactor = Math.max(0, 1 - ((Math.max(5, stake) - 5) / 15));
   const beginnerBoost = 0.20 * gracePhase * lowStakeFactor; 
 
-  const winChance = Math.min(0.85, Math.max(0.28, baseChance / pressureFactor) + beginnerBoost);
+  // Dry streak breaker: up to 25% extra win chance after severe losing streaks
+  const pityBoost = consecutiveLosses >= 4 ? Math.min(0.25, (consecutiveLosses - 3) * 0.05) : 0;
+
+  const winChance = Math.min(0.85, Math.max(0.28, baseChance / pressureFactor) + beginnerBoost + pityBoost);
   
   return Math.random() <= winChance
     ? { multiplier: 2, label: 'You won', win: true }
     : { multiplier: 0, label: 'You lost', win: false };
 }
 
-export function resolveDiceOutcome(stake: number, economyPressure = 1, spinsPlayed = 100) {
+export function resolveDiceOutcome(stake: number, economyPressure = 1, spinsPlayed = 100, consecutiveLosses = 0) {
   const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
   const riskFactor = (Math.max(5, Math.min(100, stake)) - 5) / 95;
   const baseWinChance = Math.max(0.28, 0.42 - (riskFactor * 0.10));
@@ -276,7 +401,10 @@ export function resolveDiceOutcome(stake: number, economyPressure = 1, spinsPlay
   const lowStakeFactor = Math.max(0, 1 - ((Math.max(5, stake) - 5) / 15));
   const beginnerBoost = 0.18 * gracePhase * lowStakeFactor;
 
-  const winChance = Math.min(0.75, Math.max(0.2, baseWinChance / pressureFactor) + beginnerBoost);
+  // Dry streak breaker
+  const pityBoost = consecutiveLosses >= 4 ? Math.min(0.25, (consecutiveLosses - 3) * 0.05) : 0;
+
+  const winChance = Math.min(0.75, Math.max(0.2, baseWinChance / pressureFactor) + beginnerBoost + pityBoost);
   const tieChance = Math.max(0.08, Math.min(0.2, 0.16 / pressureFactor)); 
 
   const roll = Math.random();
