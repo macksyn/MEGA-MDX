@@ -14,7 +14,7 @@
  * Usage: .dice <amount>
  */
 import { deductCoins, addCoins, getWallet, formatNumber, withEconomyGuard } from '../lib/economy.js';
-import { contributeToJackpot, getJackpotPool, resolveDiceOutcome } from '../lib/slotMachine.js';
+import { contributeToJackpot, getJackpotPool, resolveDiceOutcome, settleWin, deductFromJackpot, getEconomyPressure } from '../lib/slotMachine.js';
 import { cleanJid } from '../lib/isOwner.js';
 
 export const command = 'dice';
@@ -48,11 +48,15 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     return sock.sendMessage(chatId, { text: "❌ You don't have that many coins.", ...channelInfo }, { quoted: message });
   }
 
+  // The full stake becomes real bank capital the instant it's wagered.
   await contributeToJackpot(amount);
 
   const pool = await getJackpotPool();
-  const economyPressure = Math.max(0.85, Math.min(1.15, 1 + (pool - 500) / 10000));
-  const outcome = resolveDiceOutcome(amount, economyPressure);
+  const economyPressure = await getEconomyPressure(pool);
+  // spinsPlayed/consecutiveLosses aren't tracked for dice yet, so beginner boost
+  // and the pity timer stay inert here for now — only pressure + the RTP ceiling
+  // are live. `pool` is what lets the ceiling detect a critical solvency state.
+  const outcome = resolveDiceOutcome(amount, economyPressure, 100, 0, pool);
 
   const sent = await sock.sendMessage(chatId, {
     text: `🎲 *DICE ROLL* 🎲\n\nRolling ${randomFace()} ${randomFace()} ...`,
@@ -65,17 +69,25 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   let finalBalance: number;
 
   if (outcome.tie) {
+    // Stake was already banked by contributeToJackpot() above — refunding it means
+    // pulling that same amount back out so the pool nets to zero for this spin.
     await addCoins(userId, amount, { type: 'dice', note: 'tie refund' });
+    await deductFromJackpot(amount);
     const wallet = await getWallet(userId);
     finalBalance = wallet.coins;
     resultText = `🤝 *Tie!* Your bet of *${formatNumber(amount)} coins* was refunded.`;
   } else if (outcome.win) {
-    const payout = Math.round(amount * outcome.multiplier);
-    await addCoins(userId, payout, { type: 'dice' });
+    const rawWin = Math.round(amount * outcome.multiplier);
+    const settled = settleWin(rawWin, pool);
+    await addCoins(userId, settled.payout, { type: 'dice' });
+    await deductFromJackpot(settled.payout); // Every payout is paid out of the real bank, never minted
     const wallet = await getWallet(userId);
     finalBalance = wallet.coins;
-    resultText = `🎉 *${outcome.label}!* Won *${formatNumber(payout)} coins* (${outcome.multiplier}x your bet)!`;
+    resultText = settled.capped
+      ? `🎉 *${outcome.label}!* The bank couldn't cover the full amount, so you won *${formatNumber(settled.payout)} coins* instead of the usual ${outcome.multiplier}x.`
+      : `🎉 *${outcome.label}!* Won *${formatNumber(settled.payout)} coins* (${outcome.multiplier}x your bet)!`;
   } else {
+    // Loss — the stake is already banked via contributeToJackpot() above.
     finalBalance = deducted.wallet.coins;
     resultText = `😬 *${outcome.label}.* You lost *${formatNumber(amount)} coins*. Better luck next time!`;
   }

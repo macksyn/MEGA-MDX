@@ -14,9 +14,9 @@ async function _handler(sock: any, message: any, _args: string[], context: any) 
   await sock.sendMessage(chatId, {
     text:
       `👑 *JUNGLE HUNT JACKPOT* 👑\n\n` +
-      `Current pool: *${formatNumber(pool)} coins*\n\n` +
-      `Play *!slots <5|20|50|100>* — land 🦁🦁🐯 (Mega) for a slice, or 🦁🦁🦁 (Super Mega) to take the WHOLE pool!\n` +
-      `_Every bet on !slots, !coinflip and !dice feeds this pool._`,
+      `Current bank: *${formatNumber(pool)} coins*\n\n` +
+      `Play *!slots <5|20|50|100>* — land 🦁🦁🐯 (Mega) or 🦁🦁🦁 (Super Mega) for the biggest payouts in the bank!\n` +
+      `_Every stake on !slots, !coinflip and !dice goes straight into this bank, and every payout is paid straight back out of it — it's the real house bankroll, not a bonus pot._`,
     ...channelInfo
   }, { quoted: message });
 }

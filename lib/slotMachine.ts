@@ -47,6 +47,26 @@ const houseStatsTbl  = store.table('houseStats'); // tracks daily bets/wins for 
 
 const JACKPOT_SEED = 500; // protected floor — the bank can never be paid down below this, by anything
 
+// ── RTP policy ───────────────────────────────────────────────────────────────
+// Every game resolver enforces these regardless of how many boosts (beginner
+// grace period, pity timer, house mood) are stacked at once:
+//   TARGET_RTP             — the design-center return the base odds aim for
+//                             over time. Not itself enforced as a clamp; it's
+//                             the reference point the base probabilities were
+//                             tuned against.
+//   HARD_CEILING_RTP       — the absolute max expected return any single spin
+//                             can carry under healthy solvency, however
+//                             generous the stacked boosts get. This is what
+//                             actually gets enforced.
+//   EMERGENCY_CEILING_RTP  — a tighter ceiling that automatically replaces the
+//                             hard ceiling the moment the bank enters a
+//                             critical solvency state, so a thin bankroll
+//                             recovers faster instead of getting boost-stacked
+//                             further down.
+export const TARGET_RTP            = 0.915;
+export const HARD_CEILING_RTP      = 0.93;
+export const EMERGENCY_CEILING_RTP = 0.90;
+
 export async function getJackpotPool(): Promise<number> {
   const val = await jackpotTbl.get('pool');
   return typeof val === 'number' ? val : JACKPOT_SEED;
@@ -329,6 +349,24 @@ export interface SpinOutcome {
   label: string;
 }
 
+// Average payout each tier represents, for RTP math (recover/big/mega/superMega
+// each roll a small random range at resolution time — these are that range's mean).
+const AVG_TIER_MULTIPLIER: Record<SpinOutcome['tier'], number> = {
+  lose: 0, recover30: 0.3, recover70: 0.7, double: 2, triple: 3, big: 5, mega: 11, superMega: 17,
+};
+
+// Risk-scaled design-center RTP: the baseline (no grace period, no pity timer,
+// neutral pressure) odds are tuned to land here — a bit more generous at the
+// lowest stake, a bit tighter at the highest, instead of the old baseline's
+// unexplained ~50%-to-96% swing across stakes.
+const MIN_STAKE_BASE_RTP = 0.93; // at stake 5  (normalized = 0.2)
+const MAX_STAKE_BASE_RTP = 0.90; // at stake 100 (normalized = 1.0)
+
+function targetBaseRTP(normalized: number): number {
+  const t = (normalized - 0.2) / 0.8; // 0 at the lowest stake, 1 at the highest
+  return MIN_STAKE_BASE_RTP + (MAX_STAKE_BASE_RTP - MIN_STAKE_BASE_RTP) * t;
+}
+
 /**
  * Calculates win probabilities based on stake size and historical games.
  * Allowed stakes (5, 20, 50, 100) are mapped smoothly onto a 0.2 to 1.0 risk profile.
@@ -350,6 +388,42 @@ export function getStakeProfile(stake: number, spinsPlayed: number = 100, consec
   let recover70Chance = Math.max(0.08, 0.14 - 0.06 * normalized);
   let doubleChance = Math.max(0.08, 0.12 - 0.04 * normalized);
   let tripleChance = Math.max(0.03, 0.07 - 0.04 * normalized);
+
+  // --- BASE RTP RECALIBRATION ---
+  // The raw curve above wasn't tuned to any RTP target and swings wildly by stake
+  // (was ~50% house edge at max stake, ~4-24% at min stake — no real reason for the
+  // gap). Scale the winning-tier chances so the neutral, unboosted RTP for THIS
+  // stake lands on the risk-scaled target, before grace period / pity timer boosts
+  // (which are intentional, temporary generosity) get layered on top of it.
+  {
+    const rawWinTotal = recover30Chance + recover70Chance + doubleChance + tripleChance + bigWinChance + megaWinChance + superMegaWinChance;
+    const rawWinRTP = (
+      recover30Chance * AVG_TIER_MULTIPLIER.recover30 +
+      recover70Chance * AVG_TIER_MULTIPLIER.recover70 +
+      doubleChance * AVG_TIER_MULTIPLIER.double +
+      tripleChance * AVG_TIER_MULTIPLIER.triple +
+      bigWinChance * AVG_TIER_MULTIPLIER.big +
+      megaWinChance * AVG_TIER_MULTIPLIER.mega +
+      superMegaWinChance * AVG_TIER_MULTIPLIER.superMega
+    ) / (rawWinTotal + loseChance);
+
+    const target = targetBaseRTP(normalized);
+    const scale = rawWinRTP > 0 ? target / rawWinRTP : 1;
+
+    recover30Chance *= scale;
+    recover70Chance *= scale;
+    doubleChance    *= scale;
+    tripleChance    *= scale;
+    bigWinChance    *= scale;
+    megaWinChance   *= scale;
+    superMegaWinChance *= scale;
+
+    // Whatever probability mass shifted moves out of (or back into) 'lose', so the
+    // relative shape between winning tiers is preserved — only the overall win/lose
+    // balance changes.
+    const newWinTotal = recover30Chance + recover70Chance + doubleChance + tripleChance + bigWinChance + megaWinChance + superMegaWinChance;
+    loseChance = Math.max(0.05, loseChance - (newWinTotal - rawWinTotal));
+  }
 
   // --- BEGINNER GRACE PERIOD (Soft Landing & High-Tier Hooking) ---
   const gracePhase = Math.max(0, 1 - (spinsPlayed / 25));
@@ -428,6 +502,27 @@ export function resolveSpinOutcome(
   const total = weights.reduce((sum, entry) => sum + entry.weight, 0);
   const normalized = weights.map(entry => ({ ...entry, weight: entry.weight / total }));
 
+  // Hard RTP ceiling: whatever the beginner grace period, pity timer, and pressure
+  // factor stacked up to, the expected payout of this spin can never cross the
+  // ceiling. Winning-tier weights are scaled down proportionally (preserving their
+  // relative shape) and the reclaimed probability mass is added back to 'lose' —
+  // rather than capping any single tier, which would distort the odds shape.
+  const expectedRTP = normalized.reduce((sum, entry) => sum + entry.weight * AVG_TIER_MULTIPLIER[entry.tier], 0);
+  const rtpCeiling = getSolvencyState(pool).level === 'critical' ? EMERGENCY_CEILING_RTP : HARD_CEILING_RTP;
+
+  if (expectedRTP > rtpCeiling) {
+    const scaleDown = rtpCeiling / expectedRTP;
+    const loseEntry = normalized.find(entry => entry.tier === 'lose')!;
+    let reclaimed = 0;
+    for (const entry of normalized) {
+      if (entry.tier === 'lose') continue;
+      const removed = entry.weight * (1 - scaleDown);
+      entry.weight -= removed;
+      reclaimed += removed;
+    }
+    loseEntry.weight += reclaimed;
+  }
+
   const roll = Math.random();
   let cumulative = 0;
   for (const entry of normalized) {
@@ -490,7 +585,7 @@ export function resolveSpinOutcome(
   return { tier: 'lose', multiplier: 0, label: 'No win' };
 }
 
-export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spinsPlayed = 100, consecutiveLosses = 0) {
+export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spinsPlayed = 100, consecutiveLosses = 0, pool = JACKPOT_SEED) {
   const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
   const riskFactor = (Math.max(5, Math.min(100, stake)) - 5) / 95; 
   const baseChance = Math.max(0.34, 0.48 - (riskFactor * 0.10));
@@ -502,14 +597,21 @@ export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spins
   // Dry streak breaker: up to 25% extra win chance after severe losing streaks
   const pityBoost = consecutiveLosses >= 4 ? Math.min(0.25, (consecutiveLosses - 3) * 0.05) : 0;
 
-  const winChance = Math.min(0.85, Math.max(0.28, baseChance / pressureFactor) + beginnerBoost + pityBoost);
+  let winChance = Math.min(0.85, Math.max(0.28, baseChance / pressureFactor) + beginnerBoost + pityBoost);
+
+  // Hard RTP ceiling: no matter how much beginner boost + pity + loose mood stack,
+  // the house can never be pushed past this expected payout ratio. Automatically
+  // tightens further if the bank is in a critical solvency state.
+  const COINFLIP_MULTIPLIER = 2;
+  const rtpCeiling = getSolvencyState(pool).level === 'critical' ? EMERGENCY_CEILING_RTP : HARD_CEILING_RTP;
+  winChance = Math.min(winChance, rtpCeiling / COINFLIP_MULTIPLIER);
 
   return Math.random() <= winChance
-    ? { multiplier: 2, label: 'You won', win: true }
+    ? { multiplier: COINFLIP_MULTIPLIER, label: 'You won', win: true }
     : { multiplier: 0, label: 'You lost', win: false };
 }
 
-export function resolveDiceOutcome(stake: number, economyPressure = 1, spinsPlayed = 100, consecutiveLosses = 0) {
+export function resolveDiceOutcome(stake: number, economyPressure = 1, spinsPlayed = 100, consecutiveLosses = 0, pool = JACKPOT_SEED) {
   const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
   const riskFactor = (Math.max(5, Math.min(100, stake)) - 5) / 95;
   const baseWinChance = Math.max(0.28, 0.42 - (riskFactor * 0.10));
@@ -521,8 +623,15 @@ export function resolveDiceOutcome(stake: number, economyPressure = 1, spinsPlay
   // Dry streak breaker
   const pityBoost = consecutiveLosses >= 4 ? Math.min(0.25, (consecutiveLosses - 3) * 0.05) : 0;
 
-  const winChance = Math.min(0.75, Math.max(0.2, baseWinChance / pressureFactor) + beginnerBoost + pityBoost);
+  let winChance = Math.min(0.75, Math.max(0.2, baseWinChance / pressureFactor) + beginnerBoost + pityBoost);
   const tieChance = Math.max(0.08, Math.min(0.2, 0.16 / pressureFactor)); 
+
+  // Hard RTP ceiling — same principle as coinflip, but the tie's 1x refund also
+  // counts toward RTP, so it has to be netted out before capping the win chance.
+  const DICE_WIN_MULTIPLIER = 1.9;
+  const rtpCeiling = getSolvencyState(pool).level === 'critical' ? EMERGENCY_CEILING_RTP : HARD_CEILING_RTP;
+  const maxWinChance = Math.max(0, (rtpCeiling - tieChance) / DICE_WIN_MULTIPLIER);
+  winChance = Math.min(winChance, maxWinChance);
 
   const roll = Math.random();
   if (roll <= tieChance) {
