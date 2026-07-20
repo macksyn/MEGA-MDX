@@ -141,10 +141,10 @@ export async function getTodayProfit(): Promise<number> {
   const todayStr = new Date().toISOString().split('T')[0];
   const betKey = `${todayStr}_ocean_bet`;
   const wonKey = `${todayStr}_ocean_won`;
-  
+
   const todayBet = ((await houseStatsTbl.get(betKey)) as number) || 0;
   const todayWon = ((await houseStatsTbl.get(wonKey)) as number) || 0;
-  
+
   return todayBet - todayWon;
 }
 
@@ -153,10 +153,10 @@ export async function recordHouseActivity(bet: number, payout: number): Promise<
   const todayStr = new Date().toISOString().split('T')[0];
   const betKey = `${todayStr}_ocean_bet`;
   const wonKey = `${todayStr}_ocean_won`;
-  
+
   const currentBet = ((await houseStatsTbl.get(betKey)) as number) || 0;
   const currentWon = ((await houseStatsTbl.get(wonKey)) as number) || 0;
-  
+
   await houseStatsTbl.set(betKey, currentBet + bet);
   await houseStatsTbl.set(wonKey, currentWon + payout);
 }
@@ -172,7 +172,7 @@ export async function getEconomyPressure(): Promise<number> {
 
   // 1. House Profit Factor
   const todayProfit = await getTodayProfit();
-  
+
   // If house is in profit, loosen the economy. If in loss, tighten it.
   if (todayProfit > 0) {
     pressure -= Math.min(0.15, (todayProfit / 1000) * 0.02);
@@ -183,7 +183,7 @@ export async function getEconomyPressure(): Promise<number> {
   // 2. Jackpot Pool Factor
   const pool = await getJackpotPool();
   const poolBaseline = 1500;
-  
+
   if (pool > poolBaseline) {
     pressure -= Math.min(0.1, ((pool - poolBaseline) / 1000) * 0.02);
   } else {
@@ -219,11 +219,11 @@ export interface SpinOutcome {
 export function getStakeProfile(stake: number, spinsPlayed: number = 100, consecutiveLosses: number = 0): StakeProfile {
   const minBet = 5;
   const maxBet = 100;
-  
+
   const clampedStake = Math.max(minBet, Math.min(maxBet, stake));
   // Maps 5 -> 0.2 (low-stake retention heaven) and 100 -> 1.0 (strict house-defending risk)
   const normalized = 0.2 + 0.8 * ((clampedStake - minBet) / (maxBet - minBet));
-  
+
   // Base probabilities scale dynamically against the normalized value
   let bigWinChance = Math.max(0.012, 0.03 - 0.018 * normalized);
   let megaWinChance = Math.max(0.003, 0.008 - 0.005 * normalized);
@@ -316,10 +316,10 @@ export function resolveSpinOutcome(
   for (const entry of normalized) {
     cumulative += entry.weight;
     if (roll <= cumulative) {
-      
+
       // Calculate dynamic profit metrics on the fly to protect house balance
       let healthScore = 0.5; // neutral starting state
-      
+
       if (todayProfit > 0) healthScore += 0.25; // house is in profit today
       else if (todayProfit < 0) healthScore -= 0.25; // house is down today
 
@@ -337,7 +337,7 @@ export function resolveSpinOutcome(
       else if (entry.tier === 'recover70') resolvedMultiplier = [0.6, 0.7, 0.8][Math.floor(Math.random() * 3)];
       else if (entry.tier === 'double') resolvedMultiplier = 2;
       else if (entry.tier === 'triple') resolvedMultiplier = 3;
-      
+
       // Dynamic High-Tiers: Higher house health increases odds of top-tier multipliers
       else if (entry.tier === 'big') {
         if (healthScore > 0.7) resolvedMultiplier = 6;
@@ -421,7 +421,7 @@ export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spins
   const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
   const riskFactor = (Math.max(5, Math.min(100, stake)) - 5) / 95; 
   const baseChance = Math.max(0.34, 0.48 - (riskFactor * 0.10));
-  
+
   const gracePhase = Math.max(0, 1 - (spinsPlayed / 25));
   const lowStakeFactor = Math.max(0, 1 - ((Math.max(5, stake) - 5) / 15));
   const beginnerBoost = 0.20 * gracePhase * lowStakeFactor; 
@@ -430,7 +430,7 @@ export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spins
   const pityBoost = consecutiveLosses >= 4 ? Math.min(0.25, (consecutiveLosses - 3) * 0.05) : 0;
 
   const winChance = Math.min(0.85, Math.max(0.28, baseChance / pressureFactor) + beginnerBoost + pityBoost);
-  
+
   return Math.random() <= winChance
     ? { multiplier: 2, label: 'You won', win: true }
     : { multiplier: 0, label: 'You lost', win: false };
@@ -440,7 +440,7 @@ export function resolveDiceOutcome(stake: number, economyPressure = 1, spinsPlay
   const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
   const riskFactor = (Math.max(5, Math.min(100, stake)) - 5) / 95;
   const baseWinChance = Math.max(0.28, 0.42 - (riskFactor * 0.10));
-  
+
   const gracePhase = Math.max(0, 1 - (spinsPlayed / 25));
   const lowStakeFactor = Math.max(0, 1 - ((Math.max(5, stake) - 5) / 15));
   const beginnerBoost = 0.18 * gracePhase * lowStakeFactor;
