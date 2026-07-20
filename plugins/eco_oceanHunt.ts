@@ -9,8 +9,10 @@
 import { deductCoins, addCoins, getWallet, withEconomyGuard, formatNumber } from '../lib/economy.js';
 import {
   spinGridForTier, renderGrid,
-  contributeToJackpot, getJackpotPool, resolveSpinOutcome,
-  incrementAndGetSpins, getTodayProfit, recordHouseActivity, deductFromJackpot
+  contributeToJackpot, getJackpotPool, resolveSpinOutcome, resolveJackpotPayout,
+  incrementAndGetSpins, getTodayProfit, recordHouseActivity, deductFromJackpot,
+  getConsecutiveLosses, incrementConsecutiveLosses, resetConsecutiveLosses,
+  recordPlayerActivity, recordPlayerJackpot
 } from '../lib/oceanSlotMachine.js';
 import { cleanJid } from '../lib/isOwner.js';
 
@@ -65,9 +67,10 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const newPool = await getJackpotPool();
   const todayProfit = await getTodayProfit();
   const economyPressure = Math.max(0.8, Math.min(1.2, 1 + (newPool - 500) / 10000));
-  
+  const consecutiveLosses = await getConsecutiveLosses(userId);
+
   // Resolve outcome based on dynamic tracking
-  const outcome = resolveSpinOutcome(bet, economyPressure, spinsPlayed, todayProfit, newPool);
+  const outcome = resolveSpinOutcome(bet, economyPressure, spinsPlayed, todayProfit, newPool, consecutiveLosses);
   const grid = spinGridForTier(outcome.tier);
 
   // Send initial spinning animation frame
@@ -87,35 +90,52 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   }
   await delay(SPIN_FRAME_DELAY_MS);
 
-  await delay(SPIN_FRAME_DELAY_MS);
-
   let winText = '';
   let banner = '';
-  const totalWin = Math.round(bet * outcome.multiplier);
+  let totalWin = Math.round(bet * outcome.multiplier);
 
   if (outcome.tier === 'lose') {
+    await incrementConsecutiveLosses(userId);
     winText = `\n\n😬 Splashed! No luck on this dive. Better luck next time!`;
-  } else if (outcome.tier === 'mega') {
+  } else if (outcome.tier === 'mega' || outcome.tier === 'superMega') {
+    await resetConsecutiveLosses(userId);
+    await recordPlayerJackpot(userId);
+    const payout = resolveJackpotPayout(outcome.tier, bet, outcome.multiplier, newPool);
+    totalWin = payout.totalWin;
+
     await addCoins(userId, totalWin, { type: 'slots' });
-    await deductFromJackpot(totalWin);
-    banner = WIN_BANNERS.mega;
-    winText = `\n\n🐋🐋🦈 *MEGA CATCH!* You got a *${outcome.multiplier}x* multiplier! Reeled in *${formatNumber(totalWin)} coins*!`;
-  } else if (outcome.tier === 'superMega') {
-    await addCoins(userId, totalWin, { type: 'slots' });
-    await deductFromJackpot(totalWin);
-    banner = WIN_BANNERS.superMega;
-    winText = `\n\n🐋🐋🐋 *GREAT WHITE WHALE!!* Epic *${outcome.multiplier}x* jackpot hit! Reeled in *${formatNumber(totalWin)} coins*!`;
+    if (payout.fromPool) {
+      await deductFromJackpot(totalWin);
+    }
+
+    if (outcome.tier === 'mega') {
+      banner = WIN_BANNERS.mega;
+      winText = payout.downgraded
+        ? `\n\n🐋🐋🦈 *MEGA CATCH!* The jackpot pool was running low, so you still reel in a solid *${payout.multiplier}x* — *${formatNumber(totalWin)} coins*!`
+        : `\n\n🐋🐋🦈 *MEGA CATCH!* You got a *${payout.multiplier}x* multiplier! Reeled in *${formatNumber(totalWin)} coins*!`;
+    } else {
+      banner = WIN_BANNERS.superMega;
+      winText = payout.downgraded
+        ? `\n\n🐋🐋🐋 *GREAT WHITE WHALE!!* The ocean vault couldn't cover the full jackpot, but you still haul in *${payout.multiplier}x* — *${formatNumber(totalWin)} coins*!`
+        : `\n\n🐋🐋🐋 *GREAT WHITE WHALE!!* Epic *${payout.multiplier}x* jackpot hit! Reeled in *${formatNumber(totalWin)} coins*!`;
+    }
   } else if (outcome.tier === 'big') {
+    await resetConsecutiveLosses(userId);
     await addCoins(userId, totalWin, { type: 'slots' });
     banner = WIN_BANNERS.big;
     winText = `\n\n🎉 *${outcome.label}!* Reeled in *${formatNumber(totalWin)} coins* (${outcome.multiplier}x your bet)!`;
   } else {
+    // recover30 / recover70 / double / triple are still partial or full recoveries —
+    // only a genuine 'lose' should build the streak.
+    await resetConsecutiveLosses(userId);
     await addCoins(userId, totalWin, { type: 'slots' });
     winText = `\n\n🎉 *${outcome.label}!* Reeled in *${formatNumber(totalWin)} coins* (${outcome.multiplier}x your bet)!`;
   }
 
   // Log today's results to the daily profit table
   await recordHouseActivity(bet, totalWin);
+  // Log this player's lifetime bet/payout totals (feeds getPlayerProfile's RTP/average stake)
+  await recordPlayerActivity(userId, bet, totalWin);
 
   const wallet = await getWallet(userId);
 

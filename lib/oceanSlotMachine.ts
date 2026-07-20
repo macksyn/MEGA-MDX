@@ -373,6 +373,50 @@ export function resolveSpinOutcome(
   return { tier: 'lose', multiplier: 0, label: 'No win' };
 }
 
+// ── Pool-gated jackpot payouts (mega / superMega) ──────────────────────────
+
+/**
+ * If the jackpot pool can't actually afford the multiplier resolveSpinOutcome()
+ * rolled, these are the guaranteed smaller multipliers paid instead. These are
+ * paid directly (not drawn from the pool) so a thin pool never blocks a win —
+ * it just downgrades the size of it.
+ */
+export const MEGA_FALLBACK_RANGE = { min: 4, max: 6 } as const;       // matches 'big' tier payout
+export const SUPERMEGA_FALLBACK_RANGE = { min: 10, max: 12 } as const; // matches 'mega' tier payout
+
+export interface JackpotPayout {
+  totalWin: number;
+  multiplier: number;
+  fromPool: boolean;   // true if this payout was actually drawn down from the jackpot pool
+  downgraded: boolean; // true if the pool couldn't cover the rolled multiplier and we fell back
+}
+
+/**
+ * Resolves the real payout for a mega/superMega spin, constrained by what the pool
+ * can actually afford above its floor seed. Full multiplier wins are only paid out
+ * (and only deducted from the pool) if the pool can cover them; otherwise the player
+ * still gets a smaller guaranteed win, paid straight from the house.
+ */
+export function resolveJackpotPayout(
+  tier: 'mega' | 'superMega',
+  bet: number,
+  multiplier: number,
+  pool: number
+): JackpotPayout {
+  const availableSurplus = Math.max(0, pool - JACKPOT_SEED);
+  const rawWin = Math.round(bet * multiplier);
+
+  if (rawWin <= availableSurplus) {
+    return { totalWin: rawWin, multiplier, fromPool: true, downgraded: false };
+  }
+
+  const fallbackRange = tier === 'superMega' ? SUPERMEGA_FALLBACK_RANGE : MEGA_FALLBACK_RANGE;
+  const fallbackMultiplier = fallbackRange.min + Math.floor(Math.random() * (fallbackRange.max - fallbackRange.min + 1));
+  const fallbackWin = Math.round(bet * fallbackMultiplier);
+
+  return { totalWin: fallbackWin, multiplier: fallbackMultiplier, fromPool: false, downgraded: true };
+}
+
 export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spinsPlayed = 100, consecutiveLosses = 0) {
   const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
   const riskFactor = (Math.max(5, Math.min(100, stake)) - 5) / 95; 

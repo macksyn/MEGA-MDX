@@ -2,8 +2,10 @@
 import { deductCoins, addCoins, getWallet, withEconomyGuard, formatNumber } from '../lib/economy.js';
 import {
   spinGridForTier, renderGrid,
-  contributeToJackpot, getJackpotPool, resolveSpinOutcome,
-  incrementAndGetSpins, getTodayProfit, recordHouseActivity, deductFromJackpot
+  contributeToJackpot, getJackpotPool, resolveSpinOutcome, settleWin, getEconomyPressure,
+  incrementAndGetSpins, getTodayProfit, recordHouseActivity, deductFromJackpot,
+  getConsecutiveLosses, incrementConsecutiveLosses, resetConsecutiveLosses,
+  recordPlayerActivity, recordPlayerJackpot
 } from '../lib/slotMachine.js';
 import { cleanJid } from '../lib/isOwner.js';
 
@@ -57,10 +59,11 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   // Retrieve economic metric points
   const newPool = await getJackpotPool();
   const todayProfit = await getTodayProfit();
-  const economyPressure = Math.max(0.8, Math.min(1.2, 1 + (newPool - 500) / 10000));
+  const economyPressure = await getEconomyPressure(newPool);
+  const consecutiveLosses = await getConsecutiveLosses(userId);
 
   // Resolve spin tier and payout multiplier synchronously using real-time stats
-  const outcome = resolveSpinOutcome(bet, economyPressure, spinsPlayed, todayProfit, newPool);
+  const outcome = resolveSpinOutcome(bet, economyPressure, spinsPlayed, todayProfit, newPool, consecutiveLosses);
   const grid = spinGridForTier(outcome.tier);
 
   const sent = await sock.sendMessage(chatId, {
@@ -81,31 +84,46 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
   let winText = '';
   let banner = '';
-  const totalWin = Math.round(bet * outcome.multiplier);
+  let totalWin = 0;
 
   if (outcome.tier === 'lose') {
+    await incrementConsecutiveLosses(userId);
+    // The stake was already banked by contributeToJackpot() above — nothing further to settle.
     winText = `\n\n😬 No win this spin. Better luck next time!`;
-  } else if (outcome.tier === 'mega') {
-    await addCoins(userId, totalWin, { type: 'slots' });
-    await deductFromJackpot(totalWin); // Deduct winnings directly from the progressive jackpot pool reserve
-    banner = WIN_BANNERS.mega;
-    winText = `\n\n🦁🦁🐯 *MEGA WIN!* You got a *${outcome.multiplier}x* multiplier! Won *${formatNumber(totalWin)} coins*!`;
-  } else if (outcome.tier === 'superMega') {
-    await addCoins(userId, totalWin, { type: 'slots' });
-    await deductFromJackpot(totalWin); // Deduct winnings directly from the progressive jackpot pool reserve
-    banner = WIN_BANNERS.superMega;
-    winText = `\n\n🦁🦁🦁 *SUPER MEGA WIN!* Epic *${outcome.multiplier}x* jackpot hit! Won *${formatNumber(totalWin)} coins*!`;
-  } else if (outcome.tier === 'big') {
-    await addCoins(userId, totalWin, { type: 'slots' });
-    banner = WIN_BANNERS.big;
-    winText = `\n\n🎉 *${outcome.label}!* Won *${formatNumber(totalWin)} coins* (${outcome.multiplier}x your bet)!`;
   } else {
+    await resetConsecutiveLosses(userId);
+
+    const rawWin = Math.round(bet * outcome.multiplier);
+    const settled = settleWin(rawWin, newPool);
+    totalWin = settled.payout;
+
     await addCoins(userId, totalWin, { type: 'slots' });
-    winText = `\n\n🎉 *${outcome.label}!* Won *${formatNumber(totalWin)} coins* (${outcome.multiplier}x your bet)!`;
+    await deductFromJackpot(totalWin); // Every payout is paid out of the real bank, never minted
+
+    if (outcome.tier === 'mega' || outcome.tier === 'superMega') {
+      await recordPlayerJackpot(userId);
+      banner = outcome.tier === 'mega' ? WIN_BANNERS.mega : WIN_BANNERS.superMega;
+      const emoji = outcome.tier === 'mega' ? '🦁🦁🐯 *MEGA WIN!*' : '🦁🦁🦁 *SUPER MEGA WIN!*';
+      winText = settled.capped
+        ? `\n\n${emoji} The jackpot pool couldn't cover the full payout, so this one's capped at *${formatNumber(totalWin)} coins*.`
+        : `\n\n${emoji} You got a *${outcome.multiplier}x* multiplier! Won *${formatNumber(totalWin)} coins*!`;
+    } else if (outcome.tier === 'big') {
+      banner = WIN_BANNERS.big;
+      winText = settled.capped
+        ? `\n\n🎉 *${outcome.label}!* The pool couldn't cover the full amount, so you got *${formatNumber(totalWin)} coins* instead of the usual ${outcome.multiplier}x.`
+        : `\n\n🎉 *${outcome.label}!* Won *${formatNumber(totalWin)} coins* (${outcome.multiplier}x your bet)!`;
+    } else {
+      // recover30 / recover70 / double / triple
+      winText = settled.capped
+        ? `\n\n🎉 *${outcome.label}!* The pool couldn't cover the full amount, so you got *${formatNumber(totalWin)} coins* instead of the usual ${outcome.multiplier}x.`
+        : `\n\n🎉 *${outcome.label}!* Won *${formatNumber(totalWin)} coins* (${outcome.multiplier}x your bet)!`;
+    }
   }
 
   // Log today's results to the daily profit table to maintain real-time adaptive metrics
   await recordHouseActivity(bet, totalWin);
+  // Log this player's lifetime bet/payout totals (feeds getPlayerProfile's RTP/average stake)
+  await recordPlayerActivity(userId, bet, totalWin);
 
   const wallet = await getWallet(userId);
 

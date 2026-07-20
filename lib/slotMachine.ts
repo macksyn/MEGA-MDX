@@ -6,6 +6,23 @@
  * coinflip/dice/slots all feed. Pure game logic — no WhatsApp/sock code
  * here, so plugins just call these and handle the messaging themselves.
  *
+ * ── The pool is a real bank, not a side pot ─────────────────────────────
+ * The jackpot pool IS the house's bankroll. Every stake a player loses
+ * becomes real pool capital the moment it's wagered (contributeToJackpot).
+ * Every coin paid out to a winner is drawn back out of that same pool
+ * (settleWin + deductFromJackpot) — nothing is ever minted from nowhere.
+ * JACKPOT_SEED is a protected floor: no payout, from any game or any
+ * future feature (referrals, attendance bonuses, etc.), may push the pool
+ * below it. If the pool can't afford a payout in full, the payout is
+ * capped down to whatever it can actually afford — never paid anyway.
+ *
+ * getEconomyPressure() is the single source of truth for how generous or
+ * strict the house is being right now. It combines two independent
+ * factors: real bank solvency (protects the floor, never auto-loosens
+ * just because the pool has grown large) and the house's shared "mood"
+ * (a small, randomly-timed hot/cold swing that applies to everyone at
+ * once, independent of any single player's own streak).
+ *
  * Payout is fully tier-driven: resolveSpinOutcome() is the single source of
  * truth for what a spin wins. spinGridForTier() then draws a grid that
  * matches that result — it never decides the outcome itself. All symbols
@@ -17,40 +34,62 @@
  *   double     — 1 lion + 1 tiger
  *   triple     — 2 tiger
  *   big        — 1 lion + 2 tiger
- *   mega       — 2 lion + 1 tiger   (pays stake multiplier 10-12 based on pool/profits)
- *   superMega  — 3 lion             (pays stake multiplier 16-18 based on pool/profits)
+ *   mega       — 2 lion + 1 tiger   (pays stake multiplier 10-12, capped to what the pool can afford)
+ *   superMega  — 3 lion             (pays stake multiplier 16-18, capped to what the pool can afford)
  */
 
 import { createStore } from './pluginStore.js';
 
 const store          = createStore('slotmachine');
-const jackpotTbl     = store.table('jackpot'); // single key 'pool' -> number
+const jackpotTbl     = store.table('jackpot'); // 'pool' -> number, 'houseMood' -> HouseMood
 const playerStatsTbl = store.table('playerStats'); // tracks individual player spins
 const houseStatsTbl  = store.table('houseStats'); // tracks daily bets/wins for profit calculation
 
-const JACKPOT_SEED               = 500;   // pool never drops below this
-const JACKPOT_CONTRIBUTION_RATE  = 0.05;  // 5% of every gambling bet feeds the pool
+const JACKPOT_SEED = 500; // protected floor — the bank can never be paid down below this, by anything
 
 export async function getJackpotPool(): Promise<number> {
   const val = await jackpotTbl.get('pool');
   return typeof val === 'number' ? val : JACKPOT_SEED;
 }
 
-/** Called on every gambling bet (slots, coinflip, dice) — grows the shared pool. */
+/**
+ * Called on every gambling bet (slots, coinflip, dice) — the full stake becomes
+ * real bank capital the instant it's wagered. If the player wins, settleWin() +
+ * deductFromJackpot() pay their winnings back out of this same pool; if they
+ * lose, the stake just stays banked.
+ */
 export async function contributeToJackpot(bet: number): Promise<number> {
-  const contribution = Math.max(1, Math.round(bet * JACKPOT_CONTRIBUTION_RATE));
   const pool = await getJackpotPool();
-  const newPool = pool + contribution;
+  const newPool = pool + bet;
   await jackpotTbl.set('pool', newPool);
   return newPool;
 }
 
-/** Deducts a high-tier payout from the jackpot pool, respecting the floor seed. */
+/** Pays a payout out of the jackpot pool, respecting the protected floor seed. */
 export async function deductFromJackpot(amount: number): Promise<number> {
   const pool = await getJackpotPool();
   const newPool = Math.max(JACKPOT_SEED, pool - amount);
   await jackpotTbl.set('pool', newPool);
   return newPool;
+}
+
+export interface SettledPayout {
+  payout: number;
+  capped: boolean; // true if the bank couldn't afford the full rolled payout and this was capped down
+}
+
+/**
+ * Every winning payout — from every game, every tier — is settled through here
+ * before it's paid. The bank never pays more than it actually has above its
+ * protected floor; if a payout would breach that floor, it's capped down to
+ * whatever the bank can currently afford instead of being paid in full anyway.
+ */
+export function settleWin(rawWin: number, pool: number): SettledPayout {
+  const availableSurplus = Math.max(0, pool - JACKPOT_SEED);
+  if (rawWin <= availableSurplus) {
+    return { payout: rawWin, capped: false };
+  }
+  return { payout: availableSurplus, capped: true };
 }
 
 /** Track how many spins a user has made to calculate their grace period */
@@ -160,41 +199,114 @@ export async function recordHouseActivity(bet: number, payout: number): Promise<
   await houseStatsTbl.set(wonKey, currentWon + payout);
 }
 
+// ── Bank solvency & house mood ──────────────────────────────────────────────
+//
+// getEconomyPressure() is the single source of truth for how generous or
+// strict the house is right now. It's the product of two independent signals:
+//
+//   1. Solvency  — grounded in the REAL surplus above the protected floor.
+//      Tightens smoothly as the pool nears the floor. Once healthy, stays
+//      perfectly neutral no matter how large the pool grows — the house
+//      never auto-loosens odds just because it's sitting on a lot of capital.
+//      This always has final say: mood can never override it into paying out
+//      money the bank doesn't have.
+//
+//   2. House mood — a small, randomly-timed hot/cold/neutral swing shared by
+//      every player at once (independent of any individual's own win/loss
+//      streak). Rerolls itself on a random schedule so it can't be timed.
+//
+// < 1.0 = Loose/Generous · > 1.0 = Tight/Strict (same convention as before)
+
+const CRITICAL_BAND            = JACKPOT_SEED * 0.5; // surplus below this = critical zone
+const MAX_CRITICAL_TIGHTENING  = 0.35;                // extra pressure added right at the floor
+
+export type SolvencyLevel = 'critical' | 'healthy';
+
+export interface SolvencyState {
+  level: SolvencyLevel;
+  surplus: number;
+  pressure: number;
+}
+
 /**
- * Calculates a dynamic economy pressure multiplier based on house profits and jackpot reserves.
- * Plugin wrappers should call this and pass the result to the game resolvers.
- * < 1.0 = Loose/Generous (House is rich, give back to players)
- * > 1.0 = Tight/Strict (House is losing money, protect the bank)
+ * Reads the bank's actual health from its real surplus above the protected floor.
+ * This is deliberately asymmetric: it only ever tightens (protecting the floor),
+ * never loosens on its own just because the pool has grown large — growth is
+ * capital the community can spend deliberately elsewhere, not an auto-giveback.
  */
-export async function getEconomyPressure(): Promise<number> {
-  let pressure = 1.0;
+export function getSolvencyState(pool: number): SolvencyState {
+  const surplus = Math.max(0, pool - JACKPOT_SEED);
 
-  // 1. House Profit Factor
-  const todayProfit = await getTodayProfit();
-  
-  // If house is in profit, loosen the economy. If in loss, tighten it.
-  if (todayProfit > 0) {
-    // E.g., 2000 profit -> reduces pressure by 0.04 (caps at 0.15)
-    pressure -= Math.min(0.15, (todayProfit / 1000) * 0.02);
-  } else {
-    // E.g., -1000 loss -> increases pressure by 0.05 (caps at 0.20)
-    pressure += Math.min(0.20, (Math.abs(todayProfit) / 1000) * 0.05);
+  if (surplus >= CRITICAL_BAND) {
+    return { level: 'healthy', surplus, pressure: 1.0 };
   }
 
-  // 2. Jackpot Pool Factor
-  const pool = await getJackpotPool();
-  const poolBaseline = 1500;
-  
-  if (pool > poolBaseline) {
-    // Abundant pool -> looser economy (caps at 0.1 reduction)
-    pressure -= Math.min(0.1, ((pool - poolBaseline) / 1000) * 0.02);
+  const severity = 1 - (surplus / CRITICAL_BAND); // 0 at the edge of the band, 1 right at the floor
+  const pressure = 1.0 + severity * MAX_CRITICAL_TIGHTENING;
+  return { level: 'critical', surplus, pressure };
+}
+
+const MOOD_MIN_DURATION_MS = 20 * 60 * 1000;  // 20 minutes
+const MOOD_MAX_DURATION_MS = 120 * 60 * 1000; // 2 hours
+
+export type HouseMoodName = 'hot' | 'neutral' | 'cold';
+
+export interface HouseMood {
+  mood: HouseMoodName;
+  multiplier: number; // <1 loosens, >1 tightens
+  expiresAt: number;
+}
+
+function rollHouseMood(): HouseMood {
+  const r = Math.random();
+  let mood: HouseMoodName;
+  let multiplier: number;
+
+  if (r < 0.15) {
+    mood = 'hot';
+    multiplier = 0.9;
+  } else if (r < 0.30) {
+    mood = 'cold';
+    multiplier = 1.1;
   } else {
-    // Starved pool -> tighter economy (caps at 0.1 increase)
-    pressure += Math.min(0.1, ((poolBaseline - pool) / 1000) * 0.04);
+    mood = 'neutral';
+    multiplier = 1.0;
   }
 
-  // Clamp between 0.75 (very generous) and 1.25 (very strict)
-  return Math.max(0.75, Math.min(1.25, pressure));
+  const duration = MOOD_MIN_DURATION_MS + Math.random() * (MOOD_MAX_DURATION_MS - MOOD_MIN_DURATION_MS);
+  return { mood, multiplier, expiresAt: Date.now() + duration };
+}
+
+/**
+ * The house's current shared mood. Applies to every player at once and rerolls
+ * itself on a random schedule once its window expires — not on a fixed timer,
+ * so it can't be gamed by watching the clock.
+ */
+export async function getHouseMood(): Promise<HouseMood> {
+  const stored = (await jackpotTbl.get('houseMood')) as HouseMood | undefined;
+
+  if (stored && typeof stored === 'object' && stored.expiresAt > Date.now()) {
+    return stored;
+  }
+
+  const fresh = rollHouseMood();
+  await jackpotTbl.set('houseMood', fresh);
+  return fresh;
+}
+
+/**
+ * Combines solvency and house mood into the single pressure value every game
+ * resolver uses. Solvency always has final say: in a critical state, mood can
+ * only add extra caution on top, never loosen odds below what solvency allows.
+ */
+export async function getEconomyPressure(pool: number): Promise<number> {
+  const solvency = getSolvencyState(pool);
+  const mood = await getHouseMood();
+
+  let pressure = solvency.pressure;
+  pressure *= solvency.level === 'critical' ? Math.max(1, mood.multiplier) : mood.multiplier;
+
+  return Math.max(0.75, Math.min(1.35, pressure));
 }
 
 // ── Weighted payout engine for Jungle Hunt ───────────────────────────────────
