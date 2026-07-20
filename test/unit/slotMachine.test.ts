@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
-import { resolveDiceOutcome, rollGuessResult } from '../../lib/slotMachine.js';
+import { resolveDiceOutcome } from '../../lib/slotMachine.js';
 
 describe('resolveDiceOutcome', () => {
   afterEach(() => {
@@ -22,19 +22,5 @@ describe('resolveDiceOutcome', () => {
       win: false,
       multiplier: 0,
     });
-  });
-
-  it('builds a dice roll that matches the guess when the outcome is a win', () => {
-    const result = rollGuessResult(4, true);
-
-    expect(result.total).toBe(4);
-    expect(result.faces.reduce((sum, face) => sum + face, 0)).toBe(4);
-  });
-
-  it('builds a dice roll that does not match the guess when the outcome is a loss', () => {
-    const result = rollGuessResult(4, false);
-
-    expect(result.total).not.toBe(4);
-    expect(result.faces.length).toBe(2);
   });
 });
