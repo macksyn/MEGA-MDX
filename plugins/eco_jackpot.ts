@@ -17,7 +17,7 @@ import {
   getJackpotPool, getTodayStats, getSolvencyState, getHouseMood,
   TARGET_RTP, HARD_CEILING_RTP, EMERGENCY_CEILING_RTP,
 } from '../lib/slotMachine.js';
-import { cleanJid, isOwner } from '../lib/isOwner.js';
+import { cleanJid, isOwnerOnly } from '../lib/isOwner.js';
 
 export const command = 'reserve';
 export const aliases = ['jackpot', 'bank'];
