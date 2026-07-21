@@ -61,7 +61,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     return sock.sendMessage(chatId, {
       text:
         `🎲 *NUMBER GUESS* 🎲\n\n` +
-        `Usage: *!dice <amount> <guess>*\n` +
+        `Usage: *.dice <amount> <guess>*\n` +
         `Guess a number from *2* to *12*.\n\n` +
         `✅ Correct → 6× your bet\n` +
         `🔹 Close (off by 1) → bet refunded\n` +
