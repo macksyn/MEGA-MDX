@@ -63,8 +63,8 @@ const JACKPOT_SEED = 500; // protected floor — the bank can never be paid down
 //                             critical solvency state, so a thin bankroll
 //                             recovers faster instead of getting boost-stacked
 //                             further down.
-export const TARGET_RTP            = 0.915;
-export const HARD_CEILING_RTP      = 0.93;
+export const TARGET_RTP            = 0.918;
+export const HARD_CEILING_RTP      = 0.95;
 export const EMERGENCY_CEILING_RTP = 0.90;
 
 export async function getJackpotPool(): Promise<number> {
