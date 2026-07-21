@@ -24,7 +24,7 @@ export const aliases = ['jackpot', 'bank'];
 export const category = 'economy-games';
 export const cooldown = 3000;
 
-const JACKPOT_SEED = 500; // mirrors the protected floor in lib/slotMachine.ts
+const JACKPOT_SEED = 500; // mirrors the insured amount in lib/slotMachine.ts
 
 // Vague, ambient flavor only — deliberately doesn't say "odds are better/worse
 // right now" or name the mechanic, so !jackpot can't be used to time bets
@@ -50,7 +50,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const wantsAdmin = (args[0] || '').toLowerCase() === 'admin';
 
   if (wantsAdmin) {
-    if (!isOwner(userId)) {
+    if (!isOwnerOnly(userId)) {
       return sock.sendMessage(chatId, {
         text: `❌ That view is for admins only.`,
         ...channelInfo
@@ -69,15 +69,15 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     text:
       `🏦 *THE COMMUNITY BANK* 🏦\n\n` +
       `💰 Current reserve: *${formatNumber(pool)} coins*\n` +
-      `🛡️ Protected floor: *${formatNumber(JACKPOT_SEED)} coins* _(never spent — guarantees the bank can never fail)_\n` +
+      `🛡️ DeFi Insurance: *${formatNumber(JACKPOT_SEED)} coins* _(guarantees your coins are never lost.)_\n` +
       `🎯 Available to win: *${formatNumber(surplus)} coins*\n\n` +
       `📊 *Today's activity*\n` +
       `   Wagered: ${formatNumber(today.bet)} coins\n` +
       `   Paid out: ${formatNumber(today.won)} coins\n` +
       `   Net: ${netSign}${formatNumber(today.net)} coins\n\n` +
       `${MOOD_FLAVOR[mood.mood] || MOOD_FLAVOR.neutral}\n\n` +
-      `🎮 Fed by: *!slots*, *!coinflip*, *!dice*\n` +
-      `_Every stake goes in. Every win comes out. No coins are ever printed — this is the real house account, not a bonus pot._`,
+      `🎮 Fed by: *Jungle Hunt*, *Coinflip*, *Dice*\n` +
+      `_Happy Winning!!_`,
     ...channelInfo
   }, { quoted: message });
 }
