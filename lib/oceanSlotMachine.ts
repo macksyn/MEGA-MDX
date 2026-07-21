@@ -43,7 +43,7 @@ const jackpotTbl     = store.table('jackpot'); // 'ocean_pool' -> number, 'ocean
 const playerStatsTbl = store.table('playerStats'); // tracks individual player spins
 const houseStatsTbl  = store.table('houseStats'); // tracks daily bets/wins for profit calculation
 
-const JACKPOT_SEED = 5000; // protected floor — the bank can never be paid down below this, by anything
+const JACKPOT_SEED = 500; // protected floor — the bank can never be paid down below this, by anything
 
 // ── RTP policy ───────────────────────────────────────────────────────────────
 // Same three-tier policy as Jungle Hunt — see lib/slotMachine.ts for the full

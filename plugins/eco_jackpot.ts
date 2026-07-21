@@ -24,7 +24,7 @@ export const aliases = ['jackpot', 'bank'];
 export const category = 'economy-games';
 export const cooldown = 3000;
 
-const JACKPOT_SEED = 5000; // mirrors the protected floor in lib/slotMachine.ts
+const JACKPOT_SEED = 500; // mirrors the protected floor in lib/slotMachine.ts
 
 // Vague, ambient flavor only — deliberately doesn't say "odds are better/worse
 // right now" or name the mechanic, so !jackpot can't be used to time bets
