@@ -45,7 +45,7 @@ const jackpotTbl     = store.table('jackpot'); // 'pool' -> number, 'houseMood' 
 const playerStatsTbl = store.table('playerStats'); // tracks individual player spins
 const houseStatsTbl  = store.table('houseStats'); // tracks daily bets/wins for profit calculation
 
-const JACKPOT_SEED = 500; // protected floor — the bank can never be paid down below this, by anything
+const JACKPOT_SEED = 5000; // protected floor — the bank can never be paid down below this, by anything
 
 // ── RTP policy ───────────────────────────────────────────────────────────────
 // Every game resolver enforces these regardless of how many boosts (beginner
@@ -194,16 +194,27 @@ export async function getPlayerProfile(userId: string) {
   };
 }
 
-/** Retrieves today's net profit (bets - payouts) */
-export async function getTodayProfit(): Promise<number> {
+export interface DailyStats {
+  bet: number;
+  won: number;
+  net: number;
+}
+
+/** Retrieves today's full activity breakdown: total wagered, total paid out, and net. */
+export async function getTodayStats(): Promise<DailyStats> {
   const todayStr = new Date().toISOString().split('T')[0];
   const betKey = `${todayStr}_bet`;
   const wonKey = `${todayStr}_won`;
 
-  const todayBet = ((await houseStatsTbl.get(betKey)) as number) || 0;
-  const todayWon = ((await houseStatsTbl.get(wonKey)) as number) || 0;
+  const bet = ((await houseStatsTbl.get(betKey)) as number) || 0;
+  const won = ((await houseStatsTbl.get(wonKey)) as number) || 0;
 
-  return todayBet - todayWon;
+  return { bet, won, net: bet - won };
+}
+
+/** Retrieves today's net profit (bets - payouts) */
+export async function getTodayProfit(): Promise<number> {
+  return (await getTodayStats()).net;
 }
 
 /** Records house activity for a specific spin or game */
@@ -611,36 +622,132 @@ export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spins
     : { multiplier: 0, label: 'You lost', win: false };
 }
 
-export function resolveDiceOutcome(stake: number, economyPressure = 1, spinsPlayed = 100, consecutiveLosses = 0, pool = JACKPOT_SEED) {
-  const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
-  const riskFactor = (Math.max(5, Math.min(100, stake)) - 5) / 95;
-  const baseWinChance = Math.max(0.28, 0.42 - (riskFactor * 0.10));
+// ── Number guess (2–12) resolver ────────────────────────────────────────────
 
-  const gracePhase = Math.max(0, 1 - (spinsPlayed / 25));
+export function resolveNumberGuessOutcome(
+  stake: number,
+  guess: number,
+  economyPressure: number,
+  spinsPlayed: number,
+  consecutiveLosses: number,
+  pool: number
+): {
+  outcome: 'win' | 'tie' | 'lose';
+  resultNumber: number;
+  multiplier: number;
+} {
+  // clamp guess to valid range
+  guess = Math.max(2, Math.min(12, Math.round(guess)));
+
+  const pressureFactor = Math.max(0.8, Math.min(1.2, economyPressure));
+
+  // Base probabilities – tuned to reach ~0.92 RTP after boosts
+  let baseWinProb = 0.10;
+  let baseTieProb = 0.22;
+  let baseLossProb = 1 - baseWinProb - baseTieProb;
+
+  // Apply pressure: win/tie decrease when pressure > 1
+  let winProb = baseWinProb / pressureFactor;
+  let tieProb = baseTieProb / pressureFactor;
+  let lossProb = 1 - winProb - tieProb;
+
+  // clamp and re-normalise
+  winProb = Math.max(0.01, Math.min(0.6, winProb));
+  tieProb = Math.max(0.01, Math.min(0.5, tieProb));
+  lossProb = Math.max(0.05, Math.min(0.9, lossProb));
+  const total = winProb + tieProb + lossProb;
+  winProb /= total;
+  tieProb /= total;
+  lossProb /= total;
+
+  // Beginner grace period (first 25 spins, low stakes)
+  const gracePhase = Math.max(0, 1 - spinsPlayed / 25);
   const lowStakeFactor = Math.max(0, 1 - ((Math.max(5, stake) - 5) / 15));
-  const beginnerBoost = 0.18 * gracePhase * lowStakeFactor;
+  if (gracePhase > 0 && lowStakeFactor > 0) {
+    const boost = 0.15 * gracePhase * lowStakeFactor; // up to +15% win chance
+    winProb = Math.min(0.8, winProb + boost);
+    lossProb = 1 - winProb - tieProb;
+    if (lossProb < 0) {
+      tieProb += lossProb;
+      lossProb = 0.05;
+      const scale = (1 - lossProb) / (winProb + tieProb);
+      winProb *= scale;
+      tieProb *= scale;
+    }
+  }
 
-  // Dry streak breaker
-  const pityBoost = consecutiveLosses >= 4 ? Math.min(0.25, (consecutiveLosses - 3) * 0.05) : 0;
+  // Pity timer – after 5 losses, increase win & tie chances
+  if (consecutiveLosses >= 5) {
+    const streakFactor = Math.min(10, consecutiveLosses - 4);
+    const boost = 0.02 * streakFactor; // up to +20% win
+    winProb = Math.min(0.8, winProb + boost);
+    tieProb = Math.min(0.5, tieProb + 0.01 * streakFactor);
+    lossProb = 1 - winProb - tieProb;
+    if (lossProb < 0.05) {
+      lossProb = 0.05;
+      const scale = (1 - lossProb) / (winProb + tieProb);
+      winProb *= scale;
+      tieProb *= scale;
+    }
+  }
 
-  let winChance = Math.min(0.75, Math.max(0.2, baseWinChance / pressureFactor) + beginnerBoost + pityBoost);
-  const tieChance = Math.max(0.08, Math.min(0.2, 0.16 / pressureFactor)); 
+  // Hard RTP ceiling (critical bank → tighter)
+  const rtpCeiling =
+    getSolvencyState(pool).level === 'critical'
+      ? EMERGENCY_CEILING_RTP
+      : HARD_CEILING_RTP;
 
-  // Hard RTP ceiling — same principle as coinflip, but the tie's 1x refund also
-  // counts toward RTP, so it has to be netted out before capping the win chance.
-  const DICE_WIN_MULTIPLIER = 1.9;
-  const rtpCeiling = getSolvencyState(pool).level === 'critical' ? EMERGENCY_CEILING_RTP : HARD_CEILING_RTP;
-  const maxWinChance = Math.max(0, (rtpCeiling - tieChance) / DICE_WIN_MULTIPLIER);
-  winChance = Math.min(winChance, maxWinChance);
+  let expectedRTP = winProb * 6 + tieProb * 1;
+  if (expectedRTP > rtpCeiling) {
+    const scale = rtpCeiling / expectedRTP;
+    winProb *= scale;
+    tieProb *= scale;
+    lossProb = 1 - winProb - tieProb;
+    if (lossProb < 0) {
+      lossProb = 0;
+      const total2 = winProb + tieProb;
+      winProb /= total2;
+      tieProb /= total2;
+    }
+  }
 
+  // Roll outcome
   const roll = Math.random();
-  if (roll <= tieChance) {
-    return { multiplier: 1, label: 'Tie', win: false, tie: true };
+  let outcome: 'win' | 'tie' | 'lose';
+  if (roll < winProb) outcome = 'win';
+  else if (roll < winProb + tieProb) outcome = 'tie';
+  else outcome = 'lose';
+
+  // Generate a result number that matches the outcome
+  let resultNumber: number;
+  if (outcome === 'win') {
+    resultNumber = guess;
+  } else if (outcome === 'tie') {
+    const candidates: number[] = [];
+    if (guess - 1 >= 2) candidates.push(guess - 1);
+    if (guess + 1 <= 12) candidates.push(guess + 1);
+    if (candidates.length === 0) {
+      // fallback (should never happen)
+      resultNumber = guess;
+      outcome = 'win'; // treat as win
+    } else {
+      resultNumber = candidates[Math.floor(Math.random() * candidates.length)];
+    }
+  } else {
+    // lose – pick a number not equal and not adjacent
+    const candidates: number[] = [];
+    for (let n = 2; n <= 12; n++) {
+      if (Math.abs(n - guess) > 1) candidates.push(n);
+    }
+    if (candidates.length === 0) {
+      resultNumber = guess === 2 ? 12 : 2;
+    } else {
+      resultNumber = candidates[Math.floor(Math.random() * candidates.length)];
+    }
   }
-  if (roll <= tieChance + winChance) {
-    return { multiplier: 1.9, label: 'You win', win: true };
-  }
-  return { multiplier: 0, label: 'You lost', win: false };
+
+  const multiplier = outcome === 'win' ? 6 : outcome === 'tie' ? 1 : 0;
+  return { outcome, resultNumber, multiplier };
 }
 
 // ── Symbols & weighted RNG ────────────────────────────────────────────────────

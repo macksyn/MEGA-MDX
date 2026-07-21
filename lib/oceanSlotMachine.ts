@@ -2,8 +2,21 @@
 /***
  * lib/oceanSlotMachine.ts
  *
- * "Ocean Hunt" slot machine engine + the shared jackpot pool.
+ * "Ocean Hunt" slot machine engine + its own independent jackpot pool.
  * Pure game logic based on the verified Jungle Hunt engine.
+ *
+ * ── The pool is a real bank, not a side pot ─────────────────────────────
+ * Same model as Jungle Hunt, but kept fully independent — its own pool
+ * ('ocean_pool'), its own house mood ('ocean_houseMood'), separate from
+ * Jungle Hunt's. Every stake a player loses becomes real pool capital the
+ * moment it's wagered (contributeToJackpot). Every coin paid out to a
+ * winner is drawn back out of that same pool (settleWin + deductFromJackpot)
+ * — nothing is ever minted from nowhere. JACKPOT_SEED is a protected floor
+ * no payout may push the pool below.
+ *
+ * getEconomyPressure() combines real bank solvency (protects the floor,
+ * never auto-loosens just because the pool has grown large) with the
+ * house's shared "mood" (a small, randomly-timed hot/cold swing).
  *
  * Payout is fully tier-driven: resolveSpinOutcome() is the single source of
  * truth for what a spin wins. spinGridForTier() then draws a grid that
@@ -16,8 +29,8 @@
  *   double     — 1 whale + 1 shark
  *   triple     — 2 sharks
  *   big        — 1 whale + 2 sharks
- *   mega       — 2 whales + 1 shark  (pays a bounded SHARE of the ocean jackpot pool)
- *   superMega  — 3 whales            (pays the ENTIRE ocean jackpot pool)
+ *   mega       — 2 whales + 1 shark  (pays stake multiplier 10-12, capped to what the pool can afford)
+ *   superMega  — 3 whales            (pays stake multiplier 16-18, capped to what the pool can afford)
  *
  * Newbie grace period boosts chances at stakes strictly under 20 coins,
  * scaling down linearly to 0.0 at stakes of 20 or more.
@@ -26,33 +39,63 @@
 import { createStore } from './pluginStore.js';
 
 const store          = createStore('slotmachine');
-const jackpotTbl     = store.table('jackpot'); // single key 'ocean_pool' -> number
+const jackpotTbl     = store.table('jackpot'); // 'ocean_pool' -> number, 'ocean_houseMood' -> HouseMood
 const playerStatsTbl = store.table('playerStats'); // tracks individual player spins
 const houseStatsTbl  = store.table('houseStats'); // tracks daily bets/wins for profit calculation
 
-const JACKPOT_SEED               = 500;   // pool never drops below this
-const JACKPOT_CONTRIBUTION_RATE  = 0.05;  // 5% of every gambling bet feeds the pool
+const JACKPOT_SEED = 5000; // protected floor — the bank can never be paid down below this, by anything
+
+// ── RTP policy ───────────────────────────────────────────────────────────────
+// Same three-tier policy as Jungle Hunt — see lib/slotMachine.ts for the full
+// rationale. Kept as its own copy here rather than a shared import so Ocean
+// Hunt's tuning can diverge independently later if needed.
+export const TARGET_RTP            = 0.915;
+export const HARD_CEILING_RTP      = 0.93;
+export const EMERGENCY_CEILING_RTP = 0.90;
 
 export async function getJackpotPool(): Promise<number> {
   const val = await jackpotTbl.get('ocean_pool');
   return typeof val === 'number' ? val : JACKPOT_SEED;
 }
 
-/** Called on every gambling bet — grows the shared ocean pool. */
+/**
+ * Called on every gambling bet — the full stake becomes real bank capital the
+ * instant it's wagered. If the player wins, settleWin() + deductFromJackpot()
+ * pay their winnings back out of this same pool; if they lose, the stake just
+ * stays banked.
+ */
 export async function contributeToJackpot(bet: number): Promise<number> {
-  const contribution = Math.max(1, Math.round(bet * JACKPOT_CONTRIBUTION_RATE));
   const pool = await getJackpotPool();
-  const newPool = pool + contribution;
+  const newPool = pool + bet;
   await jackpotTbl.set('ocean_pool', newPool);
   return newPool;
 }
 
-/** Deducts a high-tier payout from the ocean jackpot pool, respecting the floor seed. */
+/** Pays a payout out of the ocean jackpot pool, respecting the protected floor seed. */
 export async function deductFromJackpot(amount: number): Promise<number> {
   const pool = await getJackpotPool();
   const newPool = Math.max(JACKPOT_SEED, pool - amount);
   await jackpotTbl.set('ocean_pool', newPool);
   return newPool;
+}
+
+export interface SettledPayout {
+  payout: number;
+  capped: boolean; // true if the bank couldn't afford the full rolled payout and this was capped down
+}
+
+/**
+ * Every winning payout — from every game, every tier — is settled through here
+ * before it's paid. The bank never pays more than it actually has above its
+ * protected floor; if a payout would breach that floor, it's capped down to
+ * whatever the bank can currently afford instead of being paid in full anyway.
+ */
+export function settleWin(rawWin: number, pool: number): SettledPayout {
+  const availableSurplus = Math.max(0, pool - JACKPOT_SEED);
+  if (rawWin <= availableSurplus) {
+    return { payout: rawWin, capped: false };
+  }
+  return { payout: availableSurplus, capped: true };
 }
 
 /** Track how many spins a user has made to calculate their grace period */
@@ -141,10 +184,10 @@ export async function getTodayProfit(): Promise<number> {
   const todayStr = new Date().toISOString().split('T')[0];
   const betKey = `${todayStr}_ocean_bet`;
   const wonKey = `${todayStr}_ocean_won`;
-
+  
   const todayBet = ((await houseStatsTbl.get(betKey)) as number) || 0;
   const todayWon = ((await houseStatsTbl.get(wonKey)) as number) || 0;
-
+  
   return todayBet - todayWon;
 }
 
@@ -153,44 +196,107 @@ export async function recordHouseActivity(bet: number, payout: number): Promise<
   const todayStr = new Date().toISOString().split('T')[0];
   const betKey = `${todayStr}_ocean_bet`;
   const wonKey = `${todayStr}_ocean_won`;
-
+  
   const currentBet = ((await houseStatsTbl.get(betKey)) as number) || 0;
   const currentWon = ((await houseStatsTbl.get(wonKey)) as number) || 0;
-
+  
   await houseStatsTbl.set(betKey, currentBet + bet);
   await houseStatsTbl.set(wonKey, currentWon + payout);
 }
 
+// ── Bank solvency & house mood ──────────────────────────────────────────────
+//
+// getEconomyPressure() is the single source of truth for how generous or
+// strict the house is right now. Same two-factor model as Jungle Hunt:
+// real solvency (protects the floor, never auto-loosens on a large pool)
+// combined with an independent, randomly-timed house mood.
+//
+// < 1.0 = Loose/Generous · > 1.0 = Tight/Strict
+
+const CRITICAL_BAND            = JACKPOT_SEED * 0.5; // surplus below this = critical zone
+const MAX_CRITICAL_TIGHTENING  = 0.35;                // extra pressure added right at the floor
+
+export type SolvencyLevel = 'critical' | 'healthy';
+
+export interface SolvencyState {
+  level: SolvencyLevel;
+  surplus: number;
+  pressure: number;
+}
+
+/** Reads the ocean bank's actual health from its real surplus above the protected floor. */
+export function getSolvencyState(pool: number): SolvencyState {
+  const surplus = Math.max(0, pool - JACKPOT_SEED);
+
+  if (surplus >= CRITICAL_BAND) {
+    return { level: 'healthy', surplus, pressure: 1.0 };
+  }
+
+  const severity = 1 - (surplus / CRITICAL_BAND);
+  const pressure = 1.0 + severity * MAX_CRITICAL_TIGHTENING;
+  return { level: 'critical', surplus, pressure };
+}
+
+const MOOD_MIN_DURATION_MS = 20 * 60 * 1000;  // 20 minutes
+const MOOD_MAX_DURATION_MS = 120 * 60 * 1000; // 2 hours
+
+export type HouseMoodName = 'hot' | 'neutral' | 'cold';
+
+export interface HouseMood {
+  mood: HouseMoodName;
+  multiplier: number; // <1 loosens, >1 tightens
+  expiresAt: number;
+}
+
+function rollHouseMood(): HouseMood {
+  const r = Math.random();
+  let mood: HouseMoodName;
+  let multiplier: number;
+
+  if (r < 0.15) {
+    mood = 'hot';
+    multiplier = 0.9;
+  } else if (r < 0.30) {
+    mood = 'cold';
+    multiplier = 1.1;
+  } else {
+    mood = 'neutral';
+    multiplier = 1.0;
+  }
+
+  const duration = MOOD_MIN_DURATION_MS + Math.random() * (MOOD_MAX_DURATION_MS - MOOD_MIN_DURATION_MS);
+  return { mood, multiplier, expiresAt: Date.now() + duration };
+}
+
 /**
- * Calculates a dynamic economy pressure multiplier based on house profits and jackpot reserves.
- * Plugin wrappers should call this and pass the result to the game resolvers.
- * < 1.0 = Loose/Generous (House is rich, give back to players)
- * > 1.0 = Tight/Strict (House is losing money, protect the bank)
+ * Ocean Hunt's own house mood — kept under a distinct storage key so it swings
+ * independently of Jungle Hunt's, even though both live in the same store.
  */
-export async function getEconomyPressure(): Promise<number> {
-  let pressure = 1.0;
+export async function getHouseMood(): Promise<HouseMood> {
+  const stored = (await jackpotTbl.get('ocean_houseMood')) as HouseMood | undefined;
 
-  // 1. House Profit Factor
-  const todayProfit = await getTodayProfit();
-
-  // If house is in profit, loosen the economy. If in loss, tighten it.
-  if (todayProfit > 0) {
-    pressure -= Math.min(0.15, (todayProfit / 1000) * 0.02);
-  } else {
-    pressure += Math.min(0.20, (Math.abs(todayProfit) / 1000) * 0.05);
+  if (stored && typeof stored === 'object' && stored.expiresAt > Date.now()) {
+    return stored;
   }
 
-  // 2. Jackpot Pool Factor
-  const pool = await getJackpotPool();
-  const poolBaseline = 1500;
+  const fresh = rollHouseMood();
+  await jackpotTbl.set('ocean_houseMood', fresh);
+  return fresh;
+}
 
-  if (pool > poolBaseline) {
-    pressure -= Math.min(0.1, ((pool - poolBaseline) / 1000) * 0.02);
-  } else {
-    pressure += Math.min(0.1, ((poolBaseline - pool) / 1000) * 0.04);
-  }
+/**
+ * Combines solvency and house mood into the single pressure value every game
+ * resolver uses. Solvency always has final say: in a critical state, mood can
+ * only add extra caution on top, never loosen odds below what solvency allows.
+ */
+export async function getEconomyPressure(pool: number): Promise<number> {
+  const solvency = getSolvencyState(pool);
+  const mood = await getHouseMood();
 
-  return Math.max(0.75, Math.min(1.25, pressure));
+  let pressure = solvency.pressure;
+  pressure *= solvency.level === 'critical' ? Math.max(1, mood.multiplier) : mood.multiplier;
+
+  return Math.max(0.75, Math.min(1.35, pressure));
 }
 
 // ── Weighted payout engine for Ocean Hunt ───────────────────────────────────
@@ -213,17 +319,34 @@ export interface SpinOutcome {
   label: string;
 }
 
+// Average payout each tier represents, for RTP math (recover/big/mega/superMega
+// each roll a small random range at resolution time — these are that range's mean).
+const AVG_TIER_MULTIPLIER: Record<SpinOutcome['tier'], number> = {
+  lose: 0, recover30: 0.3, recover70: 0.7, double: 2, triple: 3, big: 5, mega: 11, superMega: 17,
+};
+
+// Risk-scaled design-center RTP: the baseline (no grace period, no pity timer,
+// neutral pressure) odds are tuned to land here — a bit more generous at the
+// lowest stake, a bit tighter at the highest.
+const MIN_STAKE_BASE_RTP = 0.93; // at stake 5  (normalized = 0.2)
+const MAX_STAKE_BASE_RTP = 0.90; // at stake 100 (normalized = 1.0)
+
+function targetBaseRTP(normalized: number): number {
+  const t = (normalized - 0.2) / 0.8; // 0 at the lowest stake, 1 at the highest
+  return MIN_STAKE_BASE_RTP + (MAX_STAKE_BASE_RTP - MIN_STAKE_BASE_RTP) * t;
+}
+
 /**
  * Calculates win probabilities based on stake size and historical games.
  */
 export function getStakeProfile(stake: number, spinsPlayed: number = 100, consecutiveLosses: number = 0): StakeProfile {
   const minBet = 5;
   const maxBet = 100;
-
+  
   const clampedStake = Math.max(minBet, Math.min(maxBet, stake));
   // Maps 5 -> 0.2 (low-stake retention heaven) and 100 -> 1.0 (strict house-defending risk)
   const normalized = 0.2 + 0.8 * ((clampedStake - minBet) / (maxBet - minBet));
-
+  
   // Base probabilities scale dynamically against the normalized value
   let bigWinChance = Math.max(0.012, 0.03 - 0.018 * normalized);
   let megaWinChance = Math.max(0.003, 0.008 - 0.005 * normalized);
@@ -233,6 +356,40 @@ export function getStakeProfile(stake: number, spinsPlayed: number = 100, consec
   let recover70Chance = Math.max(0.08, 0.14 - 0.06 * normalized);
   let doubleChance = Math.max(0.08, 0.12 - 0.04 * normalized);
   let tripleChance = Math.max(0.03, 0.07 - 0.04 * normalized);
+
+  // --- BASE RTP RECALIBRATION ---
+  // Scale the winning-tier chances so the neutral, unboosted RTP for THIS stake
+  // lands on the risk-scaled target, before grace period / pity timer boosts
+  // (which are intentional, temporary generosity) get layered on top of it.
+  {
+    const rawWinTotal = recover30Chance + recover70Chance + doubleChance + tripleChance + bigWinChance + megaWinChance + superMegaWinChance;
+    const rawWinRTP = (
+      recover30Chance * AVG_TIER_MULTIPLIER.recover30 +
+      recover70Chance * AVG_TIER_MULTIPLIER.recover70 +
+      doubleChance * AVG_TIER_MULTIPLIER.double +
+      tripleChance * AVG_TIER_MULTIPLIER.triple +
+      bigWinChance * AVG_TIER_MULTIPLIER.big +
+      megaWinChance * AVG_TIER_MULTIPLIER.mega +
+      superMegaWinChance * AVG_TIER_MULTIPLIER.superMega
+    ) / (rawWinTotal + loseChance);
+
+    const target = targetBaseRTP(normalized);
+    const scale = rawWinRTP > 0 ? target / rawWinRTP : 1;
+
+    recover30Chance *= scale;
+    recover70Chance *= scale;
+    doubleChance    *= scale;
+    tripleChance    *= scale;
+    bigWinChance    *= scale;
+    megaWinChance   *= scale;
+    superMegaWinChance *= scale;
+
+    // Whatever probability mass shifted moves out of (or back into) 'lose', so the
+    // relative shape between winning tiers is preserved — only the overall win/lose
+    // balance changes.
+    const newWinTotal = recover30Chance + recover70Chance + doubleChance + tripleChance + bigWinChance + megaWinChance + superMegaWinChance;
+    loseChance = Math.max(0.05, loseChance - (newWinTotal - rawWinTotal));
+  }
 
   // --- BEGINNER GRACE PERIOD (Soft Landing & High-Tier Hooking) ---
   const gracePhase = Math.max(0, 1 - (spinsPlayed / 25));
@@ -311,15 +468,36 @@ export function resolveSpinOutcome(
   const total = weights.reduce((sum, entry) => sum + entry.weight, 0);
   const normalized = weights.map(entry => ({ ...entry, weight: entry.weight / total }));
 
+  // Hard RTP ceiling: whatever the beginner grace period, pity timer, and pressure
+  // factor stacked up to, the expected payout of this spin can never cross the
+  // ceiling. Winning-tier weights are scaled down proportionally (preserving their
+  // relative shape) and the reclaimed probability mass is added back to 'lose' —
+  // rather than capping any single tier, which would distort the odds shape.
+  const expectedRTP = normalized.reduce((sum, entry) => sum + entry.weight * AVG_TIER_MULTIPLIER[entry.tier], 0);
+  const rtpCeiling = getSolvencyState(pool).level === 'critical' ? EMERGENCY_CEILING_RTP : HARD_CEILING_RTP;
+
+  if (expectedRTP > rtpCeiling) {
+    const scaleDown = rtpCeiling / expectedRTP;
+    const loseEntry = normalized.find(entry => entry.tier === 'lose')!;
+    let reclaimed = 0;
+    for (const entry of normalized) {
+      if (entry.tier === 'lose') continue;
+      const removed = entry.weight * (1 - scaleDown);
+      entry.weight -= removed;
+      reclaimed += removed;
+    }
+    loseEntry.weight += reclaimed;
+  }
+
   const roll = Math.random();
   let cumulative = 0;
   for (const entry of normalized) {
     cumulative += entry.weight;
     if (roll <= cumulative) {
-
+      
       // Calculate dynamic profit metrics on the fly to protect house balance
       let healthScore = 0.5; // neutral starting state
-
+      
       if (todayProfit > 0) healthScore += 0.25; // house is in profit today
       else if (todayProfit < 0) healthScore -= 0.25; // house is down today
 
@@ -337,7 +515,7 @@ export function resolveSpinOutcome(
       else if (entry.tier === 'recover70') resolvedMultiplier = [0.6, 0.7, 0.8][Math.floor(Math.random() * 3)];
       else if (entry.tier === 'double') resolvedMultiplier = 2;
       else if (entry.tier === 'triple') resolvedMultiplier = 3;
-
+      
       // Dynamic High-Tiers: Higher house health increases odds of top-tier multipliers
       else if (entry.tier === 'big') {
         if (healthScore > 0.7) resolvedMultiplier = 6;
@@ -373,55 +551,11 @@ export function resolveSpinOutcome(
   return { tier: 'lose', multiplier: 0, label: 'No win' };
 }
 
-// ── Pool-gated jackpot payouts (mega / superMega) ──────────────────────────
-
-/**
- * If the jackpot pool can't actually afford the multiplier resolveSpinOutcome()
- * rolled, these are the guaranteed smaller multipliers paid instead. These are
- * paid directly (not drawn from the pool) so a thin pool never blocks a win —
- * it just downgrades the size of it.
- */
-export const MEGA_FALLBACK_RANGE = { min: 4, max: 6 } as const;       // matches 'big' tier payout
-export const SUPERMEGA_FALLBACK_RANGE = { min: 10, max: 12 } as const; // matches 'mega' tier payout
-
-export interface JackpotPayout {
-  totalWin: number;
-  multiplier: number;
-  fromPool: boolean;   // true if this payout was actually drawn down from the jackpot pool
-  downgraded: boolean; // true if the pool couldn't cover the rolled multiplier and we fell back
-}
-
-/**
- * Resolves the real payout for a mega/superMega spin, constrained by what the pool
- * can actually afford above its floor seed. Full multiplier wins are only paid out
- * (and only deducted from the pool) if the pool can cover them; otherwise the player
- * still gets a smaller guaranteed win, paid straight from the house.
- */
-export function resolveJackpotPayout(
-  tier: 'mega' | 'superMega',
-  bet: number,
-  multiplier: number,
-  pool: number
-): JackpotPayout {
-  const availableSurplus = Math.max(0, pool - JACKPOT_SEED);
-  const rawWin = Math.round(bet * multiplier);
-
-  if (rawWin <= availableSurplus) {
-    return { totalWin: rawWin, multiplier, fromPool: true, downgraded: false };
-  }
-
-  const fallbackRange = tier === 'superMega' ? SUPERMEGA_FALLBACK_RANGE : MEGA_FALLBACK_RANGE;
-  const fallbackMultiplier = fallbackRange.min + Math.floor(Math.random() * (fallbackRange.max - fallbackRange.min + 1));
-  const fallbackWin = Math.round(bet * fallbackMultiplier);
-
-  return { totalWin: fallbackWin, multiplier: fallbackMultiplier, fromPool: false, downgraded: true };
-}
-
-export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spinsPlayed = 100, consecutiveLosses = 0) {
+export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spinsPlayed = 100, consecutiveLosses = 0, pool = JACKPOT_SEED) {
   const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
   const riskFactor = (Math.max(5, Math.min(100, stake)) - 5) / 95; 
   const baseChance = Math.max(0.34, 0.48 - (riskFactor * 0.10));
-
+  
   const gracePhase = Math.max(0, 1 - (spinsPlayed / 25));
   const lowStakeFactor = Math.max(0, 1 - ((Math.max(5, stake) - 5) / 15));
   const beginnerBoost = 0.20 * gracePhase * lowStakeFactor; 
@@ -429,18 +563,25 @@ export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spins
   // Dry streak breaker: up to 25% extra win chance after severe losing streaks
   const pityBoost = consecutiveLosses >= 4 ? Math.min(0.25, (consecutiveLosses - 3) * 0.05) : 0;
 
-  const winChance = Math.min(0.85, Math.max(0.28, baseChance / pressureFactor) + beginnerBoost + pityBoost);
+  let winChance = Math.min(0.85, Math.max(0.28, baseChance / pressureFactor) + beginnerBoost + pityBoost);
+
+  // Hard RTP ceiling: no matter how much beginner boost + pity + loose mood stack,
+  // the house can never be pushed past this expected payout ratio. Automatically
+  // tightens further if the bank is in a critical solvency state.
+  const COINFLIP_MULTIPLIER = 2;
+  const rtpCeiling = getSolvencyState(pool).level === 'critical' ? EMERGENCY_CEILING_RTP : HARD_CEILING_RTP;
+  winChance = Math.min(winChance, rtpCeiling / COINFLIP_MULTIPLIER);
 
   return Math.random() <= winChance
-    ? { multiplier: 2, label: 'You won', win: true }
+    ? { multiplier: COINFLIP_MULTIPLIER, label: 'You won', win: true }
     : { multiplier: 0, label: 'You lost', win: false };
 }
 
-export function resolveDiceOutcome(stake: number, economyPressure = 1, spinsPlayed = 100, consecutiveLosses = 0) {
+export function resolveDiceOutcome(stake: number, economyPressure = 1, spinsPlayed = 100, consecutiveLosses = 0, pool = JACKPOT_SEED) {
   const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
   const riskFactor = (Math.max(5, Math.min(100, stake)) - 5) / 95;
   const baseWinChance = Math.max(0.28, 0.42 - (riskFactor * 0.10));
-
+  
   const gracePhase = Math.max(0, 1 - (spinsPlayed / 25));
   const lowStakeFactor = Math.max(0, 1 - ((Math.max(5, stake) - 5) / 15));
   const beginnerBoost = 0.18 * gracePhase * lowStakeFactor;
@@ -448,8 +589,15 @@ export function resolveDiceOutcome(stake: number, economyPressure = 1, spinsPlay
   // Dry streak breaker
   const pityBoost = consecutiveLosses >= 4 ? Math.min(0.25, (consecutiveLosses - 3) * 0.05) : 0;
 
-  const winChance = Math.min(0.75, Math.max(0.2, baseWinChance / pressureFactor) + beginnerBoost + pityBoost);
+  let winChance = Math.min(0.75, Math.max(0.2, baseWinChance / pressureFactor) + beginnerBoost + pityBoost);
   const tieChance = Math.max(0.08, Math.min(0.2, 0.16 / pressureFactor)); 
+
+  // Hard RTP ceiling — same principle as coinflip, but the tie's 1x refund also
+  // counts toward RTP, so it has to be netted out before capping the win chance.
+  const DICE_WIN_MULTIPLIER = 1.9;
+  const rtpCeiling = getSolvencyState(pool).level === 'critical' ? EMERGENCY_CEILING_RTP : HARD_CEILING_RTP;
+  const maxWinChance = Math.max(0, (rtpCeiling - tieChance) / DICE_WIN_MULTIPLIER);
+  winChance = Math.min(winChance, maxWinChance);
 
   const roll = Math.random();
   if (roll <= tieChance) {
