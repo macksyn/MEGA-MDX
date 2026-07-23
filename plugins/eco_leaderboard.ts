@@ -19,12 +19,10 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
   const medals = ['🥇', '🥈', '🥉'];
 
-  // entry.userId is already the raw JID the wallet was saved under (@lid
-  // when that's what WhatsApp gave us) — safe to mention directly, no need
-  // to reconstruct or re-resolve it live. Each wallet also already carries
-  // a best-effort .phone (unwrapped from @lid at sync time) and .name from
-  // syncIdentity(), so we use those for the display line instead of a
-  // second live lookup.
+  // entry.userId is the exact raw JID (e.g. @lid) captured at the time the
+  // wallet was written — same pattern activitytracker/activity.ts uses for
+  // its leaderboard, which mentions everyone correctly. That JID stays
+  // valid for mentions later; no live re-resolution needed or wanted here.
   const wallets = await Promise.all(top.map(entry => getWallet(entry.userId)));
 
   const lines = top.map((entry, i) => {
