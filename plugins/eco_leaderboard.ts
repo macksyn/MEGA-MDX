@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { getLeaderboard, formatNumber, withEconomyGuard, getWallet } from '../lib/economy.js';
+import { resolveParticipant } from '../lib/contactUtil.js';
 
 export const command = 'leaderboard';
 export const aliases = ['lb', 'topcoins'];
@@ -20,13 +21,16 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const medals = ['🥇', '🥈', '🥉'];
   const wallets = await Promise.all(top.map(entry => getWallet(entry.userId)));
   const lines = top.map((entry, i) => {
-    const name = wallets[i]?.name ? `${wallets[i].name} ` : '';
-    return `${medals[i] || `${i + 1}.`} ${name}@${entry.userId} — ${formatNumber(entry.amount)} ${emoji}`;
+    const { jid, phoneNumber, name } = resolveParticipant(entry.userId, sock);
+
+    mentions.push(jid);
+
+    return `${medals[i] || `${i + 1}.`} @${phoneNumber} — ${formatNumber(entry.amount)} ${emoji}`;
   });
 
   await sock.sendMessage(chatId, {
     text: `🏆 *${type === 'coins' ? 'Coins' : 'Groq Coins'} Leaderboard*\n\n${lines.join('\n')}`,
-    mentions: top.map(e => `${e.userId}@s.whatsapp.net`),
+    mentions,
     ...channelInfo
   }, { quoted: message });
 }

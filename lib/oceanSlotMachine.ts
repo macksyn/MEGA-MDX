@@ -49,8 +49,8 @@ const JACKPOT_SEED = 500; // protected floor — the bank can never be paid down
 // Same three-tier policy as Jungle Hunt — see lib/slotMachine.ts for the full
 // rationale. Kept as its own copy here rather than a shared import so Ocean
 // Hunt's tuning can diverge independently later if needed.
-export const TARGET_RTP            = 0.918;
-export const HARD_CEILING_RTP      = 0.95;
+export const TARGET_RTP            = 0.915;
+export const HARD_CEILING_RTP      = 0.93;
 export const EMERGENCY_CEILING_RTP = 0.90;
 
 export async function getJackpotPool(): Promise<number> {
