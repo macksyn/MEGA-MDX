@@ -93,9 +93,12 @@ export function withEconomyGuard(handler: (sock: any, message: any, args: string
         ...channelInfo
       }, { quoted: message });
     }
-    // Fire-and-forget: keep the wallet's name/phone fresh from this live
-    // message without delaying the actual command response.
-    if (senderId) void syncIdentity(cleanJid(senderId), sock, message?.pushName);
+    // Fire-and-forget: keep the wallet's name/phone/jid fresh from this live
+    // message without delaying the actual command response. IMPORTANT: pass
+    // the raw senderId (domain intact) as the 4th arg — cleanJid(senderId) is
+    // still the wallet's storage key, but resolvePhone()'s @lid-unwrap logic
+    // and the wallet's persisted .jid both need the un-stripped JID to work.
+    if (senderId) void syncIdentity(cleanJid(senderId), sock, message?.pushName, senderId);
     return handler(sock, message, args, context);
   };
 }
@@ -114,6 +117,10 @@ export interface Wallet {
   createdAt: number;
   name: string | null;    // best-known display first name (WhatsApp pushName/contact), for recognition
   phone: string | null;   // best-known phone number, resolved from @lid where needed
+  jid: string | null;     // raw JID as last seen, domain intact (e.g. '123@lid' or '234@s.whatsapp.net').
+                          // The wallet key itself (userId) has the domain stripped by cleanJid(), so this
+                          // is the ONLY place that survives to build a mention that WhatsApp will actually
+                          // render — never reconstruct a mention JID by guessing the domain.
   identitySyncedAt: number | null;
 }
 
@@ -129,6 +136,7 @@ const EMPTY_WALLET: Wallet = {
   createdAt: Date.now(),
   name: null,
   phone: null,
+  jid: null,
   identitySyncedAt: null,
 };
 
@@ -208,15 +216,22 @@ function resolveName(userId: string, sock: any, pushNameHint?: string | null): s
  * safe to call on every economy command — only writes when something
  * actually changed. Never throws.
  */
-export async function syncIdentity(userId: string, sock: any, pushName?: string | null): Promise<void> {
+export async function syncIdentity(userId: string, sock: any, pushName?: string | null, rawJid?: string | null): Promise<void> {
   if (!userId || !sock) return;
   try {
     const wallet = await getWallet(userId);
-    const [phone, name] = [await resolvePhone(userId, sock), resolveName(userId, sock, pushName)];
+    // Resolve against the raw JID (domain intact) when we have it — userId
+    // has already had its domain stripped by cleanJid() and can never match
+    // sock.store.contacts keys or trigger the @lid-unwrap branch otherwise.
+    // Falls back to userId for callers that don't have the raw JID handy
+    // (e.g. syncing a transfer recipient we've only ever seen as a cleaned id).
+    const jidForResolution = rawJid || userId;
+    const [phone, name] = [await resolvePhone(jidForResolution, sock), resolveName(jidForResolution, sock, pushName)];
 
     const patch: Partial<Wallet> = {};
     if (phone && phone !== wallet.phone) patch.phone = phone;
     if (name && name !== wallet.name) patch.name = name;
+    if (rawJid && rawJid !== wallet.jid) patch.jid = rawJid;
 
     if (Object.keys(patch).length > 0) {
       patch.identitySyncedAt = Date.now();
