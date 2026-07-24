@@ -504,6 +504,14 @@ async function handleAutoAttendance(message: any, sock: any): Promise<boolean> {
         bonusMessage = `\n💰 Coins earned: ${reward.toLocaleString()}` +
           (streakBonus > 0 ? ` (incl. ${streakBonus.toLocaleString()} streak bonus, x${attendanceSettings.streakBonusMultiplier})` : '') +
           (imageBonus > 0 ? ` (incl. ${imageBonus.toLocaleString()} image bonus)` : '');
+        // Reward is drawn from the same shared bank that backs !slots/
+        // !coinflip/!dice — if the bank's reserve is currently low, the
+        // payout may have been capped below what was actually earned.
+        if (bonusResult.capped) {
+          bonusMessage += reward > 0
+            ? `\n⚠️ _Bank reserve is low right now, so this was capped down from the full ${totalReward.toLocaleString()} earned. Check *.reserve* for details._`
+            : `\n⚠️ _Bank reserve is currently at its protected floor, so no coins could be paid out this time. Your streak still counts! Check *.reserve* for details._`;
+        }
       }
     } catch (error) {
       console.error('[ATTENDANCE] Error awarding economy coins:', error);

@@ -19,6 +19,7 @@ import moment from 'moment-timezone';
 import { createStore } from './pluginStore.js';
 import config from '../config.js';
 import { getMonthlyLeaderboard, isGroupEnabled } from './activitytracker.js';
+import { getJackpotPool, deductFromJackpot, settleWin, recordHouseActivity } from './slotMachine.js';
 import { cleanJid } from './isOwner.js';
 
 const root       = createStore('economy');
@@ -28,6 +29,7 @@ const settingsTbl = root.table('settings');
 const processed   = root.table('processed');
 const feePool     = root.table('feePool'); // accumulated fees from peer-to-peer exchanges
 const transactionsTbl = root.table('transactions'); // per-user ledger, keyed by userId -> array
+const exchangeDebtsTbl = root.table('exchangeDebts'); // per-user pending reciprocal !exchange debts, keyed by debtorId -> array
 
 const TZ = config.timeZone || 'Africa/Lagos';
 
@@ -41,6 +43,7 @@ interface EconomySettings {
   workCooldownMs:      number;
   top3Rewards:         [number, number, number]; // daily coins for whoever holds rank 1st/2nd/3rd on the monthly activity leaderboard, paid every day they hold that spot
   exchangeFeePercent:  number; // % cut taken from the Groq Coins side of a peer-to-peer !exchange, routed to the fee pool
+  exchangeAllowedAmounts: number[]; // whitelist of coin amounts !exchange will accept — keeps amounts predictable and easy to type
   fineAmount:          number; // coins docked for bad-word/spam triggers (used by other plugins if wired up)
   economyGroupId:      string | null; // the ONE group JID (e.g. '1203xxxx@g.us') this economy is scoped to. null = unrestricted (any chat)
 }
@@ -53,6 +56,7 @@ const DEFAULT_SETTINGS: EconomySettings = {
   workCooldownMs: Number(process.env.ECONOMY_WORK_COOLDOWN_MS) || 60 * 60 * 1000, // 1hr
   top3Rewards: [300, 200, 100],
   exchangeFeePercent: Number(process.env.ECONOMY_EXCHANGE_FEE_PERCENT) || 15,
+  exchangeAllowedAmounts: [10, 20, 50, 100],
   fineAmount: Number(process.env.ECONOMY_FINE_AMOUNT) || 20,
   economyGroupId: process.env.ECONOMY_GROUP_ID || null,
 };
@@ -462,13 +466,25 @@ export async function drainFeePool(): Promise<number> {
 }
 
 export async function exchangeWithMember(senderId: string, targetId: string, coinsAmount: number): Promise<
-  | { success: false; reason: 'invalid_amount' | 'self_exchange' | 'below_minimum' | 'insufficient_funds' }
-  | { success: true; coinsSpent: number; groqCoinsGained: number; fee: number }
+  | { success: false; reason: 'invalid_amount' | 'amount_not_allowed' | 'self_exchange' | 'below_minimum' | 'insufficient_funds' }
+  | { success: true; coinsSpent: number; groqCoinsGained: number; fee: number; debtResolved: boolean }
 > {
   if (!coinsAmount || coinsAmount <= 0) return { success: false, reason: 'invalid_amount' };
   if (senderId === targetId) return { success: false, reason: 'self_exchange' };
 
   const settings = await getSettings();
+
+  // Amount must be one of the admin-configured whitelist (default
+  // 10/20/50/100) — keeps !exchange predictable rather than arbitrary
+  // amounts. NOTE: this is independent of coinsPerGroqCoin (the conversion
+  // rate) — if coinsPerGroqCoin is set higher than an allowed amount, that
+  // amount will still fail with 'below_minimum' below. Keep the two settings
+  // coherent (e.g. set coinsPerGroqCoin <= the smallest allowed amount) if
+  // you want every whitelisted amount to actually be usable.
+  if (!settings.exchangeAllowedAmounts.includes(coinsAmount)) {
+    return { success: false, reason: 'amount_not_allowed' };
+  }
+
   if (coinsAmount < settings.coinsPerGroqCoin) {
     return { success: false, reason: 'below_minimum' };
   }
@@ -491,7 +507,70 @@ export async function exchangeWithMember(senderId: string, targetId: string, coi
   // Counts toward the SENDER's exchange-level progress, same as self-conversion did.
   await addExchange(senderId, 1);
 
-  return { success: true, coinsSpent: coinsToSpend, groqCoinsGained: netGroqCoins, fee };
+  // Reciprocal debt bookkeeping: if the sender previously benefited from an
+  // exchange FROM the target (i.e. sender already owed target a reciprocal),
+  // this exchange settles that debt. Either way, the target now owes the
+  // sender a reciprocal exchange going forward — that's the whole "Peter
+  // sends Paul, so now Paul owes Peter" loop.
+  const debtResolved = await resolveOldestDebt(senderId, targetId);
+  await addDebt(targetId, senderId);
+
+  return { success: true, coinsSpent: coinsToSpend, groqCoinsGained: netGroqCoins, fee, debtResolved };
+}
+
+// ── Reciprocal exchange debt ledger ───────────────────────────────────────────
+// Tracks, per debtor, who they still "owe" a reciprocal !exchange to. Purely
+// informational (nothing is auto-charged) — powers the "who owes me" /
+// "who do I owe" views and the post-exchange nudge message.
+
+interface ExchangeDebt {
+  id: string;
+  creditorId: string; // the person who is owed a reciprocal exchange
+  timestamp: number;
+}
+
+const MAX_DEBTS_PER_USER = 100;
+
+async function addDebt(debtorId: string, creditorId: string): Promise<void> {
+  try {
+    const list: ExchangeDebt[] = (await exchangeDebtsTbl.get(debtorId)) || [];
+    list.push({ id: `debt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, creditorId, timestamp: Date.now() });
+    if (list.length > MAX_DEBTS_PER_USER) list.splice(0, list.length - MAX_DEBTS_PER_USER);
+    await exchangeDebtsTbl.set(debtorId, list);
+  } catch (_) {
+    // Best-effort — debt tracking should never break the underlying exchange.
+  }
+}
+
+/** Resolves (removes) the oldest debt debtorId owes to creditorId, if any. Returns whether one was found. */
+async function resolveOldestDebt(debtorId: string, creditorId: string): Promise<boolean> {
+  try {
+    const list: ExchangeDebt[] = (await exchangeDebtsTbl.get(debtorId)) || [];
+    const idx = list.findIndex(d => d.creditorId === creditorId);
+    if (idx === -1) return false;
+    list.splice(idx, 1);
+    await exchangeDebtsTbl.set(debtorId, list);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/** Reciprocal exchanges this user still owes to others (they received, haven't paid back yet). */
+export async function getDebtsOwedByUser(userId: string): Promise<ExchangeDebt[]> {
+  return (await exchangeDebtsTbl.get(userId)) || [];
+}
+
+/** Who still owes THIS user a reciprocal exchange (they sent coins to these people, no payback yet). */
+export async function getDebtsOwedToUser(userId: string): Promise<Array<{ debtorId: string; timestamp: number }>> {
+  const all = (await exchangeDebtsTbl.getAll()) || {};
+  const results: Array<{ debtorId: string; timestamp: number }> = [];
+  for (const [debtorId, list] of Object.entries(all as Record<string, ExchangeDebt[]>)) {
+    for (const d of list) {
+      if (d.creditorId === userId) results.push({ debtorId, timestamp: d.timestamp });
+    }
+  }
+  return results.sort((a, b) => a.timestamp - b.timestamp);
 }
 
 // ── Attendance-triggered daily bonus ──────────────────────────────────────────
@@ -502,10 +581,16 @@ export async function exchangeWithMember(senderId: string, targetId: string, coi
 // entirely inside plugins/attendance.ts using ITS OWN settings (.attendance
 // settings) — attendance already tracks streak independently (dbUsers /
 // userData.streak), so it's the single source of truth for that number. This
-// function does not read economy settings and does not recompute anything;
-// it just credits the final amount attendance already worked out, and mirrors
-// the streak value onto the wallet purely for display in economy commands
-// (e.g. !balance) that may want to show it.
+// function does not read economy settings and does not recompute anything.
+//
+// IMPORTANT: the reward is drawn from the SAME shared bank that backs
+// !slots/!coinflip/!dice (lib/slotMachine.ts), not minted. It goes through
+// settleWin() — the exact function every game payout uses — so it's capped
+// down to whatever the bank can actually afford above its protected floor,
+// same as a slot payout would be, rather than paid in full regardless. It's
+// also recorded via recordHouseActivity() so it shows up in !reserve's daily
+// stats (as a payout with no corresponding "bet", since attendance isn't a
+// wager).
 
 export async function awardAttendanceBonus(
   userId: string,
@@ -513,7 +598,7 @@ export async function awardAttendanceBonus(
   streak: number
 ): Promise<
   | { success: false; reason: 'already_awarded_today' }
-  | { success: true; reward: number }
+  | { success: true; reward: number; capped: boolean }
 > {
   const wallet = await getWallet(userId);
   const today = todayStr();
@@ -524,14 +609,29 @@ export async function awardAttendanceBonus(
     return { success: false, reason: 'already_awarded_today' };
   }
 
-  wallet.coins += totalReward;
-  if (totalReward > 0) wallet.lifetimeCoinsEarned += totalReward;
+  const pool = await getJackpotPool();
+  const { payout, capped } = settleWin(totalReward, pool);
+
+  if (payout > 0) await deductFromJackpot(payout);
+  await recordHouseActivity(0, payout);
+
+  // Streak/attendance credit still updates even if the bank is completely
+  // dry right now (payout === 0) — attendance itself was still valid, and
+  // blocking that would unfairly penalize the member for the bank's state.
+  wallet.coins += payout;
+  if (payout > 0) wallet.lifetimeCoinsEarned += payout;
   wallet.dailyStreak = streak;
   wallet.lastDailyDate = today;
   const saved = await saveWallet(userId, wallet);
-  await logTransaction(userId, { currency: 'coins', amount: totalReward, balanceAfter: saved.coins, type: 'attendance', note: `streak: ${streak}` });
+  await logTransaction(userId, {
+    currency: 'coins',
+    amount: payout,
+    balanceAfter: saved.coins,
+    type: 'attendance',
+    note: `streak: ${streak}${capped ? ' (capped — bank reserve low)' : ''}`,
+  });
 
-  return { success: true, reward: totalReward };
+  return { success: true, reward: payout, capped };
 }
 
 // ── Work command (cooldown-based random payout) ──────────────────────────────
