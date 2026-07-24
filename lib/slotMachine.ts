@@ -391,9 +391,9 @@ export function getStakeProfile(stake: number, spinsPlayed: number = 100, consec
   const normalized = 0.2 + 0.8 * ((clampedStake - minBet) / (maxBet - minBet));
 
   // Base probabilities scale dynamically against the normalized value
-  let bigWinChance = Math.max(0.012, 0.03 - 0.018 * normalized);
-  let megaWinChance = Math.max(0.003, 0.008 - 0.005 * normalized);
-  let superMegaWinChance = Math.max(0.0006, 0.002 - 0.0014 * normalized);
+  let bigWinChance = Math.max(0.015, 0.045 - 0.025 * normalized);
+  let megaWinChance = Math.max(0.005, 0.015 - 0.009 * normalized);
+  let superMegaWinChance = Math.max(0.0015, 0.004 - 0.0028 * normalized);
   let loseChance = Math.max(0.42, 0.44 + 0.12 * normalized);
   let recover30Chance = Math.max(0.12, 0.17 - 0.05 * normalized);
   let recover70Chance = Math.max(0.08, 0.14 - 0.06 * normalized);
@@ -450,9 +450,9 @@ export function getStakeProfile(stake: number, spinsPlayed: number = 100, consec
       const baseMega = megaWinChance;
       const baseSuper = superMegaWinChance;
 
-      bigWinChance       *= (1 + 1.8 * newbieHighTierBoost);
-      megaWinChance      *= (1 + 2.5 * newbieHighTierBoost);
-      superMegaWinChance *= (1 + 3.0 * newbieHighTierBoost);
+      bigWinChance       *= (1 + 2.5 * newbieHighTierBoost);
+      megaWinChance      *= (1 + 3.5 * newbieHighTierBoost);
+      superMegaWinChance *= (1 + 4.5 * newbieHighTierBoost);
 
       const totalAddedHighTier = (bigWinChance - baseBig) + (megaWinChance - baseMega) + (superMegaWinChance - baseSuper);
       loseChance = Math.max(0.20, loseChance - totalAddedHighTier);
