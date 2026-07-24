@@ -17,7 +17,7 @@ export const cooldown = 3000;
 // Configured exactly to 5, 20, 50, and 100 coin options
 const ALLOWED_BETS = [5, 20, 50, 100];
 
-const SPIN_FRAMES = ['▰▱▱▱▱', '▰▰▱▱▱', '▰▰▰▱▱', '▰▰▰▰▱', '▰▰▰▰▰'];
+const SPIN_FRAMES = ['▰▰▱▱▱', '▰▰▰▱▱', '▰▰▰▰▱', '▰▰▰▰▰'];
 const SPIN_FRAME_DELAY_MS = 550;
 const INITIAL_DELAY_MS = 1200; // show first frame longer
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));

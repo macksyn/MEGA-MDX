@@ -298,7 +298,7 @@ function rollHouseMood(): HouseMood {
     multiplier = 0.9;
   } else if (r < 0.30) {
     mood = 'cold';
-    multiplier = 1.1;
+    multiplier = 1.2;
   } else {
     mood = 'neutral';
     multiplier = 1.0;

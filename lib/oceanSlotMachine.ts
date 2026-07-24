@@ -258,7 +258,7 @@ function rollHouseMood(): HouseMood {
     multiplier = 0.9;
   } else if (r < 0.30) {
     mood = 'cold';
-    multiplier = 1.1;
+    multiplier = 1.2;
   } else {
     mood = 'neutral';
     multiplier = 1.0;
@@ -427,8 +427,8 @@ export function getStakeProfile(stake: number, spinsPlayed: number = 100, consec
   if (consecutiveLosses >= 5) {
     // Caps out at 14 consecutive losses (max multiplier 10)
     const streakFactor = Math.min(10, consecutiveLosses - 4); 
-    // Reduces the chance to lose by up to 40% based on the streak severity
-    const lossReduction = loseChance * (0.04 * streakFactor); 
+    // Reduces the chance to lose by up to 50% based on the streak severity
+    const lossReduction = loseChance * (0.05 * streakFactor); 
 
     loseChance -= lossReduction;
     // Distribute the improved odds heavily towards a satisfying recovery and exciting wins
