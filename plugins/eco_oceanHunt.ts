@@ -26,6 +26,8 @@ const ALLOWED_BETS = [5, 20, 50, 100];
 
 const SPIN_FRAMES = ['🌊░░░░', '🌊🌊░░░', '🌊🌊🌊░░', '🌊🌊🌊🌊░', '🌊🌊🌊🌊🌊'];
 const SPIN_FRAME_DELAY_MS = 550;
+const INITIAL_DELAY_MS = 1200; // show first frame longer
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const WIN_BANNERS: Record<string, string> = {
   big:       '『 🌊 Ｂ Ｉ Ｇ　Ｃ Ａ Ｔ Ｃ Ｈ ！ 🌊 』',
@@ -74,21 +76,28 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const grid = spinGridForTier(outcome.tier);
 
   // Send initial spinning animation frame
-  const sent = await sock.sendMessage(chatId, {
-    text: `🐠 *OCEAN HUNT* 🐠\n\n🌊 Bubbling... ${SPIN_FRAMES[0]}`,
-    ...channelInfo
-  }, { quoted: message });
+  sent = await sock.sendMessage(chatId, {
+  text: `🐠 *OCEAN HUNT* 🐠\n\n🌊 Bubbling... ${SPIN_FRAMES[0]}`,
+  ...channelInfo
+}, { quoted: message });
 
-  // Loop through fluid aquatic frames
-  for (let i = 1; i < SPIN_FRAMES.length; i++) {
-    await delay(SPIN_FRAME_DELAY_MS);
+await delay(INITIAL_DELAY_MS);
+
+for (let i = 1; i < SPIN_FRAMES.length; i++) {
+  try {
     await sock.sendMessage(chatId, {
       text: `🐠 *OCEAN HUNT* 🐠\n\n🐟 Swimming deep...\n\n${SPIN_FRAMES[i]}`,
       edit: sent.key,
       ...channelInfo
     });
+  } catch {
+    sent = await sock.sendMessage(chatId, {
+      text: `🐠 *OCEAN HUNT* 🐠\n\n🐟 Swimming deep...\n\n${SPIN_FRAMES[i]}`,
+      ...channelInfo
+    });
   }
   await delay(SPIN_FRAME_DELAY_MS);
+}
 
   let winText = '';
   let banner = '';
