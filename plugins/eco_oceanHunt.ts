@@ -27,7 +27,6 @@ const ALLOWED_BETS = [5, 20, 50, 100];
 const SPIN_FRAMES = ['🌊░░░░', '🌊🌊░░░', '🌊🌊🌊░░', '🌊🌊🌊🌊'];
 const SPIN_FRAME_DELAY_MS = 550;
 const INITIAL_DELAY_MS = 1200; // show first frame longer
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const WIN_BANNERS: Record<string, string> = {
   big:       '『 🌊 Ｂ Ｉ Ｇ　Ｃ Ａ Ｔ Ｃ Ｈ ！ 🌊 』',
