@@ -9,7 +9,7 @@
 import { deductCoins, addCoins, getWallet, withEconomyGuard, formatNumber } from '../lib/economy.js';
 import {
   spinGridForTier, renderGrid,
-  contributeToJackpot, getJackpotPool, resolveSpinOutcome, settleWin, getEconomyPressure,
+  contributeToJackpot, getJackpotPool, resolveSpinOutcome, resolveJackpotPayout,
   incrementAndGetSpins, getTodayProfit, recordHouseActivity, deductFromJackpot,
   getConsecutiveLosses, incrementConsecutiveLosses, resetConsecutiveLosses,
   recordPlayerActivity, recordPlayerJackpot
@@ -24,9 +24,8 @@ export const cooldown = 3000;
 // Supported wager sizes matching your calibrated system
 const ALLOWED_BETS = [5, 20, 50, 100];
 
-const SPIN_FRAMES = ['🌊░░░░', '🌊🌊░░░', '🌊🌊🌊░░', '🌊🌊🌊🌊'];
+const SPIN_FRAMES = ['🌊░░░░', '🌊🌊░░░', '🌊🌊🌊░░', '🌊🌊🌊🌊░', '🌊🌊🌊🌊🌊'];
 const SPIN_FRAME_DELAY_MS = 550;
-const INITIAL_DELAY_MS = 1200; // show first frame longer
 
 const WIN_BANNERS: Record<string, string> = {
   big:       '『 🌊 Ｂ Ｉ Ｇ　Ｃ Ａ Ｔ Ｃ Ｈ ！ 🌊 』',
@@ -67,7 +66,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
   const newPool = await getJackpotPool();
   const todayProfit = await getTodayProfit();
-  const economyPressure = await getEconomyPressure(newPool);
+  const economyPressure = Math.max(0.8, Math.min(1.2, 1 + (newPool - 500) / 10000));
   const consecutiveLosses = await getConsecutiveLosses(userId);
 
   // Resolve outcome based on dynamic tracking
@@ -75,65 +74,62 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const grid = spinGridForTier(outcome.tier);
 
   // Send initial spinning animation frame
-  sent = await sock.sendMessage(chatId, {
-  text: `🐠 *OCEAN HUNT* 🐠\n\n🌊 Bubbling... ${SPIN_FRAMES[0]}`,
-  ...channelInfo
-}, { quoted: message });
+  const sent = await sock.sendMessage(chatId, {
+    text: `🐠 *OCEAN HUNT* 🐠\n\n🌊 Bubbling... ${SPIN_FRAMES[0]}`,
+    ...channelInfo
+  }, { quoted: message });
 
-await delay(INITIAL_DELAY_MS);
-
-for (let i = 1; i < SPIN_FRAMES.length; i++) {
-  try {
+  // Loop through fluid aquatic frames
+  for (let i = 1; i < SPIN_FRAMES.length; i++) {
+    await delay(SPIN_FRAME_DELAY_MS);
     await sock.sendMessage(chatId, {
       text: `🐠 *OCEAN HUNT* 🐠\n\n🐟 Swimming deep...\n\n${SPIN_FRAMES[i]}`,
       edit: sent.key,
       ...channelInfo
     });
-  } catch {
-    sent = await sock.sendMessage(chatId, {
-      text: `🐠 *OCEAN HUNT* 🐠\n\n🐟 Swimming deep...\n\n${SPIN_FRAMES[i]}`,
-      ...channelInfo
-    });
   }
   await delay(SPIN_FRAME_DELAY_MS);
-}
 
   let winText = '';
   let banner = '';
-  let totalWin = 0;
+  let totalWin = Math.round(bet * outcome.multiplier);
 
   if (outcome.tier === 'lose') {
     await incrementConsecutiveLosses(userId);
-    // The stake was already banked by contributeToJackpot() above — nothing further to settle.
     winText = `\n\n😬 Splashed! No luck on this dive. Better luck next time!`;
-  } else {
+  } else if (outcome.tier === 'mega' || outcome.tier === 'superMega') {
     await resetConsecutiveLosses(userId);
-
-    const rawWin = Math.round(bet * outcome.multiplier);
-    const settled = settleWin(rawWin, newPool);
-    totalWin = settled.payout;
+    await recordPlayerJackpot(userId);
+    const payout = resolveJackpotPayout(outcome.tier, bet, outcome.multiplier, newPool);
+    totalWin = payout.totalWin;
 
     await addCoins(userId, totalWin, { type: 'slots' });
-    await deductFromJackpot(totalWin); // Every payout is paid out of the real bank, never minted
-
-    if (outcome.tier === 'mega' || outcome.tier === 'superMega') {
-      await recordPlayerJackpot(userId);
-      banner = outcome.tier === 'mega' ? WIN_BANNERS.mega : WIN_BANNERS.superMega;
-      const emoji = outcome.tier === 'mega' ? '🐋🐋🦈 *MEGA CATCH!*' : '🐋🐋🐋 *GREAT WHITE WHALE!!*';
-      winText = settled.capped
-        ? `\n\n${emoji} The ocean vault couldn't cover the full payout, so this one's capped at *${formatNumber(totalWin)} coins*.`
-        : `\n\n${emoji} You got a *${outcome.multiplier}x* multiplier! Reeled in *${formatNumber(totalWin)} coins*!`;
-    } else if (outcome.tier === 'big') {
-      banner = WIN_BANNERS.big;
-      winText = settled.capped
-        ? `\n\n🎉 *${outcome.label}!* The vault couldn't cover the full amount, so you reeled in *${formatNumber(totalWin)} coins* instead of the usual ${outcome.multiplier}x.`
-        : `\n\n🎉 *${outcome.label}!* Reeled in *${formatNumber(totalWin)} coins* (${outcome.multiplier}x your bet)!`;
-    } else {
-      // recover30 / recover70 / double / triple
-      winText = settled.capped
-        ? `\n\n🎉 *${outcome.label}!* The vault couldn't cover the full amount, so you reeled in *${formatNumber(totalWin)} coins* instead of the usual ${outcome.multiplier}x.`
-        : `\n\n🎉 *${outcome.label}!* Reeled in *${formatNumber(totalWin)} coins* (${outcome.multiplier}x your bet)!`;
+    if (payout.fromPool) {
+      await deductFromJackpot(totalWin);
     }
+
+    if (outcome.tier === 'mega') {
+      banner = WIN_BANNERS.mega;
+      winText = payout.downgraded
+        ? `\n\n🐋🐋🦈 *MEGA CATCH!* The jackpot pool was running low, so you still reel in a solid *${payout.multiplier}x* — *${formatNumber(totalWin)} coins*!`
+        : `\n\n🐋🐋🦈 *MEGA CATCH!* You got a *${payout.multiplier}x* multiplier! Reeled in *${formatNumber(totalWin)} coins*!`;
+    } else {
+      banner = WIN_BANNERS.superMega;
+      winText = payout.downgraded
+        ? `\n\n🐋🐋🐋 *GREAT WHITE WHALE!!* The ocean vault couldn't cover the full jackpot, but you still haul in *${payout.multiplier}x* — *${formatNumber(totalWin)} coins*!`
+        : `\n\n🐋🐋🐋 *GREAT WHITE WHALE!!* Epic *${payout.multiplier}x* jackpot hit! Reeled in *${formatNumber(totalWin)} coins*!`;
+    }
+  } else if (outcome.tier === 'big') {
+    await resetConsecutiveLosses(userId);
+    await addCoins(userId, totalWin, { type: 'slots' });
+    banner = WIN_BANNERS.big;
+    winText = `\n\n🎉 *${outcome.label}!* Reeled in *${formatNumber(totalWin)} coins* (${outcome.multiplier}x your bet)!`;
+  } else {
+    // recover30 / recover70 / double / triple are still partial or full recoveries —
+    // only a genuine 'lose' should build the streak.
+    await resetConsecutiveLosses(userId);
+    await addCoins(userId, totalWin, { type: 'slots' });
+    winText = `\n\n🎉 *${outcome.label}!* Reeled in *${formatNumber(totalWin)} coins* (${outcome.multiplier}x your bet)!`;
   }
 
   // Log today's results to the daily profit table

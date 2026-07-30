@@ -17,9 +17,8 @@ export const cooldown = 3000;
 // Configured exactly to 5, 20, 50, and 100 coin options
 const ALLOWED_BETS = [5, 20, 50, 100];
 
-const SPIN_FRAMES = ['▰▰▱▱▱', '▰▰▰▱▱', '▰▰▰▰▱', '▰▰▰▰▰'];
+const SPIN_FRAMES = ['▰▱▱▱▱', '▰▰▱▱▱', '▰▰▰▱▱', '▰▰▰▰▱', '▰▰▰▰▰'];
 const SPIN_FRAME_DELAY_MS = 550;
-const INITIAL_DELAY_MS = 1200; // show first frame longer
 
 const WIN_BANNERS: Record<string, string> = {
   big:       '『 🎉 Ｂ Ｉ Ｇ　Ｗ Ｉ Ｎ ！ 🎉 』',
@@ -67,32 +66,21 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const outcome = resolveSpinOutcome(bet, economyPressure, spinsPlayed, todayProfit, newPool, consecutiveLosses);
   const grid = spinGridForTier(outcome.tier);
 
-  // Send initial frame
-  let sent = await sock.sendMessage(chatId, {
+  const sent = await sock.sendMessage(chatId, {
     text: `🎰 *JUNGLE HUNT* 🎰\n\n🎰 Spinning${SPIN_FRAMES[0]}`,
     ...channelInfo
   }, { quoted: message });
 
-  // Wait extra before first edit
-  await delay(INITIAL_DELAY_MS);
-
-  // Animate the rest
-for (let i = 1; i < SPIN_FRAMES.length; i++) {
-  try {
+  for (let i = 1; i < SPIN_FRAMES.length; i++) {
+    await delay(SPIN_FRAME_DELAY_MS);
     await sock.sendMessage(chatId, {
       text: `🎰 *JUNGLE HUNT* 🎰\n\n🎰 Spinning...\n\n${SPIN_FRAMES[i]}`,
       edit: sent.key,
       ...channelInfo
     });
-  } catch {
-    // Edit failed – send a new message instead and remember its key
-    sent = await sock.sendMessage(chatId, {
-      text: `🎰 *JUNGLE HUNT* 🎰\n\n🎰 Spinning...\n\n${SPIN_FRAMES[i]}`,
-      ...channelInfo
-    });
   }
   await delay(SPIN_FRAME_DELAY_MS);
-}
+
 
   let winText = '';
   let banner = '';
