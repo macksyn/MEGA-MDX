@@ -86,7 +86,21 @@ const dbAdminGroup   = db.table!('admin_group');
 let birthdaySettings: BirthdaySettings = { ...DEFAULT_SETTINGS, loaded: false };
 let busListenerRegistered = false;
 
-const lastSchedulerRun: Record<string, boolean> = {};
+// ── Self-arming daily guard state ─────────────────────────────────────────────
+// The guard is dormant by default. It only wakes up (starts ticking) on a date
+// that actually has a wish or reminder due, and disarms itself the moment all
+// of that date's tasks are confirmed sent (or give up after a retry cap) —
+// it never polls on ordinary days with nothing scheduled.
+
+const GUARD_TICK_MS     = 60 * 1000; // how often the guard checks in, once armed
+const GUARD_MAX_RETRIES = 30;        // ~30 attempts (30 min) per task before giving up for the day
+
+let guardInterval: NodeJS.Timeout | null = null;
+let guardDate:     string | null         = null;
+let guardTicking                          = false; // prevents overlapping ticks
+
+const wishRetryCounts:     Record<string, number> = {};
+const reminderRetryCounts: Record<string, number> = {};
 
 // ── Settings persistence ──────────────────────────────────────────────────────
 
@@ -579,21 +593,147 @@ async function runBirthdayReminders(sock: any, daysAhead: number): Promise<void>
   }
 }
 
+// ── Self-arming daily guard ────────────────────────────────────────────────────
+//
+// Design: instead of relying purely on exact-minute `at:` triggers (which can be
+// silently skipped by a cron hiccup, a blocked event loop, or a process restart
+// timing gap), a lightweight once-a-day check decides whether *today* has any
+// wish or reminder due at all. Most days it won't, and nothing further happens.
+// On a day that does have something due, it arms an internal retry loop that
+// ticks every minute, using the existing hasWishedToday/hasReminderSent dedup
+// logs to know what's still outstanding, and disarms itself the instant
+// everything for that date is done (or after a retry cap) — so there's no
+// standing background poll on ordinary days.
+
+function stopGuard(reason: string): void {
+  if (guardInterval) {
+    clearInterval(guardInterval);
+    guardInterval = null;
+    printLog('info', `[BIRTHDAY] Guard disarmed — ${reason}`);
+  }
+  guardDate = null;
+}
+
+async function guardTick(sock: any): Promise<void> {
+  if (guardTicking) return; // avoid overlapping ticks if a send is still in flight
+  guardTicking = true;
+
+  try {
+    const today = moment.tz(TIMEZONE).format('YYYY-MM-DD');
+
+    // Date rolled over while armed — stop; the daily arm-check will re-evaluate the new day.
+    if (guardDate !== today) {
+      stopGuard('date rolled over');
+      return;
+    }
+
+    const currentTime = moment.tz(TIMEZONE).format('HH:mm');
+    let stillPending   = false;
+
+    // ── Wishes ──
+    if (birthdaySettings.enableAutoWishes) {
+      const todays = await getTodaysBirthdays();
+      const unsent = [];
+      for (const p of todays) {
+        if (!(await hasWishedToday(p.userId))) unsent.push(p);
+      }
+
+      if (unsent.length > 0) {
+        if (currentTime >= birthdaySettings.wishTime) {
+          const key = `wishes_${today}`;
+          wishRetryCounts[key] = (wishRetryCounts[key] || 0) + 1;
+          if (wishRetryCounts[key] <= GUARD_MAX_RETRIES) {
+            stillPending = true;
+            printLog('info', `[BIRTHDAY] Guard: ${unsent.length} unsent wish(es), attempt ${wishRetryCounts[key]}/${GUARD_MAX_RETRIES}`);
+            await runBirthdayWishes(sock);
+          } else {
+            printLog('warning', `[BIRTHDAY] Guard: giving up on wishes for ${today} after ${GUARD_MAX_RETRIES} attempts`);
+          }
+        } else {
+          // wishTime hasn't arrived yet today — keep the guard alive, nothing to send yet
+          stillPending = true;
+        }
+      }
+    }
+
+    // ── Reminders ──
+    if (birthdaySettings.enableReminders) {
+      for (const days of birthdaySettings.reminderDays) {
+        const upcoming = await getUpcomingBirthdays(days);
+        const unsent   = [];
+        for (const p of upcoming) {
+          const reminderKey = `${today}-${p.userId}-${days}`;
+          if (!(await hasReminderSent(reminderKey))) unsent.push(p);
+        }
+
+        if (unsent.length > 0) {
+          if (currentTime >= birthdaySettings.reminderTime) {
+            const key = `reminder_${days}_${today}`;
+            reminderRetryCounts[key] = (reminderRetryCounts[key] || 0) + 1;
+            if (reminderRetryCounts[key] <= GUARD_MAX_RETRIES) {
+              stillPending = true;
+              printLog('info', `[BIRTHDAY] Guard: ${unsent.length} unsent ${days}-day reminder(s), attempt ${reminderRetryCounts[key]}/${GUARD_MAX_RETRIES}`);
+              await runBirthdayReminders(sock, days);
+            } else {
+              printLog('warning', `[BIRTHDAY] Guard: giving up on ${days}-day reminders for ${today} after ${GUARD_MAX_RETRIES} attempts`);
+            }
+          } else {
+            stillPending = true;
+          }
+        }
+      }
+    }
+
+    if (!stillPending) {
+      stopGuard(`all tasks for ${today} complete`);
+    }
+  } catch (e: any) {
+    printLog('error', `[BIRTHDAY] Guard tick error: ${e.message}`);
+  } finally {
+    guardTicking = false;
+  }
+}
+
+// Cheap once-a-day (and once-per-restart) check: is anything due today at all?
+// If not, the guard stays dormant — no polling happens until this is called again.
+async function armGuardIfNeeded(sock: any): Promise<void> {
+  if (!birthdaySettings.loaded) await loadSettings();
+
+  const today = moment.tz(TIMEZONE).format('YYYY-MM-DD');
+
+  // Already armed for today — nothing to do.
+  if (guardInterval && guardDate === today) return;
+
+  const todaysBirthdays = birthdaySettings.enableAutoWishes ? await getTodaysBirthdays() : [];
+
+  let anyReminderDue = false;
+  if (birthdaySettings.enableReminders) {
+    for (const days of birthdaySettings.reminderDays) {
+      const upcoming = await getUpcomingBirthdays(days);
+      if (upcoming.length > 0) { anyReminderDue = true; break; }
+    }
+  }
+
+  if (todaysBirthdays.length === 0 && !anyReminderDue) {
+    return; // nothing due today — stay dormant
+  }
+
+  guardDate = today;
+  delete wishRetryCounts[`wishes_${today}`];
+  printLog('info', `[BIRTHDAY] Guard armed for ${today} — ${todaysBirthdays.length} birthday(s) today, reminder(s) due: ${anyReminderDue}`);
+
+  guardInterval = setInterval(() => { void guardTick(sock); }, GUARD_TICK_MS);
+  await guardTick(sock); // check immediately in case we armed at/after the scheduled time
+}
+
 // ── Schedules — managed by pluginLoader.start() ───────────────────────────────
 
 export const schedules = [
   {
-    at: () => birthdaySettings.wishTime,
+    // Fires once, right after midnight WAT — decides whether today needs the guard at all.
+    cron: '1 0 * * *',
     handler: async (sock: any) => {
-      await runBirthdayWishes(sock);
-    },
-  },
-  {
-    at: () => birthdaySettings.reminderTime,
-    handler: async (sock: any) => {
-      for (const days of birthdaySettings.reminderDays) {
-        await runBirthdayReminders(sock, days);
-      }
+      await armGuardIfNeeded(sock);
     },
   },
   {
@@ -604,32 +744,11 @@ export const schedules = [
   },
 ];
 
-async function runMissedTasks(sock: any): Promise<void> {
-
-  const today       = moment.tz(TIMEZONE).format('YYYY-MM-DD');
-  const currentTime = moment.tz(TIMEZONE).format('HH:mm');
-
-  if (currentTime >= birthdaySettings.wishTime && !lastSchedulerRun[`wishes_${today}`]) {
-    lastSchedulerRun[`wishes_${today}`] = true;
-    printLog('info', '[BIRTHDAY] Running missed wishes after restart');
-    await runBirthdayWishes(sock);
-  }
-
-  for (const days of birthdaySettings.reminderDays) {
-    const runKey = `reminder_${days}_${today}`;
-    if (currentTime >= birthdaySettings.reminderTime && !lastSchedulerRun[runKey]) {
-      lastSchedulerRun[runKey] = true;
-      printLog('info', `[BIRTHDAY] Running missed ${days}-day reminders after restart`);
-      await runBirthdayReminders(sock, days);
-    }
-  }
-}
-
 // ── onLoad ────────────────────────────────────────────────────────────────────
 
 async function onLoad(sock: any): Promise<void> {
   await loadSettings();
-  await runMissedTasks(sock);
+  await armGuardIfNeeded(sock);
 
   if (!busListenerRegistered) {
     busListenerRegistered = true;
@@ -969,7 +1088,7 @@ async function handleForce(sock: any, message: any, chatId: string, senderId: st
 
   if (type === 'wishes') {
     await sock.sendMessage(chatId, { text: '🔧 Forcing birthday wishes...' }, { quoted: message });
-    delete lastSchedulerRun[`wishes_${today}`];
+    delete wishRetryCounts[`wishes_${today}`];
     await runBirthdayWishes(sock);
     return sock.sendMessage(chatId, { text: '✅ Forced birthday wishes completed!' }, { quoted: message });
   }
@@ -977,7 +1096,7 @@ async function handleForce(sock: any, message: any, chatId: string, senderId: st
     const days = args[1] ? parseInt(args[1]) : 7;
     if (isNaN(days)) return sock.sendMessage(chatId, { text: '❌ Invalid days parameter' }, { quoted: message });
     await sock.sendMessage(chatId, { text: `🔧 Forcing ${days}-day reminders...` }, { quoted: message });
-    delete lastSchedulerRun[`reminder_${days}_${today}`];
+    delete reminderRetryCounts[`reminder_${days}_${today}`];
     await runBirthdayReminders(sock, days);
     return sock.sendMessage(chatId, { text: `✅ Forced ${days}-day reminders completed!` }, { quoted: message });
   }
