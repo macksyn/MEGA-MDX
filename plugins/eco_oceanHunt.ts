@@ -9,7 +9,7 @@
 import { deductCoins, addCoins, getWallet, withEconomyGuard, formatNumber } from '../lib/economy.js';
 import {
   spinGridForTier, renderGrid,
-  contributeToJackpot, getJackpotPool, resolveSpinOutcome, resolveJackpotPayout,
+  contributeToJackpot, getJackpotPool, resolveSpinOutcome, settleWin, getEconomyPressure,
   incrementAndGetSpins, getTodayProfit, recordHouseActivity, deductFromJackpot,
   getConsecutiveLosses, incrementConsecutiveLosses, resetConsecutiveLosses,
   recordPlayerActivity, recordPlayerJackpot
