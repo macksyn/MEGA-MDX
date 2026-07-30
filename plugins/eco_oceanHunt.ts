@@ -6,6 +6,11 @@
  * Commands: .ocean <bet> [shallow|deep|reef]
  *           .ocean shop
  *           .ocean buy <type> <tier>
+ *
+ * Features:
+ * - Spinning animation
+ * - Poetic one‑line narration
+ * - Clear result summary with coin amount
  */
 
 import { deductCoins, addCoins, getWallet, withEconomyGuard, formatNumber, EQUIPMENT_DEFS, getEquipmentDefs, buyEquipment, equipEquipment } from '../lib/economy.js';
@@ -22,7 +27,6 @@ import {
   recordPlayerActivity,
   recordPlayerJackpot,
   settleWin,
-  JACKPOT_SEED,
 } from '../lib/oceanSlotMachine.js';
 import {
   getCurrentOceanState,
@@ -41,6 +45,12 @@ export const cooldown = 3000;
 const ALLOWED_BETS = [5, 20, 50, 100];
 const STRATEGIES = ['shallow', 'deep', 'reef'] as const;
 type Strategy = typeof STRATEGIES[number];
+
+// ── Animation frames ──────────────────────────────────────────────────
+const SPIN_FRAMES = ['🌊░░░░', '🌊🌊░░░', '🌊🌊🌊░░', '🌊🌊🌊🌊░', '🌊🌊🌊🌊🌊'];
+const SPIN_FRAME_DELAY_MS = 550;
+
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function _handler(sock: any, message: any, args: string[], context: any) {
   const { chatId, senderId, channelInfo } = context;
@@ -147,6 +157,22 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   // ── Player stats ──────────────────────────────────────────────
   const expeditions = await incrementAndGetSpins(userId);
 
+  // ── Start animation ────────────────────────────────────────────
+  const sent = await sock.sendMessage(chatId, {
+    text: `🐠 *OCEAN HUNT* 🐠\n\n🌊 Bubbling... ${SPIN_FRAMES[0]}`,
+    ...channelInfo,
+  }, { quoted: message });
+
+  for (let i = 1; i < SPIN_FRAMES.length; i++) {
+    await delay(SPIN_FRAME_DELAY_MS);
+    await sock.sendMessage(chatId, {
+      text: `🐠 *OCEAN HUNT* 🐠\n\n🐟 Swimming deep...\n\n${SPIN_FRAMES[i]}`,
+      edit: sent.key,
+      ...channelInfo,
+    });
+  }
+  await delay(SPIN_FRAME_DELAY_MS);
+
   // ── Resolve expedition ────────────────────────────────────────
   const outcome = await resolveExpedition(
     userId,
@@ -157,9 +183,9 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     expeditions
   );
 
-  // ── Handle outcome ────────────────────────────────────────────
+  // ── Handle outcome & calculate result ────────────────────────
   let winAmount = outcome.winAmount;
-  let finalText = '';
+  let resultText = '';
 
   if (outcome.type === 'predator') {
     if (winAmount < 0) {
@@ -168,10 +194,10 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
       if (!lossResult.success) winAmount = 0;
     }
     await incrementConsecutiveLosses(userId);
-    finalText = `\n\n${outcome.emoji} ${outcome.narration}`;
+    resultText = `❌ You lost *${formatNumber(Math.abs(winAmount))}* extra coins.`;
   } else if (outcome.type === 'empty') {
     await incrementConsecutiveLosses(userId);
-    finalText = `\n\n${outcome.emoji} ${outcome.narration}`;
+    resultText = `😐 Nothing caught. No change.`;
   } else {
     // Win: fish, treasure, jackpot
     await resetConsecutiveLosses(userId);
@@ -183,12 +209,22 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
         await deductFromJackpot(actualWin);
       }
       const winNote = capped ? ' (capped due to low reserve)' : '';
-      finalText = `\n\n${outcome.emoji} ${outcome.narration}${winNote}`;
+      let label = '';
+      if (outcome.type === 'fish') {
+        const quality = outcome.quality ? outcome.quality.charAt(0).toUpperCase() + outcome.quality.slice(1) : '';
+        const species = outcome.fishSpecies?.name || 'Fish';
+        label = `${quality} ${species}`;
+      } else if (outcome.type === 'treasure') {
+        label = 'Treasure';
+      } else if (outcome.type === 'jackpot') {
+        label = 'JACKPOT';
+      }
+      resultText = `✅ ${label}! You won *${formatNumber(actualWin)}* coins${winNote}`;
       if (outcome.type === 'jackpot') {
         await recordPlayerJackpot(userId);
       }
     } else {
-      finalText = `\n\n${outcome.emoji} ${outcome.narration}`;
+      resultText = `😐 No gain.`;
     }
   }
 
@@ -207,7 +243,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   // ── Wallet balance ─────────────────────────────────────────────
   const wallet = await getWallet(userId);
 
-  // ── Build message ─────────────────────────────────────────────
+  // ── Build final message ─────────────────────────────────────────
   const state = await getCurrentOceanState();
   const vol = await getVolatilityLevel();
   const stateEmoji: Record<string, string> = {
@@ -216,16 +252,21 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const events = await getActiveEvents();
   const eventHeader = events.length ? events.map(e => `${e.emoji} *${e.name}*`).join('  ') : '';
 
+  // Get poetic narration – first sentence only
+  const poetic = outcome.narration.split('.')[0] + '.';
+
   const messageText =
     `🐠 *OCEAN HUNT* 🐠\n` +
     (eventHeader ? `⚡ ${eventHeader}\n` : '') +
     `🌍 *${state.name.toUpperCase()}* ${stateEmoji[state.name] || '🌊'}  🌀${vol.toUpperCase()}\n` +
     `Strategy: *${strategy.toUpperCase()}*  Bet: ${formatNumber(bet)} coins\n` +
     `💰 Balance: ${formatNumber(wallet.coins)} coins\n\n` +
-    finalText;
+    `${outcome.emoji} ${poetic}\n` +
+    `${resultText}`;
 
   await sock.sendMessage(chatId, {
     text: messageText,
+    edit: sent.key,
     ...channelInfo,
   }, { quoted: message });
 }
