@@ -273,7 +273,7 @@ const EVENT_TEMPLATES: EventTemplate[] = [
     emoji: '⛈️',
     durationMs: 2 * 60 * 60 * 1000,
     weight: 8,
-    modifiers: { emptyMod: 1.2, predatorMod: 1.3, treasureMod: 1.6, jackpotMod: 1.2, rarityShift: 0.05 },
+    modifiers: { emptyMod: 1.15, predatorMod: 1.25, treasureMod: 1.4, jackpotMod: 1.1, rarityShift: 0.03 },
   },
   {
     id: 'tuna_migration',
@@ -281,11 +281,11 @@ const EVENT_TEMPLATES: EventTemplate[] = [
     description: 'Schools of tuna pass through – excellent fishing!',
     emoji: '🐟',
     durationMs: 3 * 60 * 60 * 1000,
-    weight: 10,
-    modifiers: { emptyMod: 0.7, rarityShift: 0.10, qualityBoost: 0.10 },
+    weight: 7, // slightly rarer
+    modifiers: { emptyMod: 0.8, rarityShift: 0.07, qualityBoost: 0.07 },
     specialSpecies: [
-      { name: 'Bluefin Tuna', emoji: '🐟', rarity: 'rare', multiplier: 4.5 },
-      { name: 'Yellowfin Tuna', emoji: '🐟', rarity: 'uncommon', multiplier: 3.0 },
+      { name: 'Bluefin Tuna', emoji: '🐟', rarity: 'rare', multiplier: 4.0 },
+      { name: 'Yellowfin Tuna', emoji: '🐟', rarity: 'uncommon', multiplier: 2.8 },
     ],
   },
   {
@@ -295,16 +295,16 @@ const EVENT_TEMPLATES: EventTemplate[] = [
     emoji: '🏴‍☠️',
     durationMs: 1.5 * 60 * 60 * 1000,
     weight: 6,
-    modifiers: { predatorMod: 1.8, treasureMod: 2.0, jackpotMod: 1.5, emptyMod: 1.1 },
+    modifiers: { predatorMod: 1.6, treasureMod: 1.8, jackpotMod: 1.4, emptyMod: 1.05 },
   },
   {
     id: 'treasure_tide',
     name: 'Treasure Tide',
     description: 'The tide brings sunken riches!',
     emoji: '💎',
-    durationMs: 2.5 * 60 * 60 * 1000,
-    weight: 7,
-    modifiers: { emptyMod: 0.9, treasureMod: 2.5, jackpotMod: 1.8, qualityBoost: 0.15 },
+    durationMs: 2 * 60 * 60 * 1000,
+    weight: 6,
+    modifiers: { emptyMod: 0.9, treasureMod: 2.0, jackpotMod: 1.5, qualityBoost: 0.10 },
   },
   {
     id: 'oil_spill',
@@ -313,7 +313,7 @@ const EVENT_TEMPLATES: EventTemplate[] = [
     emoji: '🛢️',
     durationMs: 4 * 60 * 60 * 1000,
     weight: 4,
-    modifiers: { emptyMod: 1.5, predatorMod: 1.2, treasureMod: 0.5, jackpotMod: 0.5, qualityBoost: -0.1, rarityShift: -0.05 },
+    modifiers: { emptyMod: 1.4, predatorMod: 1.1, treasureMod: 0.6, jackpotMod: 0.6, qualityBoost: -0.05, rarityShift: -0.03 },
     specialSpecies: [
       { name: 'Oil‑Resistant Fish', emoji: '🐠', rarity: 'common', multiplier: 1.0 },
     ],
@@ -324,11 +324,11 @@ const EVENT_TEMPLATES: EventTemplate[] = [
     description: 'The government boosts fishing yields!',
     emoji: '🎣',
     durationMs: 6 * 60 * 60 * 1000,
-    weight: 12,
+    weight: 10,
     schedule: { dayOfWeek: 6, hourStart: 8, hourEnd: 20 },
-    modifiers: { emptyMod: 0.6, treasureMod: 1.3, jackpotMod: 1.2, rarityShift: 0.08, qualityBoost: 0.20 },
+    modifiers: { emptyMod: 0.7, treasureMod: 1.2, jackpotMod: 1.1, rarityShift: 0.05, qualityBoost: 0.15 },
     specialSpecies: [
-      { name: 'Festival Salmon', emoji: '🐟', rarity: 'rare', multiplier: 5.0 },
+      { name: 'Festival Salmon', emoji: '🐟', rarity: 'rare', multiplier: 4.5 },
     ],
   },
   {
@@ -337,10 +337,10 @@ const EVENT_TEMPLATES: EventTemplate[] = [
     description: 'The reef blooms – fish are abundant and healthy.',
     emoji: '🌸',
     durationMs: 3 * 60 * 60 * 1000,
-    weight: 9,
-    modifiers: { emptyMod: 0.5, predatorMod: 0.6, qualityBoost: 0.25, rarityShift: 0.05 },
+    weight: 8,
+    modifiers: { emptyMod: 0.6, predatorMod: 0.7, qualityBoost: 0.18, rarityShift: 0.04 },
     specialSpecies: [
-      { name: 'Coral Grouper', emoji: '🐠', rarity: 'uncommon', multiplier: 2.8 },
+      { name: 'Coral Grouper', emoji: '🐠', rarity: 'uncommon', multiplier: 2.5 },
     ],
   },
 ];

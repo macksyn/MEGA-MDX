@@ -24,7 +24,7 @@ const playerStatsTbl = store.table('playerStats');
 const houseStatsTbl = store.table('houseStats');
 
 export const JACKPOT_SEED = 500;
-export const TARGET_RTP = 0.92;
+export const TARGET_RTP = 0.80;
 export const HARD_CEILING_RTP = 0.94;
 export const EMERGENCY_CEILING_RTP = 0.90;
 
@@ -805,14 +805,14 @@ function getModifiersForState(name: OceanStateName): StateModifiers {
   }[name];
 
   const rtpScaleMap: Record<OceanStateName, number> = {
-    calm: 1.00,
-    rich: 0.98,
-    storm: 1.02,
-    deep_current: 1.01,
-    migration: 0.99,
-    treasure_tide: 1.03,
-    dangerous: 1.04,
-    breeding: 0.97,
+    calm: 0.92,
+    rich: 0.90,
+    storm: 0.94,
+    deep_current: 0.95,
+    migration: 0.91,
+    treasure_tide: 0.95,
+    dangerous: 0.96,
+    breeding: 0.89,
   };
 
   return { ...base, rtpScale: rtpScaleMap[name] };
