@@ -1,69 +1,40 @@
 // @ts-nocheck
 /***
  * lib/oceanSlotMachine.ts
- *
- * "Ocean Hunt" slot machine engine + its own independent jackpot pool.
- * Pure game logic based on the verified Jungle Hunt engine.
- *
- * ── The pool is a real bank, not a side pot ─────────────────────────────
- * Same model as Jungle Hunt, but kept fully independent — its own pool
- * ('ocean_pool'), its own house mood ('ocean_houseMood'), separate from
- * Jungle Hunt's. Every stake a player loses becomes real pool capital the
- * moment it's wagered (contributeToJackpot). Every coin paid out to a
- * winner is drawn back out of that same pool (settleWin + deductFromJackpot)
- * — nothing is ever minted from nowhere. JACKPOT_SEED is a protected floor
- * no payout may push the pool below.
- *
- * getEconomyPressure() combines real bank solvency (protects the floor,
- * never auto-loosens just because the pool has grown large) with the
- * house's shared "mood" (a small, randomly-timed hot/cold swing).
- *
- * Payout is fully tier-driven: resolveSpinOutcome() is the single source of
- * truth for what a spin wins. spinGridForTier() then draws a grid that
- * matches that result. All symbols are marine life; the payline signature
- * escalates by how many 🐋/🦈 appear:
- *
- *   lose       — no whale, no shark
- *   recover30  — 1 shark
- *   recover70  — 1 whale
- *   double     — 1 whale + 1 shark
- *   triple     — 2 sharks
- *   big        — 1 whale + 2 sharks
- *   mega       — 2 whales + 1 shark  (pays stake multiplier 10-12, capped to what the pool can afford)
- *   superMega  — 3 whales            (pays stake multiplier 16-18, capped to what the pool can afford)
- *
- * Newbie grace period boosts chances at stakes strictly under 20 coins,
- * scaling down linearly to 0.0 at stakes of 20 or more.
+ * Ocean Hunt – Expedition Engine
+ * Integrates: Ocean states, volatility, dynamic fish, equipment, quality,
+ * adaptive variance, world events, rich narration, secure RNG.
  */
 
+import crypto from 'crypto';
 import { createStore } from './pluginStore.js';
+import {
+  getCurrentOceanState,
+  getVolatilityFactor,
+  getFishAvailabilityWithEvents,
+  getEventModifiers,
+  getActiveEvents,
+  FishSpecies,
+} from './oceanEcosystem.js';
+import { getEquipment, EQUIPMENT_DEFS, formatNumber } from './economy.js';
 
-const store          = createStore('slotmachine');
-const jackpotTbl     = store.table('jackpot'); // 'ocean_pool' -> number, 'ocean_houseMood' -> HouseMood
-const playerStatsTbl = store.table('playerStats'); // tracks individual player spins
-const houseStatsTbl  = store.table('houseStats'); // tracks daily bets/wins for profit calculation
+const store = createStore('slotmachine');
+const jackpotTbl = store.table('jackpot');
+const playerStatsTbl = store.table('playerStats');
+const houseStatsTbl = store.table('houseStats');
 
-const JACKPOT_SEED = 500; // protected floor — the bank can never be paid down below this, by anything
-
-// ── RTP policy ───────────────────────────────────────────────────────────────
-// Same three-tier policy as Jungle Hunt — see lib/slotMachine.ts for the full
-// rationale. Kept as its own copy here rather than a shared import so Ocean
-// Hunt's tuning can diverge independently later if needed.
-export const TARGET_RTP            = 0.915;
-export const HARD_CEILING_RTP      = 0.93;
+export const JACKPOT_SEED = 500;
+export const TARGET_RTP = 0.92;
+export const HARD_CEILING_RTP = 0.94;
 export const EMERGENCY_CEILING_RTP = 0.90;
+
+// ── Pool functions ────────────────────────────────────────────────────
 
 export async function getJackpotPool(): Promise<number> {
   const val = await jackpotTbl.get('pool');
   return typeof val === 'number' ? val : JACKPOT_SEED;
 }
 
-/**
- * Called on every gambling bet — the full stake becomes real bank capital the
- * instant it's wagered. If the player wins, settleWin() + deductFromJackpot()
- * pay their winnings back out of this same pool; if they lose, the stake just
- * stays banked.
- */
 export async function contributeToJackpot(bet: number): Promise<number> {
   const pool = await getJackpotPool();
   const newPool = pool + bet;
@@ -71,7 +42,6 @@ export async function contributeToJackpot(bet: number): Promise<number> {
   return newPool;
 }
 
-/** Pays a payout out of the ocean jackpot pool, respecting the protected floor seed. */
 export async function deductFromJackpot(amount: number): Promise<number> {
   const pool = await getJackpotPool();
   const newPool = Math.max(JACKPOT_SEED, pool - amount);
@@ -79,18 +49,7 @@ export async function deductFromJackpot(amount: number): Promise<number> {
   return newPool;
 }
 
-export interface SettledPayout {
-  payout: number;
-  capped: boolean; // true if the bank couldn't afford the full rolled payout and this was capped down
-}
-
-/**
- * Every winning payout — from every game, every tier — is settled through here
- * before it's paid. The bank never pays more than it actually has above its
- * protected floor; if a payout would breach that floor, it's capped down to
- * whatever the bank can currently afford instead of being paid in full anyway.
- */
-export function settleWin(rawWin: number, pool: number): SettledPayout {
+export function settleWin(rawWin: number, pool: number): { payout: number; capped: boolean } {
   const availableSurplus = Math.max(0, pool - JACKPOT_SEED);
   if (rawWin <= availableSurplus) {
     return { payout: rawWin, capped: false };
@@ -98,7 +57,8 @@ export function settleWin(rawWin: number, pool: number): SettledPayout {
   return { payout: availableSurplus, capped: true };
 }
 
-/** Track how many spins a user has made to calculate their grace period */
+// ── Player stats ──────────────────────────────────────────────────────
+
 export async function incrementAndGetSpins(userId: string): Promise<number> {
   const current = (await playerStatsTbl.get(userId)) || 0;
   const updated = (current as number) + 1;
@@ -106,612 +66,754 @@ export async function incrementAndGetSpins(userId: string): Promise<number> {
   return updated;
 }
 
-/** Track consecutive losses for the pity timer */
 export async function getConsecutiveLosses(userId: string): Promise<number> {
   return ((await playerStatsTbl.get(`${userId}_streak`)) as number) || 0;
 }
-
 export async function incrementConsecutiveLosses(userId: string): Promise<number> {
   const current = await getConsecutiveLosses(userId);
   const updated = current + 1;
   await playerStatsTbl.set(`${userId}_streak`, updated);
   return updated;
 }
-
 export async function resetConsecutiveLosses(userId: string): Promise<void> {
   await playerStatsTbl.set(`${userId}_streak`, 0);
 }
 
-/** Track consecutive wins to potentially detect hot streaks or limit payouts */
-export async function getConsecutiveWins(userId: string): Promise<number> {
-  return ((await playerStatsTbl.get(`${userId}_winStreak`)) as number) || 0;
-}
-
-export async function incrementConsecutiveWins(userId: string): Promise<number> {
-  const current = await getConsecutiveWins(userId);
-  const updated = current + 1;
-  await playerStatsTbl.set(`${userId}_winStreak`, updated);
-  return updated;
-}
-
-export async function resetConsecutiveWins(userId: string): Promise<void> {
-  await playerStatsTbl.set(`${userId}_winStreak`, 0);
-}
-
-/** Record lifetime betting and payout totals for a specific player */
 export async function recordPlayerActivity(userId: string, bet: number, payout: number): Promise<void> {
   const currentBet = ((await playerStatsTbl.get(`${userId}_totalBet`)) as number) || 0;
   const currentWon = ((await playerStatsTbl.get(`${userId}_totalWon`)) as number) || 0;
-
   await playerStatsTbl.set(`${userId}_totalBet`, currentBet + bet);
   await playerStatsTbl.set(`${userId}_totalWon`, currentWon + payout);
 }
-
-/** Record the exact timestamp of a player's last major jackpot/super-mega win */
 export async function recordPlayerJackpot(userId: string): Promise<void> {
   await playerStatsTbl.set(`${userId}_lastJackpot`, new Date().toISOString());
 }
 
-/** 
- * Compiles a full player profile including calculated metrics like RTP 
- * (Return To Player) and Average Stake.
- */
-export async function getPlayerProfile(userId: string) {
-  const spins = ((await playerStatsTbl.get(userId)) as number) || 0;
-  const totalBet = ((await playerStatsTbl.get(`${userId}_totalBet`)) as number) || 0;
-  const totalWon = ((await playerStatsTbl.get(`${userId}_totalWon`)) as number) || 0;
-  const lastJackpot = ((await playerStatsTbl.get(`${userId}_lastJackpot`)) as string) || null;
-  const winStreak = await getConsecutiveWins(userId);
-  const lossStreak = await getConsecutiveLosses(userId);
+// ── House daily stats ────────────────────────────────────────────────
 
-  const rtp = totalBet > 0 ? (totalWon / totalBet) : 0;
-  const averageStake = spins > 0 ? (totalBet / spins) : 0;
-
-  return {
-    spins,
-    totalBet,
-    totalWon,
-    rtp,
-    averageStake,
-    lastJackpot,
-    winStreak,
-    lossStreak
-  };
-}
-
-/** Retrieves today's net profit (bets - payouts) */
 export async function getTodayProfit(): Promise<number> {
   const todayStr = new Date().toISOString().split('T')[0];
   const betKey = `${todayStr}_ocean_bet`;
   const wonKey = `${todayStr}_ocean_won`;
-  
   const todayBet = ((await houseStatsTbl.get(betKey)) as number) || 0;
   const todayWon = ((await houseStatsTbl.get(wonKey)) as number) || 0;
-  
   return todayBet - todayWon;
 }
 
-/** Records house activity for a specific spin or game */
 export async function recordHouseActivity(bet: number, payout: number): Promise<void> {
   const todayStr = new Date().toISOString().split('T')[0];
   const betKey = `${todayStr}_ocean_bet`;
   const wonKey = `${todayStr}_ocean_won`;
-  
   const currentBet = ((await houseStatsTbl.get(betKey)) as number) || 0;
   const currentWon = ((await houseStatsTbl.get(wonKey)) as number) || 0;
-  
   await houseStatsTbl.set(betKey, currentBet + bet);
   await houseStatsTbl.set(wonKey, currentWon + payout);
 }
 
-// ── Bank solvency & house mood ──────────────────────────────────────────────
-//
-// getEconomyPressure() is the single source of truth for how generous or
-// strict the house is right now. Same two-factor model as Jungle Hunt:
-// real solvency (protects the floor, never auto-loosens on a large pool)
-// combined with an independent, randomly-timed house mood.
-//
-// < 1.0 = Loose/Generous · > 1.0 = Tight/Strict
+// ── Expedition types ──────────────────────────────────────────────────
 
-const CRITICAL_BAND            = JACKPOT_SEED * 0.5; // surplus below this = critical zone
-const MAX_CRITICAL_TIGHTENING  = 0.35;                // extra pressure added right at the floor
+export type Strategy = 'shallow' | 'deep' | 'reef';
+export type Quality = 'damaged' | 'common' | 'healthy' | 'premium' | 'legendary';
 
-export type SolvencyLevel = 'critical' | 'healthy';
-
-export interface SolvencyState {
-  level: SolvencyLevel;
-  surplus: number;
-  pressure: number;
+export interface ExpeditionOutcome {
+  type: 'empty' | 'fish' | 'treasure' | 'jackpot' | 'predator';
+  outcomeLabel: string;
+  emoji: string;
+  narration: string;
+  winAmount: number;
+  fishRarity?: 'common' | 'uncommon' | 'rare' | 'legendary' | 'mythic';
+  quality?: Quality;
+  qualityMultiplier?: number;
+  multiplier?: number;
+  capped: boolean;
+  fishSpecies?: FishSpecies;
+  predatorSubType?: 'attack' | 'boatDamage' | 'netDamage';
 }
 
-/** Reads the ocean bank's actual health from its real surplus above the protected floor. */
-export function getSolvencyState(pool: number): SolvencyState {
-  const surplus = Math.max(0, pool - JACKPOT_SEED);
+// ── Constants ─────────────────────────────────────────────────────────
 
-  if (surplus >= CRITICAL_BAND) {
-    return { level: 'healthy', surplus, pressure: 1.0 };
-  }
-
-  const severity = 1 - (surplus / CRITICAL_BAND);
-  const pressure = 1.0 + severity * MAX_CRITICAL_TIGHTENING;
-  return { level: 'critical', surplus, pressure };
-}
-
-const MOOD_MIN_DURATION_MS = 20 * 60 * 1000;  // 20 minutes
-const MOOD_MAX_DURATION_MS = 120 * 60 * 1000; // 2 hours
-
-export type HouseMoodName = 'hot' | 'neutral' | 'cold';
-
-export interface HouseMood {
-  mood: HouseMoodName;
-  multiplier: number; // <1 loosens, >1 tightens
-  expiresAt: number;
-}
-
-function rollHouseMood(): HouseMood {
-  const r = Math.random();
-  let mood: HouseMoodName;
-  let multiplier: number;
-
-  if (r < 0.15) {
-    mood = 'hot';
-    multiplier = 0.9;
-  } else if (r < 0.30) {
-    mood = 'cold';
-    multiplier = 1.2;
-  } else {
-    mood = 'neutral';
-    multiplier = 1.0;
-  }
-
-  const duration = MOOD_MIN_DURATION_MS + Math.random() * (MOOD_MAX_DURATION_MS - MOOD_MIN_DURATION_MS);
-  return { mood, multiplier, expiresAt: Date.now() + duration };
-}
-
-/**
- * Ocean Hunt's own house mood — kept under a distinct storage key so it swings
- * independently of Jungle Hunt's, even though both live in the same store.
- */
-export async function getHouseMood(): Promise<HouseMood> {
-  const stored = (await jackpotTbl.get('ocean_houseMood')) as HouseMood | undefined;
-
-  if (stored && typeof stored === 'object' && stored.expiresAt > Date.now()) {
-    return stored;
-  }
-
-  const fresh = rollHouseMood();
-  await jackpotTbl.set('ocean_houseMood', fresh);
-  return fresh;
-}
-
-/**
- * Combines solvency and house mood into the single pressure value every game
- * resolver uses. Solvency always has final say: in a critical state, mood can
- * only add extra caution on top, never loosen odds below what solvency allows.
- */
-export async function getEconomyPressure(pool: number): Promise<number> {
-  const solvency = getSolvencyState(pool);
-  const mood = await getHouseMood();
-
-  let pressure = solvency.pressure;
-  pressure *= solvency.level === 'critical' ? Math.max(1, mood.multiplier) : mood.multiplier;
-
-  return Math.max(0.75, Math.min(1.35, pressure));
-}
-
-// ── Weighted payout engine for Ocean Hunt ───────────────────────────────────
-
-export interface StakeProfile {
-  stake: number;
-  bigWinChance: number;
-  megaWinChance: number;
-  superMegaWinChance: number;
-  loseChance: number;
-  recover30Chance: number;
-  recover70Chance: number;
-  doubleChance: number;
-  tripleChance: number;
-}
-
-export interface SpinOutcome {
-  tier: 'lose' | 'recover30' | 'recover70' | 'double' | 'triple' | 'big' | 'mega' | 'superMega';
-  multiplier: number;
-  label: string;
-}
-
-// Average payout each tier represents, for RTP math (recover/big/mega/superMega
-// each roll a small random range at resolution time — these are that range's mean).
-const AVG_TIER_MULTIPLIER: Record<SpinOutcome['tier'], number> = {
-  lose: 0, recover30: 0.3, recover70: 0.7, double: 2, triple: 3, big: 5, mega: 11, superMega: 17,
+const FISH_MULTIPLIERS = {
+  common: 1.5,
+  uncommon: 2.5,
+  rare: 4,
+  legendary: 7,
+  mythic: 12,
 };
 
-// Risk-scaled design-center RTP: the baseline (no grace period, no pity timer,
-// neutral pressure) odds are tuned to land here — a bit more generous at the
-// lowest stake, a bit tighter at the highest.
-const MIN_STAKE_BASE_RTP = 0.93; // at stake 5  (normalized = 0.2)
-const MAX_STAKE_BASE_RTP = 0.90; // at stake 100 (normalized = 1.0)
+const TREASURE_MIN = 2;
+const TREASURE_MAX = 5;
+const PREDATOR_LOSS_FRACTION = 0.5;
 
-function targetBaseRTP(normalized: number): number {
-  const t = (normalized - 0.2) / 0.8; // 0 at the lowest stake, 1 at the highest
-  return MIN_STAKE_BASE_RTP + (MAX_STAKE_BASE_RTP - MIN_STAKE_BASE_RTP) * t;
+const QUALITY_MULTIPLIERS: Record<Quality, number> = {
+  damaged: 0.6,
+  common: 1.0,
+  healthy: 1.3,
+  premium: 1.8,
+  legendary: 3.0,
+};
+
+const QUALITY_BASE_PROB: Record<Quality, number> = {
+  damaged: 0.10,
+  common: 0.40,
+  healthy: 0.30,
+  premium: 0.15,
+  legendary: 0.05,
+};
+
+const VOLATILITY_SENSITIVITY: Record<string, number> = {
+  empty: 0.3,
+  common: -0.2,
+  uncommon: -0.3,
+  rare: -0.1,
+  legendary: 0.25,
+  mythic: 0.35,
+  treasure: -0.1,
+  jackpot: 0.4,
+  predator: 0.2,
+};
+
+// ── Secure RNG ────────────────────────────────────────────────────────
+
+function secureRandom(): number {
+  const buffer = crypto.randomBytes(4);
+  return buffer.readUInt32BE(0) / 0xFFFFFFFF;
 }
 
-/**
- * Calculates win probabilities based on stake size and historical games.
- */
-export function getStakeProfile(stake: number, spinsPlayed: number = 100, consecutiveLosses: number = 0): StakeProfile {
-  const minBet = 5;
-  const maxBet = 100;
-  
-  const clampedStake = Math.max(minBet, Math.min(maxBet, stake));
-  // Maps 5 -> 0.2 (low-stake retention heaven) and 100 -> 1.0 (strict house-defending risk)
-  const normalized = 0.2 + 0.8 * ((clampedStake - minBet) / (maxBet - minBet));
-  
-  // Base probabilities scale dynamically against the normalized value
-  let bigWinChance = Math.max(0.015, 0.045 - 0.025 * normalized);
-  let megaWinChance = Math.max(0.005, 0.015 - 0.009 * normalized);
-  let superMegaWinChance = Math.max(0.0015, 0.004 - 0.0028 * normalized);
-  let loseChance = Math.max(0.42, 0.44 + 0.12 * normalized);
-  let recover30Chance = Math.max(0.12, 0.17 - 0.05 * normalized);
-  let recover70Chance = Math.max(0.08, 0.14 - 0.06 * normalized);
-  let doubleChance = Math.max(0.08, 0.12 - 0.04 * normalized);
-  let tripleChance = Math.max(0.03, 0.07 - 0.04 * normalized);
+function pickRandom<T>(arr: T[]): T {
+  return arr[Math.floor(secureRandom() * arr.length)];
+}
 
-  // --- BASE RTP RECALIBRATION ---
-  // Scale the winning-tier chances so the neutral, unboosted RTP for THIS stake
-  // lands on the risk-scaled target, before grace period / pity timer boosts
-  // (which are intentional, temporary generosity) get layered on top of it.
-  {
-    const rawWinTotal = recover30Chance + recover70Chance + doubleChance + tripleChance + bigWinChance + megaWinChance + superMegaWinChance;
-    const rawWinRTP = (
-      recover30Chance * AVG_TIER_MULTIPLIER.recover30 +
-      recover70Chance * AVG_TIER_MULTIPLIER.recover70 +
-      doubleChance * AVG_TIER_MULTIPLIER.double +
-      tripleChance * AVG_TIER_MULTIPLIER.triple +
-      bigWinChance * AVG_TIER_MULTIPLIER.big +
-      megaWinChance * AVG_TIER_MULTIPLIER.mega +
-      superMegaWinChance * AVG_TIER_MULTIPLIER.superMega
-    ) / (rawWinTotal + loseChance);
+// ── Adaptive variance ────────────────────────────────────────────────
 
-    const target = targetBaseRTP(normalized);
-    const scale = rawWinRTP > 0 ? target / rawWinRTP : 1;
+function getAdaptiveFactor(consecutiveLosses: number): number {
+  const maxReduction = 0.10;
+  const rate = 0.12;
+  const fraction = 1 - Math.exp(-consecutiveLosses * rate);
+  return 1 - maxReduction * fraction;
+}
 
-    recover30Chance *= scale;
-    recover70Chance *= scale;
-    doubleChance    *= scale;
-    tripleChance    *= scale;
-    bigWinChance    *= scale;
-    megaWinChance   *= scale;
-    superMegaWinChance *= scale;
+// ── Scene setters ─────────────────────────────────────────────────────
 
-    // Whatever probability mass shifted moves out of (or back into) 'lose', so the
-    // relative shape between winning tiers is preserved — only the overall win/lose
-    // balance changes.
-    const newWinTotal = recover30Chance + recover70Chance + doubleChance + tripleChance + bigWinChance + megaWinChance + superMegaWinChance;
-    loseChance = Math.max(0.05, loseChance - (newWinTotal - rawWinTotal));
+function getSceneIntro(): string {
+  const intros = [
+    "The morning mist lifts over the water as",
+    "Under a blazing afternoon sun,",
+    "As dusk paints the sky orange,",
+    "In the dead of night, under a crescent moon,",
+    "A gentle breeze carries the scent of salt as",
+    "The wind howls across the deck while",
+    "Your crew works in silence as",
+    "A rainbow arcs over the horizon as",
+    "The waves crash against the hull as",
+    "The ocean whispers secrets to you as",
+  ];
+  return pickRandom(intros);
+}
+
+// ── Narration templates ──────────────────────────────────────────────
+
+const NARRATIONS = {
+  empty: [
+    "{intro} your net comes up empty. The fish are elusive today.",
+    "{intro} nothing but water. Better luck next time.",
+    "{intro} the ocean is quiet. No fish around.",
+    "{intro} you cast your line, but the sea gives nothing.",
+    "{intro} a ghost net drifts by – but it's empty, too.",
+  ],
+  fish: {
+    common: [
+      "{intro} you reel in a {quality} {species}. A modest start.",
+      "{intro} a {quality} {species} wriggles in your net.",
+      "{intro} tiny but tasty! A {quality} {species}.",
+      "{intro} the {quality} {species} is small, but it's a catch.",
+      "{intro} your line tugs – a {quality} {species} bites.",
+    ],
+    uncommon: [
+      "{intro} a decent {quality} {species}! Your net feels heavier.",
+      "{intro} you land a nice {quality} {species}.",
+      "{intro} not bad at all – a {quality} {species}.",
+      "{intro} the {quality} {species} puts up a fight, but you win.",
+      "{intro} a flash of silver – it's a {quality} {species}!",
+    ],
+    rare: [
+      "{intro} a beautiful {quality} {species}! You're getting good at this.",
+      "{intro} the {quality} {species} is a prize catch!",
+      "{intro} lucky day – you landed a {quality} {species}!",
+      "{intro} your skill is paying off – a {quality} {species} in your hold.",
+      "{intro} the crew cheers as a {quality} {species} breaks the surface.",
+    ],
+    legendary: [
+      "{intro} a legendary {quality} {species}! The crew cheers!",
+      "{intro} you've done it – a {quality} {species} of legend!",
+      "{intro} the {quality} {species} is magnificent! A story to tell.",
+      "{intro} rare and mighty – you caught a {quality} {species}!",
+      "{intro} the sea parts, revealing a {quality} {species} of myth.",
+    ],
+    mythic: [
+      "{intro} a MYTHIC {quality} {species}! The ocean trembles!",
+      "{intro} unbelievable – a {quality} {species} of myth!",
+      "{intro} the {quality} {species} is a true monster!",
+      "{intro} legends speak of the {quality} {species}, and you've caught it!",
+      "{intro} the water erupts – a {quality} {species} of unimaginable size!",
+    ],
+  },
+  special: [
+    "{intro} a {species} appears! This is a special catch!",
+    "{intro} the ocean reveals a rare {species}!",
+    "{intro} your instincts pay off – a {species}!",
+    "{intro} a shimmer of gold – it's a {species}!",
+  ],
+  treasure: [
+    "{intro} you spot a sunken chest! {coins} coins inside!",
+    "{intro} your net snags on something heavy – a treasure chest! {coins} coins!",
+    "{intro} you dive and find a chest with {coins} coins!",
+    "{intro} treasure glints in the sand – {coins} coins!",
+    "{intro} a wave washes a chest onto your deck – {coins} coins!",
+  ],
+  jackpot: [
+    "{intro} you've hit the JACKPOT! A colossal beast and {coins} coins!",
+    "{intro} the sea erupts – you've struck gold! {coins} coins!",
+    "{intro} a once‑in‑a‑lifetime catch! {coins} coins reward your bravery.",
+    "{intro} your crew goes wild – {coins} coins from the deep!",
+    "{intro} the ocean rewards your persistence with {coins} coins!",
+  ],
+  predator: {
+    attack: [
+      "{intro} a shark attacks! You lose {coins} coins.",
+      "{intro} a massive predator strikes! -{coins} coins.",
+      "{intro} you escape a sea monster, but lose {coins} coins.",
+      "{intro} jaws clamp down – you lose {coins} coins.",
+      "{intro} a shadow beneath – you're robbed of {coins} coins.",
+    ],
+    boatDamage: [
+      "{intro} a rogue wave damages your {boat}! Repair costs {coins} coins.",
+      "{intro} your {boat} takes a hit – {coins} coins gone.",
+      "{intro} rough seas cause damage to your {boat}: -{coins} coins.",
+      "{intro} your {boat} collides with debris – {coins} coins to fix.",
+      "{intro} the storm batters your {boat}, costing {coins} coins.",
+    ],
+    netDamage: [
+      "{intro} your {net} snags on a rock and tears! -{coins} coins.",
+      "{intro} a sharp reef ruins your {net}. Loss: {coins} coins.",
+      "{intro} the {net} is shredded. You lose {coins} coins.",
+      "{intro} your {net} catches a hidden wreck – {coins} coins to repair.",
+      "{intro} the {net} fails under pressure – {coins} coins lost.",
+    ],
+  },
+};
+
+function buildNarration(
+  templates: string[],
+  species?: FishSpecies,
+  quality?: Quality,
+  coins?: number,
+  eventName?: string,
+  equipment?: any
+): string {
+  const template = pickRandom(templates);
+  const intro = getSceneIntro();
+  let result = template
+    .replace(/\{intro\}/g, intro)
+    .replace(/\{species\}/g, species?.name || 'fish')
+    .replace(/\{quality\}/g, quality ? quality.charAt(0).toUpperCase() + quality.slice(1) : '')
+    .replace(/\{coins\}/g, coins !== undefined ? formatNumber(coins) : '')
+    .replace(/\{boat\}/g, equipment?.boat ? EQUIPMENT_DEFS[equipment.boat].displayName : 'boat')
+    .replace(/\{net\}/g, equipment?.net ? EQUIPMENT_DEFS[equipment.net].displayName : 'net')
+    .replace(/\{bait\}/g, equipment?.bait ? EQUIPMENT_DEFS[equipment.bait].displayName : 'bait');
+  if (eventName) {
+    result = `[${eventName}] ${result}`;
   }
+  return result;
+}
 
-  // --- BEGINNER GRACE PERIOD (Soft Landing & High-Tier Hooking) ---
-  const gracePhase = Math.max(0, 1 - (spinsPlayed / 25));
+// ── Main resolver ─────────────────────────────────────────────────────
 
-  if (gracePhase > 0) {
-    // 1. HIGH TIER ACCESSIBILITY (The Bait)
-    // Only boost low stakes (threshold is strictly under 20)
-    const lowStakeFactor = Math.max(0, 1 - ((clampedStake - 5) / 15));
-    const newbieHighTierBoost = gracePhase * lowStakeFactor;
+export async function resolveExpedition(
+  userId: string,
+  bet: number,
+  strategy: Strategy,
+  pool: number,
+  consecutiveLosses: number,
+  spinsPlayed: number
+): Promise<ExpeditionOutcome> {
+  // 1. Ocean state & volatility
+  const { name } = await getCurrentOceanState();
+  const modifiers = getModifiersForState(name);
+  const volFactor = await getVolatilityFactor();
 
-    if (newbieHighTierBoost > 0) {
-      const baseBig = bigWinChance;
-      const baseMega = megaWinChance;
-      const baseSuper = superMegaWinChance;
+  // 2. Base probabilities
+  let { fishWeights, emptyChance, treasureChance, predatorChance, jackpotChance, rtpScale } = modifiers;
 
-      bigWinChance       *= (1 + 2.5 * newbieHighTierBoost);
-      megaWinChance      *= (1 + 3.5 * newbieHighTierBoost);
-      superMegaWinChance *= (1 + 4.5 * newbieHighTierBoost);
+  // 3. Equipment
+  const equip = await getEquipment(userId);
+  const boatDef = EQUIPMENT_DEFS[equip.boat];
+  const netDef = EQUIPMENT_DEFS[equip.net];
+  const baitDef = EQUIPMENT_DEFS[equip.bait];
 
-      const totalAddedHighTier = (bigWinChance - baseBig) + (megaWinChance - baseMega) + (superMegaWinChance - baseSuper);
-      loseChance = Math.max(0.20, loseChance - totalAddedHighTier);
+  emptyChance *= (boatDef.modifiers.emptyMod || 1.0);
+  predatorChance *= (boatDef.modifiers.predatorMod || 1.0);
+
+  const rarityShift = netDef.modifiers.rarityShift || 0;
+  if (rarityShift > 0) {
+    const common = fishWeights.common;
+    const shift = common * rarityShift;
+    fishWeights.common -= shift;
+    const others = ['uncommon', 'rare', 'legendary', 'mythic'] as const;
+    const totalOthers = others.reduce((s, r) => s + fishWeights[r], 0);
+    if (totalOthers > 0) {
+      for (const r of others) {
+        fishWeights[r] += shift * (fishWeights[r] / totalOthers);
+      }
+    } else {
+      fishWeights.uncommon += shift;
     }
-
-    // 2. SOFT LANDING COMPENSATION (Retention)
-    const loseReduction = loseChance * 0.3 * gracePhase;
-    loseChance -= loseReduction;
-
-    recover70Chance += loseReduction * 0.4;
-    doubleChance    += loseReduction * 0.3;
-    tripleChance    += loseReduction * 0.3;
   }
 
-  // --- DRY STREAK BREAKER (Pity Timer) ---
-  // Secretly improves odds after 5 consecutive losses to prevent player churn
-  if (consecutiveLosses >= 5) {
-    // Caps out at 14 consecutive losses (max multiplier 10)
-    const streakFactor = Math.min(10, consecutiveLosses - 4); 
-    // Reduces the chance to lose by up to 50% based on the streak severity
-    const lossReduction = loseChance * (0.05 * streakFactor); 
+  treasureChance *= (baitDef.modifiers.treasureMod || 1.0);
+  jackpotChance *= (baitDef.modifiers.jackpotMod || 1.0);
+  const baitQualityBoost = baitDef.modifiers.qualityBoost || 0;
 
-    loseChance -= lossReduction;
-    // Distribute the improved odds heavily towards a satisfying recovery and exciting wins
-    recover70Chance += lossReduction * 0.50; 
-    doubleChance    += lossReduction * 0.30; 
-    bigWinChance    += lossReduction * 0.20; 
+  // 4. Strategy adjustments
+  let adjEmpty = emptyChance;
+  let adjTreasure = treasureChance;
+  let adjPredator = predatorChance;
+  let adjJackpot = jackpotChance;
+  let fishWeightCopy = { ...fishWeights };
+
+  switch (strategy) {
+    case 'shallow':
+      adjEmpty += 0.05;
+      adjTreasure -= 0.04;
+      adjPredator -= 0.06;
+      adjJackpot -= 0.01;
+      fishWeightCopy.common += 0.10;
+      fishWeightCopy.uncommon += 0.05;
+      fishWeightCopy.rare -= 0.08;
+      fishWeightCopy.legendary -= 0.05;
+      fishWeightCopy.mythic -= 0.02;
+      break;
+    case 'deep':
+      adjEmpty -= 0.03;
+      adjTreasure += 0.08;
+      adjPredator += 0.10;
+      adjJackpot += 0.02;
+      fishWeightCopy.common -= 0.08;
+      fishWeightCopy.uncommon -= 0.02;
+      fishWeightCopy.rare += 0.05;
+      fishWeightCopy.legendary += 0.03;
+      fishWeightCopy.mythic += 0.02;
+      break;
+    case 'reef':
+      break;
   }
+
+  adjEmpty = Math.max(0.02, Math.min(0.50, adjEmpty));
+  adjTreasure = Math.max(0.02, Math.min(0.40, adjTreasure));
+  adjPredator = Math.max(0.01, Math.min(0.50, adjPredator));
+  adjJackpot = Math.max(0.001, Math.min(0.08, adjJackpot));
+
+  const totalFishWeight = Object.values(fishWeightCopy).reduce((a, b) => a + b, 0);
+  const fishProbs: Record<string, number> = {};
+  for (const [key, val] of Object.entries(fishWeightCopy)) {
+    fishProbs[key] = val / totalFishWeight;
+  }
+
+  // 5. Volatility shift
+  const categories = [
+    { category: 'empty', prob: adjEmpty },
+    { category: 'predator', prob: adjPredator },
+    ...Object.entries(fishProbs).map(([rarity, prob]) => ({ category: rarity, prob })),
+    { category: 'treasure', prob: adjTreasure },
+    { category: 'jackpot', prob: adjJackpot },
+  ];
+
+  const shifted = categories.map(c => {
+    const sens = VOLATILITY_SENSITIVITY[c.category] || 0;
+    const weight = Math.exp(sens * volFactor);
+    return { ...c, weight };
+  });
+  const totalWeight = shifted.reduce((sum, c) => sum + c.prob * c.weight, 0);
+  const adjusted = shifted.map(c => ({
+    category: c.category,
+    prob: c.prob * c.weight / totalWeight,
+  }));
+
+  let adjEmptyV = adjusted.find(c => c.category === 'empty')?.prob || 0;
+  let adjPredatorV = adjusted.find(c => c.category === 'predator')?.prob || 0;
+  let adjTreasureV = adjusted.find(c => c.category === 'treasure')?.prob || 0;
+  let adjJackpotV = adjusted.find(c => c.category === 'jackpot')?.prob || 0;
+  const adjFishProbs: Record<string, number> = {};
+  for (const rarity of ['common','uncommon','rare','legendary','mythic']) {
+    adjFishProbs[rarity] = adjusted.find(c => c.category === rarity)?.prob || 0;
+  }
+
+  // 6. Fish availability (with events)
+  const fishAvail = await getFishAvailabilityWithEvents();
+
+  // 7. Special fish probability
+  const SPECIAL_CHANCE = 0.20;
+  let specialProb = 0;
+  if (fishAvail.specials.length > 0) {
+    const totalFishProb = Object.values(adjFishProbs).reduce((a,b) => a+b, 0);
+    specialProb = totalFishProb * SPECIAL_CHANCE;
+    for (const rarity of ['common','uncommon','rare','legendary','mythic']) {
+      adjFishProbs[rarity] *= (1 - SPECIAL_CHANCE);
+    }
+  }
+
+  // 8. Event modifiers
+  const eventMods = await getEventModifiers();
+  adjEmptyV *= eventMods.emptyMod;
+  adjPredatorV *= eventMods.predatorMod;
+  adjTreasureV *= eventMods.treasureMod;
+  adjJackpotV *= eventMods.jackpotMod;
+  // Event rarity shift
+  if (eventMods.rarityShift !== 0) {
+    const shift = eventMods.rarityShift;
+    const common = adjFishProbs.common;
+    const moved = common * shift;
+    adjFishProbs.common -= moved;
+    const others = ['uncommon','rare','legendary','mythic'] as const;
+    const totalOthers = others.reduce((s, r) => s + adjFishProbs[r], 0);
+    if (totalOthers > 0) {
+      for (const r of others) {
+        adjFishProbs[r] += moved * (adjFishProbs[r] / totalOthers);
+      }
+    } else {
+      adjFishProbs.uncommon += moved;
+    }
+  }
+  // Event quality boost
+  const eventQualityBoost = eventMods.qualityBoost || 0;
+
+  // 9. Adaptive variance (hidden)
+  const adaptiveFactor = getAdaptiveFactor(consecutiveLosses);
+  adjEmptyV *= adaptiveFactor;
+  adjPredatorV *= adaptiveFactor;
+
+  // Re-normalize all probabilities
+  const allProbs = {
+    empty: adjEmptyV,
+    predator: adjPredatorV,
+    ...adjFishProbs,
+    treasure: adjTreasureV,
+    jackpot: adjJackpotV,
+  };
+  const totalProb = Object.values(allProbs).reduce((s, p) => s + p, 0);
+  for (const key of Object.keys(allProbs)) {
+    allProbs[key] /= totalProb;
+  }
+  adjEmptyV = allProbs.empty;
+  adjPredatorV = allProbs.predator;
+  adjFishProbs.common = allProbs.common;
+  adjFishProbs.uncommon = allProbs.uncommon;
+  adjFishProbs.rare = allProbs.rare;
+  adjFishProbs.legendary = allProbs.legendary;
+  adjFishProbs.mythic = allProbs.mythic;
+  adjTreasureV = allProbs.treasure;
+  adjJackpotV = allProbs.jackpot;
+
+  // 10. Quality probabilities (bait + event)
+  const totalQualityBoost = baitQualityBoost + eventQualityBoost;
+  let qDamaged = QUALITY_BASE_PROB.damaged - totalQualityBoost * 0.5;
+  let qCommon = QUALITY_BASE_PROB.common - totalQualityBoost * 0.5;
+  let qHealthy = QUALITY_BASE_PROB.healthy;
+  let qPremium = QUALITY_BASE_PROB.premium + totalQualityBoost * 0.5;
+  let qLegendary = QUALITY_BASE_PROB.legendary + totalQualityBoost * 0.5;
+  qDamaged = Math.max(0, qDamaged);
+  qCommon = Math.max(0, qCommon);
+  qHealthy = Math.max(0, qHealthy);
+  qPremium = Math.max(0, qPremium);
+  qLegendary = Math.max(0, qLegendary);
+  const sumQ = qDamaged + qCommon + qHealthy + qPremium + qLegendary;
+  const qualityProbs = {
+    damaged: qDamaged / sumQ,
+    common: qCommon / sumQ,
+    healthy: qHealthy / sumQ,
+    premium: qPremium / sumQ,
+    legendary: qLegendary / sumQ,
+  } as const;
+
+  const expectedQualityMult =
+    qualityProbs.damaged * QUALITY_MULTIPLIERS.damaged +
+    qualityProbs.common * QUALITY_MULTIPLIERS.common +
+    qualityProbs.healthy * QUALITY_MULTIPLIERS.healthy +
+    qualityProbs.premium * QUALITY_MULTIPLIERS.premium +
+    qualityProbs.legendary * QUALITY_MULTIPLIERS.legendary;
+
+  // 11. EV scaling
+  const fishMult = FISH_MULTIPLIERS;
+  const treasureAvg = (TREASURE_MIN + TREASURE_MAX) / 2;
+  const jackpotAvg = 12.5;
+  const predatorLossMult = PREDATOR_LOSS_FRACTION;
+
+  let origPositiveEV = 0;
+  for (const [rarity, prob] of Object.entries(adjFishProbs)) {
+    const baseMult = fishMult[rarity as keyof typeof fishMult];
+    origPositiveEV += prob * baseMult * expectedQualityMult;
+  }
+  if (specialProb > 0 && fishAvail.specials.length > 0) {
+    const avgSpecialMult = fishAvail.specials.reduce((sum, s) => {
+      const m = s.multiplier || (s.rarity === 'legendary' ? 7 : 12);
+      return sum + m;
+    }, 0) / fishAvail.specials.length;
+    origPositiveEV += specialProb * avgSpecialMult * expectedQualityMult;
+  }
+  origPositiveEV += adjTreasureV * treasureAvg;
+  origPositiveEV += adjJackpotV * jackpotAvg;
+
+  const origPredatorLoss = adjPredatorV * predatorLossMult;
+
+  let evScale = (TARGET_RTP + origPredatorLoss) / (origPositiveEV || 0.01);
+  evScale = Math.max(0.6, Math.min(1.4, evScale));
+  const totalScale = rtpScale * evScale;
+
+  // 12. Build roll categories
+  const rollCategories: Array<{ category: string; prob: number }> = [
+    { category: 'empty', prob: adjEmptyV },
+    { category: 'predator', prob: adjPredatorV },
+    { category: 'treasure', prob: adjTreasureV },
+    { category: 'jackpot', prob: adjJackpotV },
+  ];
+  if (specialProb > 0) {
+    rollCategories.push({ category: 'special', prob: specialProb });
+  }
+  for (const rarity of ['common','uncommon','rare','legendary','mythic']) {
+    rollCategories.push({ category: rarity, prob: adjFishProbs[rarity] });
+  }
+
+  const totalCatProb = rollCategories.reduce((s, c) => s + c.prob, 0);
+  for (const c of rollCategories) c.prob /= totalCatProb;
+
+  // 13. Roll outcome
+  const roll = secureRandom();
+  let cum = 0;
+  let selected = 'empty';
+  for (const c of rollCategories) {
+    cum += c.prob;
+    if (roll <= cum) { selected = c.category; break; }
+  }
+
+  // Get active events for narration
+  const activeEvents = await getActiveEvents();
+  const eventNames = activeEvents.map(e => e.name).join(' + ');
+  const eventName = eventNames || undefined;
+
+  // 14. Handle outcomes
+  if (selected === 'predator') {
+    const subTypes = ['attack', 'boatDamage', 'netDamage'] as const;
+    const subType = subTypes[Math.floor(secureRandom() * subTypes.length)];
+    const loss = Math.min(bet, Math.round(bet * PREDATOR_LOSS_FRACTION));
+    const templateList = NARRATIONS.predator[subType];
+    const narration = buildNarration(
+      templateList,
+      undefined, undefined, loss, eventName, equip
+    );
+    const label = subType === 'attack' ? 'Predator Attack' : subType === 'boatDamage' ? 'Boat Damage' : 'Net Damage';
+    const emoji = subType === 'attack' ? '🦈' : subType === 'boatDamage' ? '🚢' : '🧵';
+    return {
+      type: 'predator',
+      outcomeLabel: label,
+      emoji,
+      narration,
+      winAmount: -loss,
+      capped: false,
+      predatorSubType: subType,
+    };
+  }
+
+  if (selected === 'empty') {
+    const narration = buildNarration(NARRATIONS.empty, undefined, undefined, undefined, eventName, equip);
+    return {
+      type: 'empty',
+      outcomeLabel: 'Empty Net',
+      emoji: '🌊',
+      narration,
+      winAmount: 0,
+      capped: false,
+    };
+  }
+
+  if (selected === 'treasure') {
+    const mult = TREASURE_MIN + secureRandom() * (TREASURE_MAX - TREASURE_MIN);
+    const rawWin = Math.round(bet * mult * totalScale);
+    const { payout, capped } = settleWin(rawWin, pool);
+    const narration = buildNarration(NARRATIONS.treasure, undefined, undefined, payout, eventName, equip);
+    return {
+      type: 'treasure',
+      outcomeLabel: 'Treasure Chest',
+      emoji: '💎',
+      narration,
+      winAmount: payout,
+      multiplier: payout / bet,
+      capped,
+    };
+  }
+
+  if (selected === 'jackpot') {
+    const rawMult = 10 + Math.floor(secureRandom() * 6);
+    const rawWin = Math.round(bet * rawMult * totalScale);
+    const { payout, capped } = settleWin(rawWin, pool);
+    const narration = buildNarration(NARRATIONS.jackpot, undefined, undefined, payout, eventName, equip);
+    return {
+      type: 'jackpot',
+      outcomeLabel: 'Jackpot!',
+      emoji: '🐋',
+      narration,
+      winAmount: payout,
+      multiplier: payout / bet,
+      capped,
+    };
+  }
+
+  // Fish (normal or special)
+  let species: FishSpecies;
+  let rarity: 'common' | 'uncommon' | 'rare' | 'legendary' | 'mythic';
+  let isSpecial = false;
+
+  if (selected === 'special') {
+    isSpecial = true;
+    species = fishAvail.specials[Math.floor(secureRandom() * fishAvail.specials.length)];
+    rarity = species.rarity as any;
+  } else {
+    rarity = selected as 'common' | 'uncommon' | 'rare' | 'legendary' | 'mythic';
+    const list = fishAvail[rarity];
+    if (list.length === 0) {
+      // Fallback
+      const fallbackNarration = buildNarration(['No fish of that rarity around.'], undefined, undefined, undefined, eventName, equip);
+      return {
+        type: 'empty',
+        outcomeLabel: 'Empty Net',
+        emoji: '🌊',
+        narration: fallbackNarration,
+        winAmount: 0,
+        capped: false,
+      };
+    }
+    species = list[Math.floor(secureRandom() * list.length)];
+  }
+
+  // Roll quality
+  const qualityRoll = secureRandom();
+  let quality: Quality = 'common';
+  let qcum = 0;
+  for (const q of ['damaged','common','healthy','premium','legendary'] as Quality[]) {
+    qcum += qualityProbs[q];
+    if (qualityRoll <= qcum) { quality = q; break; }
+  }
+  const qualityMult = QUALITY_MULTIPLIERS[quality];
+  const baseMult = species.multiplier || FISH_MULTIPLIERS[rarity] || 1.5;
+  const finalMult = baseMult * qualityMult;
+  const rawWin = Math.round(bet * finalMult * totalScale);
+  const { payout, capped } = settleWin(rawWin, pool);
+
+  // Build narration
+  const templateList = isSpecial ? NARRATIONS.special : (NARRATIONS.fish[rarity] || NARRATIONS.fish.common);
+  const narration = buildNarration(templateList, species, quality, payout, eventName, equip);
+
+  const qualityLabel = quality.charAt(0).toUpperCase() + quality.slice(1);
+  const rarityLabel = isSpecial ? 'Special' : rarity.charAt(0).toUpperCase() + rarity.slice(1);
+  const outcomeLabel = isSpecial ? `Special ${species.name}` : `${qualityLabel} ${rarityLabel}`;
 
   return {
-    stake, bigWinChance, megaWinChance, superMegaWinChance,
-    loseChance, recover30Chance, recover70Chance, doubleChance, tripleChance,
+    type: 'fish',
+    outcomeLabel,
+    emoji: species.emoji,
+    narration,
+    winAmount: payout,
+    fishRarity: rarity,
+    quality,
+    qualityMultiplier: qualityMult,
+    multiplier: payout / bet,
+    capped,
+    fishSpecies: species,
   };
 }
 
-export function resolveSpinOutcome(
-  stake: number, 
-  economyPressure = 1, 
-  spinsPlayed = 100,
-  todayProfit = 0,
-  pool = 500,
-  consecutiveLosses = 0
-): SpinOutcome {
-  const profile = getStakeProfile(stake, spinsPlayed, consecutiveLosses);
-  const pressureFactor = Math.max(0.8, Math.min(1.2, economyPressure));
+// ── State modifiers ──────────────────────────────────────────────────
 
-  const weights = [
-    { tier: 'lose' as const, weight: profile.loseChance * (1 + 0.08 * (pressureFactor - 1)) },
-    { tier: 'recover30' as const, weight: profile.recover30Chance / pressureFactor },
-    { tier: 'recover70' as const, weight: profile.recover70Chance / pressureFactor },
-    { tier: 'double' as const, weight: profile.doubleChance / pressureFactor },
-    { tier: 'triple' as const, weight: profile.tripleChance / pressureFactor },
-    { tier: 'big' as const, weight: profile.bigWinChance / pressureFactor },
-    { tier: 'mega' as const, weight: profile.megaWinChance / pressureFactor },
-    { tier: 'superMega' as const, weight: profile.superMegaWinChance / pressureFactor },
-  ];
+type OceanStateName =
+  | 'calm' | 'rich' | 'storm' | 'deep_current' | 'migration' | 'treasure_tide' | 'dangerous' | 'breeding';
 
-  const total = weights.reduce((sum, entry) => sum + entry.weight, 0);
-  const normalized = weights.map(entry => ({ ...entry, weight: entry.weight / total }));
-
-  // Hard RTP ceiling: whatever the beginner grace period, pity timer, and pressure
-  // factor stacked up to, the expected payout of this spin can never cross the
-  // ceiling. Winning-tier weights are scaled down proportionally (preserving their
-  // relative shape) and the reclaimed probability mass is added back to 'lose' —
-  // rather than capping any single tier, which would distort the odds shape.
-  const expectedRTP = normalized.reduce((sum, entry) => sum + entry.weight * AVG_TIER_MULTIPLIER[entry.tier], 0);
-  const rtpCeiling = getSolvencyState(pool).level === 'critical' ? EMERGENCY_CEILING_RTP : HARD_CEILING_RTP;
-
-  if (expectedRTP > rtpCeiling) {
-    const scaleDown = rtpCeiling / expectedRTP;
-    const loseEntry = normalized.find(entry => entry.tier === 'lose')!;
-    let reclaimed = 0;
-    for (const entry of normalized) {
-      if (entry.tier === 'lose') continue;
-      const removed = entry.weight * (1 - scaleDown);
-      entry.weight -= removed;
-      reclaimed += removed;
-    }
-    loseEntry.weight += reclaimed;
-  }
-
-  const roll = Math.random();
-  let cumulative = 0;
-  for (const entry of normalized) {
-    cumulative += entry.weight;
-    if (roll <= cumulative) {
-      
-      // Calculate dynamic profit metrics on the fly to protect house balance
-      let healthScore = 0.5; // neutral starting state
-      
-      if (todayProfit > 0) healthScore += 0.25; // house is in profit today
-      else if (todayProfit < 0) healthScore -= 0.25; // house is down today
-
-      if (pool > 2000) healthScore += 0.25; // robust reserve
-      else if (pool < 800) healthScore -= 0.25; // critical reserve level
-
-      healthScore = Math.max(0, Math.min(1, healthScore));
-
-      let resolvedMultiplier = 0;
-
-      // Handle default low-tier multipliers
-      if (entry.tier === 'lose') resolvedMultiplier = 0;
-      // Randomize recovery values to prevent predictability 
-      else if (entry.tier === 'recover30') resolvedMultiplier = [0.2, 0.3, 0.4][Math.floor(Math.random() * 3)];
-      else if (entry.tier === 'recover70') resolvedMultiplier = [0.6, 0.7, 0.8][Math.floor(Math.random() * 3)];
-      else if (entry.tier === 'double') resolvedMultiplier = 2;
-      else if (entry.tier === 'triple') resolvedMultiplier = 3;
-      
-      // Dynamic High-Tiers: Higher house health increases odds of top-tier multipliers
-      else if (entry.tier === 'big') {
-        if (healthScore > 0.7) resolvedMultiplier = 6;
-        else if (healthScore < 0.3) resolvedMultiplier = 4;
-        else resolvedMultiplier = [4, 5, 6][Math.floor(Math.random() * 3)];
-      } 
-      else if (entry.tier === 'mega') {
-        if (healthScore > 0.7) resolvedMultiplier = 12;
-        else if (healthScore < 0.3) resolvedMultiplier = 10;
-        else resolvedMultiplier = [10, 11, 12][Math.floor(Math.random() * 3)];
-      } 
-      else if (entry.tier === 'superMega') {
-        if (healthScore > 0.7) resolvedMultiplier = 18;
-        else if (healthScore < 0.3) resolvedMultiplier = 16;
-        else resolvedMultiplier = [16, 17, 18][Math.floor(Math.random() * 3)];
-      }
-
-      return {
-        tier: entry.tier,
-        multiplier: resolvedMultiplier,
-        label: entry.tier === 'lose' ? 'No win'
-          : entry.tier === 'recover30' ? 'Recovery'
-          : entry.tier === 'recover70' ? 'Recovery'
-          : entry.tier === 'double' ? 'Double'
-          : entry.tier === 'triple' ? 'Triple'
-          : entry.tier === 'big' ? 'Big win'
-          : entry.tier === 'mega' ? 'Mega win'
-          : 'Super mega win',
-      };
-    }
-  }
-
-  return { tier: 'lose', multiplier: 0, label: 'No win' };
+interface StateModifiers {
+  fishWeights: { common: number; uncommon: number; rare: number; legendary: number; mythic: number };
+  emptyChance: number;
+  treasureChance: number;
+  predatorChance: number;
+  jackpotChance: number;
+  rtpScale: number;
 }
 
-export function resolveCoinflipOutcome(stake: number, economyPressure = 1, spinsPlayed = 100, consecutiveLosses = 0, pool = JACKPOT_SEED) {
-  const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
-  const riskFactor = (Math.max(5, Math.min(100, stake)) - 5) / 95; 
-  const baseChance = Math.max(0.34, 0.48 - (riskFactor * 0.10));
-  
-  const gracePhase = Math.max(0, 1 - (spinsPlayed / 25));
-  const lowStakeFactor = Math.max(0, 1 - ((Math.max(5, stake) - 5) / 15));
-  const beginnerBoost = 0.20 * gracePhase * lowStakeFactor; 
+function getModifiersForState(name: OceanStateName): StateModifiers {
+  const base: Omit<StateModifiers, 'rtpScale'> = {
+    calm: {
+      fishWeights: { common: 0.40, uncommon: 0.30, rare: 0.15, legendary: 0.10, mythic: 0.05 },
+      emptyChance: 0.20,
+      treasureChance: 0.10,
+      predatorChance: 0.10,
+      jackpotChance: 0.02,
+    },
+    rich: {
+      fishWeights: { common: 0.30, uncommon: 0.30, rare: 0.20, legendary: 0.15, mythic: 0.05 },
+      emptyChance: 0.10,
+      treasureChance: 0.10,
+      predatorChance: 0.05,
+      jackpotChance: 0.03,
+    },
+    storm: {
+      fishWeights: { common: 0.35, uncommon: 0.25, rare: 0.15, legendary: 0.15, mythic: 0.10 },
+      emptyChance: 0.25,
+      treasureChance: 0.20,
+      predatorChance: 0.25,
+      jackpotChance: 0.02,
+    },
+    deep_current: {
+      fishWeights: { common: 0.25, uncommon: 0.25, rare: 0.20, legendary: 0.20, mythic: 0.10 },
+      emptyChance: 0.15,
+      treasureChance: 0.25,
+      predatorChance: 0.20,
+      jackpotChance: 0.03,
+    },
+    migration: {
+      fishWeights: { common: 0.30, uncommon: 0.25, rare: 0.20, legendary: 0.18, mythic: 0.07 },
+      emptyChance: 0.12,
+      treasureChance: 0.15,
+      predatorChance: 0.08,
+      jackpotChance: 0.03,
+    },
+    treasure_tide: {
+      fishWeights: { common: 0.35, uncommon: 0.25, rare: 0.15, legendary: 0.15, mythic: 0.10 },
+      emptyChance: 0.18,
+      treasureChance: 0.35,
+      predatorChance: 0.10,
+      jackpotChance: 0.02,
+    },
+    dangerous: {
+      fishWeights: { common: 0.20, uncommon: 0.20, rare: 0.25, legendary: 0.25, mythic: 0.10 },
+      emptyChance: 0.15,
+      treasureChance: 0.10,
+      predatorChance: 0.40,
+      jackpotChance: 0.04,
+    },
+    breeding: {
+      fishWeights: { common: 0.40, uncommon: 0.30, rare: 0.15, legendary: 0.10, mythic: 0.05 },
+      emptyChance: 0.08,
+      treasureChance: 0.08,
+      predatorChance: 0.05,
+      jackpotChance: 0.01,
+    },
+  }[name];
 
-  // Dry streak breaker: up to 25% extra win chance after severe losing streaks
-  const pityBoost = consecutiveLosses >= 4 ? Math.min(0.25, (consecutiveLosses - 3) * 0.05) : 0;
+  const rtpScaleMap: Record<OceanStateName, number> = {
+    calm: 1.00,
+    rich: 0.98,
+    storm: 1.02,
+    deep_current: 1.01,
+    migration: 0.99,
+    treasure_tide: 1.03,
+    dangerous: 1.04,
+    breeding: 0.97,
+  };
 
-  let winChance = Math.min(0.85, Math.max(0.28, baseChance / pressureFactor) + beginnerBoost + pityBoost);
-
-  // Hard RTP ceiling: no matter how much beginner boost + pity + loose mood stack,
-  // the house can never be pushed past this expected payout ratio. Automatically
-  // tightens further if the bank is in a critical solvency state.
-  const COINFLIP_MULTIPLIER = 2;
-  const rtpCeiling = getSolvencyState(pool).level === 'critical' ? EMERGENCY_CEILING_RTP : HARD_CEILING_RTP;
-  winChance = Math.min(winChance, rtpCeiling / COINFLIP_MULTIPLIER);
-
-  return Math.random() <= winChance
-    ? { multiplier: COINFLIP_MULTIPLIER, label: 'You won', win: true }
-    : { multiplier: 0, label: 'You lost', win: false };
-}
-
-export function resolveDiceOutcome(stake: number, economyPressure = 1, spinsPlayed = 100, consecutiveLosses = 0, pool = JACKPOT_SEED) {
-  const pressureFactor = Math.max(0.85, Math.min(1.15, economyPressure));
-  const riskFactor = (Math.max(5, Math.min(100, stake)) - 5) / 95;
-  const baseWinChance = Math.max(0.28, 0.42 - (riskFactor * 0.10));
-  
-  const gracePhase = Math.max(0, 1 - (spinsPlayed / 25));
-  const lowStakeFactor = Math.max(0, 1 - ((Math.max(5, stake) - 5) / 15));
-  const beginnerBoost = 0.18 * gracePhase * lowStakeFactor;
-
-  // Dry streak breaker
-  const pityBoost = consecutiveLosses >= 4 ? Math.min(0.25, (consecutiveLosses - 3) * 0.05) : 0;
-
-  let winChance = Math.min(0.75, Math.max(0.2, baseWinChance / pressureFactor) + beginnerBoost + pityBoost);
-  const tieChance = Math.max(0.08, Math.min(0.2, 0.16 / pressureFactor)); 
-
-  // Hard RTP ceiling — same principle as coinflip, but the tie's 1x refund also
-  // counts toward RTP, so it has to be netted out before capping the win chance.
-  const DICE_WIN_MULTIPLIER = 1.9;
-  const rtpCeiling = getSolvencyState(pool).level === 'critical' ? EMERGENCY_CEILING_RTP : HARD_CEILING_RTP;
-  const maxWinChance = Math.max(0, (rtpCeiling - tieChance) / DICE_WIN_MULTIPLIER);
-  winChance = Math.min(winChance, maxWinChance);
-
-  const roll = Math.random();
-  if (roll <= tieChance) {
-    return { multiplier: 1, label: 'Tie', win: false, tie: true };
-  }
-  if (roll <= tieChance + winChance) {
-    return { multiplier: 1.9, label: 'You win', win: true };
-  }
-  return { multiplier: 0, label: 'You lost', win: false };
-}
-
-// ── Symbols & weighted RNG ────────────────────────────────────────────────────
-
-export const WHALE = '🐋';
-export const SHARK = '🦈';
-
-const SYMBOL_WEIGHTS: Array<{ symbol: string; weight: number }> = [
-  { symbol: '🐠',  weight: 0.30 }, // Clownfish
-  { symbol: '🐙',  weight: 0.22 }, // Octopus
-  { symbol: '🦀',  weight: 0.16 }, // Crab
-  { symbol: '🐢',  weight: 0.14 }, // Sea Turtle
-  { symbol: WHALE,  weight: 0.10 }, // Blue Whale (Special)
-  { symbol: SHARK, weight: 0.08 }, // Great White Shark (Special)
-];
-
-function rollSymbol(): string {
-  const r = Math.random();
-  let cumulative = 0;
-  for (const { symbol, weight } of SYMBOL_WEIGHTS) {
-    cumulative += weight;
-    if (r <= cumulative) return symbol;
-  }
-  return SYMBOL_WEIGHTS[0].symbol;
-}
-
-/** A filler ocean animal that is never Whale or Shark — used to pad non-payout lines. */
-function rollFillerSymbol(): string {
-  let symbol = rollSymbol();
-  while (symbol === WHALE || symbol === SHARK) symbol = rollSymbol();
-  return symbol;
-}
-
-const ROWS = 3;
-const COLS = 4;
-export const PAYLINE_INDEX = 1; // middle row, 0-indexed
-
-export function spinGrid(): string[][] {
-  const grid: string[][] = [];
-  for (let r = 0; r < ROWS; r++) {
-    const row: string[] = [];
-    for (let c = 0; c < COLS; c++) row.push(rollSymbol());
-    grid.push(row);
-  }
-  return grid;
-}
-
-const TIER_PAYLINE: Record<SpinOutcome['tier'], string[]> = {
-  lose:      [],
-  recover30: [SHARK],
-  recover70: [WHALE],
-  double:    [WHALE, SHARK],
-  triple:    [SHARK, SHARK],
-  big:       [WHALE, SHARK, SHARK],
-  mega:      [WHALE, WHALE, SHARK],
-  superMega: [WHALE, WHALE, WHALE],
-};
-
-/**
- * Tier-aware grid matching: populates the main payline according to the resolved outcome.
- */
-export function spinGridForTier(tier: SpinOutcome['tier']): string[][] {
-  const grid = spinGrid();
-  const payline = grid[PAYLINE_INDEX];
-  const fixed = TIER_PAYLINE[tier];
-
-  for (let c = 0; c < COLS; c++) {
-    payline[c] = c < fixed.length ? fixed[c] : rollFillerSymbol();
-  }
-
-  return grid;
-}
-
-/** Scores a row: how many symbols match consecutively from the left. */
-export function scorePayline(row: string[]): { symbol: string; count: number } {
-  const target = row[0];
-  let count = 0;
-  for (const s of row) {
-    if (s === target) count++;
-    else break;
-  }
-  return { symbol: target, count };
-}
-
-const PAYTABLE: Record<string, { 3?: number; 4?: number }> = {
-  '🐠':  { 3: 2.5, 4: 5 },
-  '🐙':  { 3: 4,   4: 8 },
-  '🦀':  { 3: 6,   4: 12 },
-  '🐢':  { 3: 5,   4: 10 },
-  [SHARK]: { 3: 8,  4: 16 },
-  [WHALE]: { 3: 10, 4: 20 },
-};
-
-export function getMultiplier(symbol: string, count: number): number {
-  if (count < 3) return 0;
-  const entry = PAYTABLE[symbol] as any;
-  return entry?.[count] || 0;
-}
-
-/** Renders the grid as a text block, with the payline row visually marked. */
-export function renderGrid(grid: string[][]): string {
-  return grid
-    .map((row, i) => {
-      const line = row.join('│');
-      return i === PAYLINE_INDEX ? `${line} ` : ` ${line} `;
-    })
-    .join('\n');
+  return { ...base, rtpScale: rtpScaleMap[name] };
 }
