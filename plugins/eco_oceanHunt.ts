@@ -8,9 +8,10 @@
  *           .ocean buy <type> <tier>
  *
  * Features:
- * - Spinning animation
+ * - Spinning animation with staged captions
  * - Poetic one‑line narration
- * - Clear result summary with coin amount
+ * - Card-style result summary with quality stars, win/loss deltas, and
+ *   Big/Mega/Super Mega/Jackpot banners
  */
 
 import { deductCoins, addCoins, getWallet, withEconomyGuard, formatNumber, EQUIPMENT_DEFS, getEquipmentDefs, buyEquipment, equipEquipment } from '../lib/economy.js';
@@ -27,6 +28,7 @@ import {
   recordPlayerActivity,
   recordPlayerJackpot,
   settleWin,
+  JACKPOT_SEED,
 } from '../lib/oceanSlotMachine.js';
 import {
   getCurrentOceanState,
@@ -46,8 +48,71 @@ const ALLOWED_BETS = [5, 20, 50, 100];
 const STRATEGIES = ['shallow', 'deep', 'reef'] as const;
 type Strategy = typeof STRATEGIES[number];
 
-// ── Animation frames ──────────────────────────────────────────────────
-const SPIN_FRAMES = ['🌊░░░░', '🌊🌊░░░', '🌊🌊🌊░░', '🌊🌊🌊🌊░', '🌊🌊🌊🌊🌊'];
+// ── Visual language ─────────────────────────────────────────────────────
+// A small set of shared building blocks so every screen (help, shop, spin,
+// result) reads as one consistent "card" instead of a wall of text.
+
+const DIVIDER = '┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈';
+
+function header(subtitle?: string): string {
+  return `🌊 *OCEAN HUNT* 🌊${subtitle ? `\n${subtitle}` : ''}\n${DIVIDER}`;
+}
+
+/** Cosmetic progress bar, e.g. for the jackpot pool. Purely visual. */
+function progressBar(value: number, max: number, size = 10): string {
+  const filled = Math.max(0, Math.min(size, Math.round((value / max) * size)));
+  return '▰'.repeat(filled) + '▱'.repeat(size - filled);
+}
+
+const JACKPOT_BAR_MAX = JACKPOT_SEED * 6;
+
+const STATE_EMOJI: Record<string, string> = {
+  calm: '🌊', rich: '🐟', storm: '⛈️', deep_current: '🌊⬇️',
+  migration: '🐠', treasure_tide: '💎', dangerous: '🦈', breeding: '🐣',
+};
+
+const QUALITY_STARS: Record<string, string> = {
+  damaged: '★☆☆☆☆',
+  common: '★★☆☆☆',
+  healthy: '★★★☆☆',
+  premium: '★★★★☆',
+  legendary: '★★★★★',
+};
+
+const STRATEGY_EMOJI: Record<Strategy, string> = {
+  shallow: '🛟',
+  reef: '⚖️',
+  deep: '🌊',
+};
+
+function deltaLine(amount: number): string {
+  if (amount > 0) return `▲ *+${formatNumber(amount)}* coins`;
+  if (amount < 0) return `▼ *-${formatNumber(Math.abs(amount))}* coins`;
+  return `• No change`;
+}
+
+async function oceanStatusBlock(): Promise<string> {
+  const state = await getCurrentOceanState();
+  const vol = await getVolatilityLevel();
+  const events = await getActiveEvents();
+  const eventLine = events.length
+    ? `⚡ ${events.map(e => `${e.emoji} *${e.name}*`).join('   ')}`
+    : '';
+  const lines = [
+    `${STATE_EMOJI[state.name] || '🌊'} *${state.name.replace('_', ' ').toUpperCase()}*   ·   🌀 Volatility: *${vol.toUpperCase()}*`,
+  ];
+  if (eventLine) lines.push(eventLine);
+  return lines.join('\n');
+}
+
+// ── Animation stages ──────────────────────────────────────────────────
+const SPIN_STAGES = [
+  { bar: '🌊▫️▫️▫️▫️', caption: 'Casting your line...' },
+  { bar: '🌊🎣▫️▫️▫️', caption: 'Line hits the water...' },
+  { bar: '🌊🎣〰️▫️▫️', caption: 'Something stirs below...' },
+  { bar: '🌊🎣〰️🐟▫️', caption: "You feel a tug!" },
+  { bar: '🌊🎣〰️🐟✨', caption: 'Reeling it in...' },
+];
 const SPIN_FRAME_DELAY_MS = 550;
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -60,30 +125,36 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   if (args[0] === 'shop') {
     const wallet = await getWallet(userId);
     const equip = wallet.equipment;
-    const types = ['boat', 'net', 'bait'] as const;
-    let text = '🐠 *OCEAN HUNT SHOP* 🐠\n\n';
-    for (const type of types) {
-      text += `*${type.toUpperCase()}*\n`;
+    const types = [
+      { key: 'boat', label: 'BOATS', emoji: '🚤' },
+      { key: 'net', label: 'NETS', emoji: '🕸️' },
+      { key: 'bait', label: 'BAIT', emoji: '🪱' },
+    ] as const;
+
+    let text = `${header()}\n`;
+    for (const { key: type, label, emoji } of types) {
+      text += `${emoji} *${label}*\n`;
       const defs = getEquipmentDefs(type);
       for (const def of defs) {
         const owned = (equip[type] === def.tier);
         const price = def.cost === 0 ? 'FREE' : `${formatNumber(def.cost)} coins`;
         const mods = def.modifiers;
         const modText = [];
-        if (mods.emptyMod) modText.push(`empty ${Math.round((1 - mods.emptyMod)*100)}% ↓`);
-        if (mods.predatorMod) modText.push(`predator ${Math.round((1 - mods.predatorMod)*100)}% ↓`);
-        if (mods.rarityShift) modText.push(`rarity +${Math.round(mods.rarityShift*100)}%`);
-        if (mods.treasureMod) modText.push(`treasure ${Math.round((mods.treasureMod - 1)*100)}% ↑`);
-        if (mods.jackpotMod) modText.push(`jackpot ${Math.round((mods.jackpotMod - 1)*100)}% ↑`);
-        if (mods.qualityBoost) modText.push(`quality +${Math.round(mods.qualityBoost*100)}%`);
-        const equipped = owned ? ' ✅' : '';
-        text += `  ${def.displayName}${equipped}: ${price} (${modText.join(', ')})`;
-        if (owned) text += ' *equipped*';
-        text += '\n';
+        if (mods.emptyMod) modText.push(`empty ${Math.round((1 - mods.emptyMod) * 100)}%↓`);
+        if (mods.predatorMod) modText.push(`predator ${Math.round((1 - mods.predatorMod) * 100)}%↓`);
+        if (mods.rarityShift) modText.push(`rarity +${Math.round(mods.rarityShift * 100)}%`);
+        if (mods.treasureMod) modText.push(`treasure +${Math.round((mods.treasureMod - 1) * 100)}%`);
+        if (mods.jackpotMod) modText.push(`jackpot +${Math.round((mods.jackpotMod - 1) * 100)}%`);
+        if (mods.qualityBoost) modText.push(`quality +${Math.round(mods.qualityBoost * 100)}%`);
+
+        const bullet = owned ? '✅' : '▫️';
+        text += ` ${bullet} *${def.displayName}* — ${price}\n`;
+        if (modText.length) text += `     ↳ _${modText.join(' · ')}_\n`;
+        if (owned) text += `     ↳ _currently equipped_\n`;
       }
-      text += '\n';
+      text += `${DIVIDER}\n`;
     }
-    text += '\n_Use `.ocean buy <type> <tier>` to purchase._\n_Example: `.ocean buy boat speedBoat`_';
+    text += `🛒 \`.ocean buy <type> <tier>\`\n   _e.g. .ocean buy boat speedBoat_`;
     return sock.sendMessage(chatId, { text, ...channelInfo }, { quoted: message });
   }
 
@@ -94,9 +165,15 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     const result = await buyEquipment(userId, type, tier);
     if (result.success) {
       await equipEquipment(userId, type, tier);
-      return sock.sendMessage(chatId, { text: `✅ You bought and equipped *${tier}*!`, ...channelInfo }, { quoted: message });
+      return sock.sendMessage(chatId, {
+        text: `${header()}\n✅ Bought and equipped *${tier}*!\n_Time to put it to work — \`.ocean <bet>\`_`,
+        ...channelInfo,
+      }, { quoted: message });
     } else {
-      return sock.sendMessage(chatId, { text: `❌ ${result.reason || 'Failed to buy equipment.'}`, ...channelInfo }, { quoted: message });
+      return sock.sendMessage(chatId, {
+        text: `${header()}\n❌ ${result.reason || 'Failed to buy equipment.'}`,
+        ...channelInfo,
+      }, { quoted: message });
     }
   }
 
@@ -110,22 +187,22 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   // ── Show help if invalid bet ──────────────────────────────────
   if (!ALLOWED_BETS.includes(bet)) {
     const pool = await getJackpotPool();
-    const state = await getCurrentOceanState();
-    const { mood } = await getConditionSummary();
-    const vol = await getVolatilityLevel();
-    const events = await getActiveEvents();
-    const eventText = events.length ? events.map(e => `${e.emoji} *${e.name}*`).join('  ') : 'No active events.';
+    const statusBlock = await oceanStatusBlock();
 
     return sock.sendMessage(chatId, {
       text:
-        `🐠 *OCEAN HUNT* 🐠\n\n` +
-        `Usage: *.ocean <bet> [shallow|deep|reef]*\n` +
-        `Allowed bets: ${ALLOWED_BETS.map(b => `*${b}*`).join(', ')}\n` +
-        `Strategies: shallow (safe), deep (risky), reef (balanced)\n\n` +
-        `🌊 *${state.name.toUpperCase()}* · 🌀 Volatility: *${vol.toUpperCase()}*\n` +
-        `${mood}\n` +
-        `💎 Jackpot: *${formatNumber(pool)} coins*\n` +
-        `⚡ Events: ${eventText}\n\n` +
+        `${header()}\n` +
+        `${statusBlock}\n` +
+        `💎 Jackpot Pool  ${progressBar(pool, JACKPOT_BAR_MAX)}  ${formatNumber(pool)} coins\n` +
+        `${DIVIDER}\n` +
+        `🎣 *HOW TO PLAY*\n` +
+        `\`.ocean <bet> [strategy]\`\n\n` +
+        `  Bets       ${ALLOWED_BETS.map(b => `*${b}*`).join(' · ')}\n` +
+        `  🛟 shallow   safer, smaller catches\n` +
+        `  ⚖️ reef      balanced _(default)_\n` +
+        `  🌊 deep      riskier, bigger catches\n` +
+        `${DIVIDER}\n` +
+        `🛍️ \`.ocean shop\` — gear up your boat, net & bait\n\n` +
         `_Choose your strategy and cast your line!_`,
       ...channelInfo,
     }, { quoted: message });
@@ -136,7 +213,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const { allowed, reason } = await validateExpedition(userId, bet, strategy, consecutiveLosses);
   if (!allowed) {
     return sock.sendMessage(chatId, {
-      text: `❌ ${reason || 'Expedition blocked.'}`,
+      text: `${header()}\n❌ ${reason || 'Expedition blocked.'}`,
       ...channelInfo,
     }, { quoted: message });
   }
@@ -145,7 +222,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const deducted = await deductCoins(userId, bet, { type: 'slots' });
   if (!deducted.success) {
     return sock.sendMessage(chatId, {
-      text: '❌ You don\'t have enough coins.',
+      text: `${header()}\n❌ You don't have enough coins for that bet.`,
       ...channelInfo,
     }, { quoted: message });
   }
@@ -159,14 +236,14 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
   // ── Start animation ────────────────────────────────────────────
   const sent = await sock.sendMessage(chatId, {
-    text: `🐠 *OCEAN HUNT* 🐠\n\n🌊 Bubbling... ${SPIN_FRAMES[0]}`,
+    text: `${header()}\n${SPIN_STAGES[0].caption}\n\n${SPIN_STAGES[0].bar}`,
     ...channelInfo,
   }, { quoted: message });
 
-  for (let i = 1; i < SPIN_FRAMES.length; i++) {
+  for (let i = 1; i < SPIN_STAGES.length; i++) {
     await delay(SPIN_FRAME_DELAY_MS);
     await sock.sendMessage(chatId, {
-      text: `🐠 *OCEAN HUNT* 🐠\n\n🐟 Swimming deep...\n\n${SPIN_FRAMES[i]}`,
+      text: `${header()}\n${SPIN_STAGES[i].caption}\n\n${SPIN_STAGES[i].bar}`,
       edit: sent.key,
       ...channelInfo,
     });
@@ -185,19 +262,29 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
   // ── Handle outcome & calculate result ────────────────────────
   let winAmount = outcome.winAmount;
-  let resultText = '';
+  let catchLine = '';   // e.g. "🐋 Legendary Swordfish  ★★★★★"
+  let resultLine = '';  // the win/loss delta line
 
+  let predatorExtraLoss = 0;
   if (outcome.type === 'predator') {
     if (winAmount < 0) {
       const extraLoss = Math.abs(winAmount);
       const lossResult = await deductCoins(userId, extraLoss, { type: 'slots', note: 'predator loss' });
-      if (!lossResult.success) winAmount = 0;
+      if (lossResult.success) {
+        // The bite is a real loss for the player — it becomes real bank
+        // capital the same way the original bet did, instead of vanishing
+        // from the economy untracked.
+        await contributeToJackpot(extraLoss);
+        predatorExtraLoss = extraLoss;
+      } else {
+        winAmount = 0;
+      }
     }
     await incrementConsecutiveLosses(userId);
-    resultText = `❌ You lost *${formatNumber(Math.abs(winAmount))}* extra coins.`;
+    resultLine = deltaLine(winAmount);
   } else if (outcome.type === 'empty') {
     await incrementConsecutiveLosses(userId);
-    resultText = `😐 Nothing caught. No change.`;
+    resultLine = `• Nothing caught this time.`;
   } else {
     // Win: fish, treasure, jackpot
     await resetConsecutiveLosses(userId);
@@ -208,29 +295,29 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
         await addCoins(userId, actualWin, { type: 'slots' });
         await deductFromJackpot(actualWin);
       }
-      const winNote = capped ? ' (capped due to low reserve)' : '';
-      let label = '';
+      const winNote = capped ? '\n_(payout capped — jackpot reserve is low)_' : '';
+
       if (outcome.type === 'fish') {
-        const quality = outcome.quality ? outcome.quality.charAt(0).toUpperCase() + outcome.quality.slice(1) : '';
-        const species = outcome.fishSpecies?.name || 'Fish';
-        label = `${quality} ${species}`;
+        const stars = outcome.quality ? ` ${QUALITY_STARS[outcome.quality] || ''}` : '';
+        catchLine = `${outcome.emoji} *${outcome.outcomeLabel}*${stars}`;
       } else if (outcome.type === 'treasure') {
-        label = 'Treasure';
+        catchLine = `${outcome.emoji} *Treasure Chest*`;
       } else if (outcome.type === 'jackpot') {
-        label = 'JACKPOT';
+        catchLine = `${outcome.emoji} *Leviathan Jackpot*`;
       }
-      resultText = `✅ ${label}! You won *${formatNumber(actualWin)}* coins${winNote}`;
+
+      resultLine = `${deltaLine(actualWin)}${winNote}`;
       if (outcome.type === 'jackpot') {
         await recordPlayerJackpot(userId);
       }
     } else {
-      resultText = `😐 No gain.`;
+      resultLine = `• No gain this time.`;
     }
   }
 
   // ── Record activity ────────────────────────────────────────────
-  await recordHouseActivity(bet, Math.max(0, winAmount));
-  await recordPlayerActivity(userId, bet, Math.max(0, winAmount));
+  await recordHouseActivity(bet + predatorExtraLoss, Math.max(0, winAmount));
+  await recordPlayerActivity(userId, bet + predatorExtraLoss, Math.max(0, winAmount));
   await recordExpeditionOutcome(
     userId,
     bet,
@@ -244,25 +331,25 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const wallet = await getWallet(userId);
 
   // ── Build final message ─────────────────────────────────────────
-  const state = await getCurrentOceanState();
-  const vol = await getVolatilityLevel();
-  const stateEmoji: Record<string, string> = {
-    calm: '🌊', rich: '🐟', storm: '⛈️', deep_current: '🌊⬇️', migration: '🐠', treasure_tide: '💎', dangerous: '🦈', breeding: '🐣'
-  };
-  const events = await getActiveEvents();
-  const eventHeader = events.length ? events.map(e => `${e.emoji} *${e.name}*`).join('  ') : '';
+  const statusBlock = await oceanStatusBlock();
 
   // Get poetic narration – first sentence only
   const poetic = outcome.narration.split('.')[0] + '.';
 
+  const banner = outcome.bannerText ? `${outcome.bannerText}\n${DIVIDER}\n` : '';
+  const catchBlock = catchLine ? `${catchLine}\n` : '';
+
   const messageText =
-    `🐠 *OCEAN HUNT* 🐠\n` +
-    (eventHeader ? `⚡ ${eventHeader}\n` : '') +
-    `🌍 *${state.name.toUpperCase()}* ${stateEmoji[state.name] || '🌊'}  🌀${vol.toUpperCase()}\n` +
-    `Strategy: *${strategy.toUpperCase()}*  Bet: ${formatNumber(bet)} coins\n` +
-    `💰 Balance: ${formatNumber(wallet.coins)} coins\n\n` +
-    `${outcome.emoji} ${poetic}\n` +
-    `${resultText}`;
+    `${banner}` +
+    `${header()}\n` +
+    `${statusBlock}\n` +
+    `🎣 Strategy: *${strategy.toUpperCase()}* ${STRATEGY_EMOJI[strategy]}   Bet: *${formatNumber(bet)}* coins\n` +
+    `${DIVIDER}\n` +
+    `${catchBlock}` +
+    `_${poetic}_\n\n` +
+    `${resultLine}\n` +
+    `${DIVIDER}\n` +
+    `💰 Balance: *${formatNumber(wallet.coins)}* coins`;
 
   await sock.sendMessage(chatId, {
     text: messageText,
