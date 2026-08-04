@@ -699,10 +699,15 @@ export async function payoutMonthlyTop3(chatId: string, dateStr: string): Promis
 
   const results: Array<{ userId: string; points: number; reward: number; rank: number }> = [];
   for (let i = 0; i < top3.length; i++) {
-    const reward = settings.top3Rewards[i] || 0;
-    if (reward > 0) {
-      await addCoins(top3[i].userId, reward, { type: 'top3', note: `rank ${i + 1}, ${top3[i].points} pts` });
-    }
+  const reward = settings.top3Rewards[i] || 0;
+  if (reward > 0) {
+    // ✅ Clean the userId to match the wallet key
+    const cleanId = cleanJid(top3[i].userId);
+    await addCoins(cleanId, reward, {
+      type: 'top3',
+      note: `rank ${i + 1}, ${top3[i].points} pts`
+    });
+  }
     results.push({ userId: top3[i].userId, points: top3[i].points, reward, rank: i + 1 });
   }
 
