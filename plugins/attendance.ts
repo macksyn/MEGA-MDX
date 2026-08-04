@@ -332,7 +332,8 @@ function getImageStatus(hasImg: boolean, isRequired: boolean): string {
     : hasImg ? '📸 Image detected ✅' : '📸 No image (optional)';
 }
 
-const attendanceFormRegex = /GIST\s+HQ.*?\*?Name\*?[:].*?\*?Relationship\*?[:]/is;
+// Updated regex to support both old (*Name*:) and new bold (𝗡𝗮𝗺𝗲:) formats
+const attendanceFormRegex = /GIST\s+HQ.*?(?:\*?Name\*?[:]|𝗡𝗮𝗺𝗲[:]).*?(?:\*?Relationship\*?[:]|𝗥𝗲𝗹𝗮𝘁𝗶𝗼𝗻𝘀𝗵𝗶𝗽[:])/is;
 
 function validateAttendanceForm(body: string, hasImg = false): ValidationResult {
   const validation: ValidationResult = {
@@ -345,10 +346,11 @@ function validateAttendanceForm(body: string, hasImg = false): ValidationResult 
     extractedData:    {}
   };
 
+  // Check for GIST HQ and both Name and Relationship (old or new style)
   if (
     !/GIST\s+HQ/i.test(body) ||
-    !/\*?Name\*?[:]/i.test(body) ||
-    !/\*?Relationship\*?[:]/i.test(body)
+    !/(?:\*?Name\*?[:]|𝗡𝗮𝗺𝗲[:])/i.test(body) ||
+    !/(?:\*?Relationship\*?[:]|𝗥𝗲𝗹𝗮𝘁𝗶𝗼𝗻𝘀𝗵𝗶𝗽[:])/i.test(body)
   ) {
     validation.errors.push('❌ Invalid attendance form format');
     return validation;
@@ -359,13 +361,13 @@ function validateAttendanceForm(body: string, hasImg = false): ValidationResult 
   }
 
   const requiredFields = [
-    { name: 'Name',         pattern: /\*?Name\*?[:]\s*([^\n]+)/i,          fieldName: '👤 Name',              isBirthday: false },
-    { name: 'Location',     pattern: /\*?Location\*?[:]\s*([^\n]+)/i,      fieldName: '🌍 Location',           isBirthday: false },
-    { name: 'Time',         pattern: /\*?Time\*?[:]\s*([^\n]+)/i,          fieldName: '⌚ Time',               isBirthday: false },
-    { name: 'Weather',      pattern: /\*?Weather\*?[:]\s*([^\n]+)/i,       fieldName: '🌥 Weather',            isBirthday: false },
-    { name: 'Mood',         pattern: /\*?Mood\*?[:]\s*([^\n]+)/i,          fieldName: '❤️‍🔥 Mood',            isBirthday: false },
-    { name: 'DOB',          pattern: /\*?D\.?O\.?B\.?\*?[:]\s*([^\n]+)/i, fieldName: '🗓 D.O.B',             isBirthday: true  },
-    { name: 'Relationship', pattern: /\*?Relationship\*?[:]\s*([^\n]+)/i,  fieldName: '👩‍❤️‍👨 Relationship', isBirthday: false }
+    { name: 'Name',         pattern: /(?:\*?Name\*?[:]|𝗡𝗮𝗺𝗲[:])\s*([^\n]+)/i,          fieldName: '👤 Name',              isBirthday: false },
+    { name: 'Location',     pattern: /(?:\*?Location\*?[:]|𝗟𝗼𝗰𝗮𝘁𝗶𝗼𝗻[:])\s*([^\n]+)/i,    fieldName: '🌍 Location',           isBirthday: false },
+    { name: 'Time',         pattern: /(?:\*?Time\*?[:]|𝗧𝗶𝗺𝗲[:])\s*([^\n]+)/i,            fieldName: '⌚ Time',               isBirthday: false },
+    { name: 'Weather',      pattern: /(?:\*?Weather\*?[:]|𝗪𝗲𝗮𝘁𝗵𝗲𝗿[:])\s*([^\n]+)/i,     fieldName: '🌥 Weather',            isBirthday: false },
+    { name: 'Mood',         pattern: /(?:\*?Mood\*?[:]|𝗠𝗼𝗼𝗱[:])\s*([^\n]+)/i,            fieldName: '❤️‍🔥 Mood',            isBirthday: false },
+    { name: 'DOB',          pattern: /(?:\*?D\.?O\.?B\.?\*?[:]|𝗗\.𝗢\.𝗕[:])\s*([^\n]+)/i, fieldName: '🗓 D.O.B',             isBirthday: true  },
+    { name: 'Relationship', pattern: /(?:\*?Relationship\*?[:]|𝗥𝗲𝗹𝗮𝘁𝗶𝗼𝗻𝘀𝗵𝗶𝗽[:])\s*([^\n]+)/i, fieldName: '👩‍❤️‍👨 Relationship', isBirthday: false }
   ];
 
   requiredFields.forEach(field => {
