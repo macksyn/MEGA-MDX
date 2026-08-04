@@ -1,0 +1,190 @@
+// @ts-nocheck
+/***
+ * lib/menuSession.ts
+ *
+ * Shared "type a number, reply to the menu" session system — the pattern
+ * validated in plugins/buttonTest.ts, generalized so any plugin can use it
+ * instead of typing full commands from memory.
+ *
+ * Confirmed on this setup: native WhatsApp buttons don't render reliably
+ * (known Baileys/WhatsApp limitation for non-Business-API bots), but a
+ * typed-number reply that quotes the menu message works cleanly. This
+ * module is built on that confirmed path, not on buttons.
+ *
+ * ── Usage ────────────────────────────────────────────────────────────
+ *   import { promptMenu } from '../lib/menuSession.js';
+ *
+ *   const result = await promptMenu(sock, message, chatId, userId, {
+ *     title: '💹 FOREX',
+ *     text: 'What would you like to do?',
+ *     options: [
+ *       { label: 'Place a trade', value: 'trade' },
+ *       { label: 'Check prices', value: 'prices' },
+ *     ],
+ *   });
+ *
+ *   if (result.cancelled) { ... }
+ *   else if (result.timedOut) { ... }
+ *   else { // result.value === 'trade' | 'prices' }
+ *
+ * Chain multiple calls with plain await for multi-step flows (pick pair,
+ * then direction, then bet) — no extra state machinery needed, since each
+ * `promptMenu` call already blocks until that step's answer comes in.
+ *
+ * ── Design notes / limits worth knowing ──────────────────────────────
+ * - One listener is registered on the `sock` instance the first time
+ *   promptMenu is called; it's shared across every plugin using this
+ *   module, not one-per-plugin. Matching is by the sent menu message's own
+ *   id + the requesting user's id, so concurrent prompts (different users,
+ *   different plugins, even the same user in two chats) can't collide.
+ * - A reply only counts if it quotes the exact menu message. Anything else
+ *   (a reply to a different message, an un-quoted message, a different
+ *   sender) is ignored, not consumed — so it can't accidentally eat a
+ *   pending prompt somewhere else.
+ * - Replying "0" or "cancel" resolves with `cancelled: true`.
+ * - An invalid-but-quoted reply (wrong number, gibberish) does NOT consume
+ *   the prompt — it gets a quick nudge and can still answer before the TTL.
+ * - Default TTL is 3 minutes; pass `ttlMs` to override per-call.
+ */
+
+import { cleanJid } from './isOwner.js';
+
+export interface MenuOption {
+  label: string;
+  value: string;
+}
+
+export interface MenuPromptConfig {
+  title?: string;
+  text: string;
+  options: MenuOption[];
+  footer?: string;
+  ttlMs?: number;
+  /** Merged into the sendMessage payload (e.g. channelInfo). */
+  extra?: Record<string, any>;
+}
+
+export interface MenuResult {
+  value: string | null;
+  timedOut: boolean;
+  cancelled: boolean;
+}
+
+const DEFAULT_TTL_MS = 3 * 60_000; // within the validated 2-5 minute window
+
+interface PendingPrompt {
+  chatId: string;
+  userId: string;
+  options: MenuOption[];
+  resolve: (result: MenuResult) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const pending = new Map<string, PendingPrompt>(); // keyed by the sent menu message's own id
+let listenerRegistered = false;
+
+function getQuotedStanzaId(msg: any): string | null {
+  const m = msg.message;
+  if (!m) return null;
+  const candidates = [
+    m.extendedTextMessage?.contextInfo,
+    m.buttonsResponseMessage?.contextInfo,
+    m.listResponseMessage?.contextInfo,
+    m.templateButtonReplyMessage?.contextInfo,
+  ];
+  for (const ctx of candidates) {
+    if (ctx?.stanzaId) return ctx.stanzaId;
+  }
+  return null;
+}
+
+function extractPlainText(msg: any): string | null {
+  const m = msg.message;
+  if (!m) return null;
+  return m.conversation || m.extendedTextMessage?.text || null;
+}
+
+function registerListener(sock: any) {
+  if (listenerRegistered) return;
+  listenerRegistered = true;
+
+  sock.ev.on('messages.upsert', async (upsert: any) => {
+    try {
+      const msg = upsert.messages?.[0];
+      if (!msg || msg.key?.fromMe) return;
+
+      const quotedId = getQuotedStanzaId(msg);
+      if (!quotedId) return;
+
+      const prompt = pending.get(quotedId);
+      if (!prompt) return;
+
+      const senderId = cleanJid(msg.key.participant || msg.key.remoteJid);
+      if (senderId !== prompt.userId) return; // right menu, wrong person — ignore, don't consume
+
+      const text = (extractPlainText(msg) || '').trim().toLowerCase();
+      if (!text) return;
+
+      if (text === '0' || text === 'cancel') {
+        clearTimeout(prompt.timer);
+        pending.delete(quotedId);
+        prompt.resolve({ value: null, timedOut: false, cancelled: true });
+        return;
+      }
+
+      const n = parseInt(text, 10);
+      if (isNaN(n) || n < 1 || n > prompt.options.length) {
+        // Quoted our menu, but not a valid choice — nudge, don't consume.
+        await sock.sendMessage(prompt.chatId, {
+          text: `❓ Reply with a number from *1* to *${prompt.options.length}* (or *0* to cancel).`,
+        });
+        return;
+      }
+
+      clearTimeout(prompt.timer);
+      pending.delete(quotedId);
+      prompt.resolve({ value: prompt.options[n - 1].value, timedOut: false, cancelled: false });
+    } catch (err) {
+      console.error('[menuSession] listener error:', err);
+    }
+  });
+}
+
+export async function promptMenu(
+  sock: any,
+  message: any,
+  chatId: string,
+  userId: string,
+  config: MenuPromptConfig
+): Promise<MenuResult> {
+  registerListener(sock);
+
+  const ttlMs = config.ttlMs ?? DEFAULT_TTL_MS;
+  const body = config.options.map((o, i) => `${i + 1}️⃣ ${o.label}`).join('\n');
+  const minutes = Math.round(ttlMs / 60_000);
+
+  const sent = await sock.sendMessage(chatId, {
+    text:
+      `${config.title ? `${config.title}\n\n` : ''}` +
+      `${config.text}\n\n${body}\n\n` +
+      `_Reply to this message with a number (or 0 to cancel)._\n` +
+      `_Expires in ${minutes} minute${minutes === 1 ? '' : 's'}._`,
+    footer: config.footer,
+    ...(config.extra || {}),
+  }, { quoted: message });
+
+  const menuMessageId = sent?.key?.id;
+
+  return new Promise<MenuResult>((resolve) => {
+    if (!menuMessageId) {
+      // Couldn't get a message id back — nothing to key a reply to, fail closed.
+      resolve({ value: null, timedOut: true, cancelled: false });
+      return;
+    }
+    const timer = setTimeout(() => {
+      pending.delete(menuMessageId);
+      resolve({ value: null, timedOut: true, cancelled: false });
+    }, ttlMs);
+    pending.set(menuMessageId, { chatId, userId, options: config.options, resolve, timer });
+  });
+}
