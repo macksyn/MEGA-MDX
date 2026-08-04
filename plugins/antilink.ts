@@ -2,6 +2,7 @@ import type { BotContext } from '../types.js';
 import store from '../lib/lightweight_store.js';
 import isOwnerOrSudo from '../lib/isOwner.js';
 import isAdmin from '../lib/isAdmin.js';
+import { promptMenu, promptText } from '../lib/menuSession.js';
 
 // Type definitions
 type AntilinkAction = 'delete' | 'kick' | 'warn';
@@ -28,7 +29,7 @@ interface WhitelistInfo {
     addedBy: string;
 }
 
-// Core settings functions
+// Core settings functions (unchanged)
 async function setAntilink(
     chatId: string,
     type: AntilinkType,
@@ -87,7 +88,6 @@ async function addWarning(chatId: string, userId: string, linkType: string): Pro
         linkType: linkType
     });
 
-    // Keep only last 10 warnings to prevent data bloat
     if (warnings.warnings.length > 10) {
         warnings.warnings = warnings.warnings.slice(-10);
     }
@@ -121,10 +121,7 @@ async function addToWhitelist(chatId: string, url: string, addedBy: string, dura
         const whitelist = await store.getSetting(chatId, 'antilink_whitelist') || [];
         const expiresAt = Date.now() + (durationMinutes * 60 * 1000);
 
-        // Clean expired entries first
         const cleanedWhitelist = whitelist.filter((item: WhitelistInfo) => item.expiresAt > Date.now());
-        
-        // Add new entry
         cleanedWhitelist.push({
             url: url,
             expiresAt: expiresAt,
@@ -132,11 +129,10 @@ async function addToWhitelist(chatId: string, url: string, addedBy: string, dura
         });
 
         await store.saveSetting(chatId, 'antilink_whitelist', cleanedWhitelist);
-        
-        // Auto-clean after expiry
+
         setTimeout(async () => {
             await cleanExpiredWhitelist(chatId);
-        }, durationMinutes * 60 * 1000 + 1000); // +1 second buffer
+        }, durationMinutes * 60 * 1000 + 1000);
 
         return true;
     } catch (error: any) {
@@ -149,11 +145,8 @@ async function isWhitelisted(chatId: string, url: string): Promise<boolean> {
     try {
         const whitelist = await store.getSetting(chatId, 'antilink_whitelist') || [];
         const now = Date.now();
-
-        // Check if any whitelist entry matches the URL
         for (const item of whitelist) {
             if (item.expiresAt > now) {
-                // Check for exact match or domain match
                 if (url.includes(item.url) || item.url.includes(url)) {
                     return true;
                 }
@@ -171,7 +164,6 @@ async function cleanExpiredWhitelist(chatId: string): Promise<void> {
         const whitelist = await store.getSetting(chatId, 'antilink_whitelist') || [];
         const now = Date.now();
         const cleanedWhitelist = whitelist.filter((item: WhitelistInfo) => item.expiresAt > now);
-        
         if (cleanedWhitelist.length !== whitelist.length) {
             await store.saveSetting(chatId, 'antilink_whitelist', cleanedWhitelist);
         }
@@ -191,7 +183,7 @@ async function getWhitelist(chatId: string): Promise<WhitelistInfo[]> {
     }
 }
 
-// Main link detection handler
+// Main link detection handler (unchanged)
 export async function handleLinkDetection(
     sock: any,
     chatId: string,
@@ -203,17 +195,14 @@ export async function handleLinkDetection(
         const config = await getAntilink(chatId, 'on');
         if (!config?.enabled) return;
 
-        // Check if sender is exempt
         const isOwnerSudo = await isOwnerOrSudo(senderId, sock, chatId);
         if (isOwnerSudo) return;
 
-        // Check if sender is admin
         try {
             const { isSenderAdmin } = await isAdmin(sock, chatId, senderId);
             if (isSenderAdmin) return;
         } catch (e: any) {}
 
-        // Determine link type with prioritized checking
         let linkType = '';
         let matchedUrl = '';
 
@@ -235,7 +224,6 @@ export async function handleLinkDetection(
 
         if (!linkType) return;
 
-        // Check whitelist
         const whitelisted = await isWhitelisted(chatId, matchedUrl);
         if (whitelisted) return;
 
@@ -243,7 +231,6 @@ export async function handleLinkDetection(
         const participant = message.key.participant || senderId;
         const action = config.action || 'delete';
 
-        // Delete message for delete and kick actions
         if (action === 'delete' || action === 'kick') {
             try {
                 await sock.sendMessage(chatId, {
@@ -255,14 +242,12 @@ export async function handleLinkDetection(
                     }
                 });
             } catch (error: any) {
-                // Message might already be deleted or bot lacks permission
                 if (error.status !== 404) {
                     console.error('Failed to delete message:', error);
                 }
             }
         }
 
-        // Handle based on action type
         switch (action) {
             case 'warn':
                 const warnInfo = await addWarning(chatId, senderId, linkType);
@@ -289,7 +274,6 @@ export async function handleLinkDetection(
                     mentions: [senderId]
                 });
 
-                // If warnings >= 3, automatically kick
                 if (deleteWarnInfo.count >= 3) {
                     try {
                         await sock.groupParticipantsUpdate(chatId, [senderId], 'remove');
@@ -313,7 +297,6 @@ export async function handleLinkDetection(
                 const kickRemainingWarns = Math.max(0, 3 - kickWarnInfo.count);
 
                 if (kickWarnInfo.count < 3) {
-                    // First warn them, but don't kick yet
                     await sock.sendMessage(chatId, {
                         text: `⚠️ *Final Warning ${kickWarnInfo.count}/3*\n\n` +
                               `@${senderId.split('@')[0]}, posting ${linkType} links is not allowed here!\n\n` +
@@ -322,7 +305,6 @@ export async function handleLinkDetection(
                         mentions: [senderId]
                     });
                 } else {
-                    // Kick after 3 warnings
                     try {
                         await sock.groupParticipantsUpdate(chatId, [senderId], 'remove');
                         await clearWarnings(chatId, senderId);
@@ -346,252 +328,263 @@ export async function handleLinkDetection(
     }
 }
 
+// --- COMMAND HANDLER ---
 export default {
     command: 'antilink',
     aliases: ['alink', 'linkblock'],
     category: 'admin',
     description: 'Prevent users from sending links in the group with smart warnings and whitelisting',
-    usage: '.antilink <on|off|set|whitelist|status>',
+    usage: '.antilink (for interactive menu) or .antilink <subcommand>',
     groupOnly: true,
     adminOnly: true,
 
     async handler(sock: any, message: any, args: any, context: BotContext) {
         const chatId = context.chatId || message.key.remoteJid;
-        const action = args[0]?.toLowerCase();
+        const senderId = context.senderId;   // ✅ DEFINED HERE
 
-        if (!action) {
-            const config = await getAntilink(chatId, 'on');
-            const whitelist = await getWhitelist(chatId);
-            
-            let whitelistText = '';
-            if (whitelist.length > 0) {
-                whitelistText = `\n*Active Whitelisted Links:*\n`;
-                whitelist.forEach((item: WhitelistInfo, index: number) => {
-                    const timeLeft = Math.max(0, Math.ceil((item.expiresAt - Date.now()) / 60000));
-                    whitelistText += `${index + 1}. ${item.url} (${timeLeft} min left)\n`;
-                });
-            }
-
-            await sock.sendMessage(chatId, {
-                text: `*🔗 ANTILINK SETUP*\n\n` +
-                      `*Current Status:* ${config?.enabled ? '✅ Enabled' : '❌ Disabled'}\n` +
-                      `*Current Action:* ${config?.action || 'Not set'}\n` +
-                      `*Warning System:* 3 warnings before kick\n` +
-                      `*Whitelist:* ${whitelist.length} active item(s)\n\n` +
-                      `*Commands:*\n` +
-                      `• \`.antilink on\` - Enable antilink\n` +
-                      `• \`.antilink off\` - Disable antilink\n` +
-                      `• \`.antilink set delete\` - Delete & warn (auto-kick after 3)\n` +
-                      `• \`.antilink set kick\` - Warn 3x then kick\n` +
-                      `• \`.antilink set warn\` - Warn only (no kick)\n` +
-                      `• \`.antilink whitelist <url>\` - Allow link for 10 min\n` +
-                      `• \`.antilink whitelist clear\` - Clear whitelist\n` +
-                      `• \`.antilink warnings @user\` - View warnings\n` +
-                      `• \`.antilink clearwarn @user\` - Clear warnings\n\n` +
-                      `*Protected Links:*\n` +
-                      `• WhatsApp Groups\n` +
-                      `• WhatsApp Channels\n` +
-                      `• Telegram\n` +
-                      `• All other links\n\n` +
-                      `*Exempt:* Admins, Owner, and Sudo users` +
-                      whitelistText
-            }, { quoted: message });
+        // Group & admin checks
+        if (!chatId.endsWith('@g.us')) {
+            await sock.sendMessage(chatId, { text: '❌ This command is only for groups.' });
+            return;
+        }
+        const { isSenderAdmin } = await isAdmin(sock, chatId, senderId);
+        if (!isSenderAdmin && !(await isOwnerOrSudo(senderId, sock, chatId))) {
+            await sock.sendMessage(chatId, { text: '❌ Only admins can use this command.' });
             return;
         }
 
-        switch (action) {
-            case 'on':
-                const existingConfig = await getAntilink(chatId, 'on');
-                if (existingConfig?.enabled) {
-                    await sock.sendMessage(chatId, {
-                        text: '⚠️ *Antilink is already enabled*\n\nUse `.antilink` to see current settings.'
-                    }, { quoted: message });
-                    return;
-                }
-                const result = await setAntilink(chatId, 'on', 'delete');
-                await sock.sendMessage(chatId, {
-                    text: result 
-                        ? '✅ *Antilink enabled successfully!*\n\n' +
-                          '*Default Action:* Delete messages + warn\n' +
-                          '*Warning System:* 3 warnings, then auto-kick\n' +
-                          '*Whitelist:* Allow links temporarily with `.antilink whitelist <url>`\n\n' +
-                          '*Exempt:* Admins, Owner, Sudo users'
-                        : '❌ *Failed to enable antilink*'
-                }, { quoted: message });
-                break;
+        // If arguments are provided, fall back to the old direct command flow
+        if (args.length > 0) {
+            await handleDirectCommand(sock, message, args, chatId, senderId, context);
+            return;
+        }
 
-            case 'off':
-                await removeAntilink(chatId, 'on');
-                await sock.sendMessage(chatId, {
-                    text: '❌ *Antilink disabled*\n\nUsers can now send links freely.'
-                }, { quoted: message });
-                break;
+        // --- INTERACTIVE MENU FLOW ---
+        const config = await getAntilink(chatId, 'on');
+        const enabled = config?.enabled || false;
+        const action = config?.action || 'delete';
+        const statusText = enabled ? '✅ Enabled' : '❌ Disabled';
 
-            case 'set':
-                if (args.length < 2) {
-                    await sock.sendMessage(chatId, {
-                        text: '❌ *Please specify an action*\n\n' +
-                              'Usage: `.antilink set <delete|kick|warn>`\n\n' +
-                              '*delete* - Delete messages, warn, auto-kick after 3 warnings\n' +
-                              '*kick* - Warn 3 times, then remove from group\n' +
-                              '*warn* - Only send warnings, never kick'
-                    }, { quoted: message });
-                    return;
-                }
-                const setAction = args[1].toLowerCase() as AntilinkAction;
-                if (!['delete', 'kick', 'warn'].includes(setAction)) {
-                    await sock.sendMessage(chatId, {
-                        text: '❌ *Invalid action*\n\nChoose: delete, kick, or warn'
-                    }, { quoted: message });
-                    return;
-                }
-                const setResult = await setAntilink(chatId, 'on', setAction);
+        const mainOptions = [
+            { label: `${enabled ? 'Disable' : 'Enable'} Antilink`, value: 'toggle' },
+            { label: `Change Action (current: ${action})`, value: 'setaction' },
+            { label: 'Manage Whitelist', value: 'whitelist' },
+            { label: 'View User Warnings', value: 'viewwarnings' },
+            { label: 'Clear User Warnings', value: 'clearwarnings' },
+            { label: 'Show Status', value: 'status' },
+            { label: 'Cancel', value: 'cancel' }
+        ];
 
-                const actionDescriptions: Record<AntilinkAction, string> = {
-                    delete: 'Delete link messages\n• Warn users\n• Auto-kick after 3 warnings',
-                    kick: 'Delete messages\n• Warn 3 times\n• Kick after 3rd warning',
-                    warn: 'Only send warning messages\n• No message deletion\n• No kicking'
-                };
+        const result = await promptMenu(sock, message, chatId, senderId, {
+            title: '🔗 Antilink Control Panel',
+            text: `Current status: ${statusText}\nAction: ${action}\n\nSelect an option:`,
+            options: mainOptions,
+            ttlMs: 120000
+        });
 
-                await sock.sendMessage(chatId, {
-                    text: setResult
-                        ? `✅ *Antilink action set to: ${setAction}*\n\n` +
-                          `${actionDescriptions[setAction]}\n\n` +
-                          `*Exempt:* Admins, Owner, Sudo users\n` +
-                          `*Whitelist:* Use \`.antilink whitelist <url>\` to temporarily allow links`
-                        : '❌ *Failed to set antilink action*'
-                }, { quoted: message });
-                break;
+        if (result.cancelled || result.timedOut) {
+            if (result.timedOut) {
+                await sock.sendMessage(chatId, { text: '⏰ Menu timed out.' });
+            }
+            return;
+        }
 
-            case 'whitelist':
-                if (args.length < 2) {
-                    await sock.sendMessage(chatId, {
-                        text: '❌ *Please specify a URL or "clear"*\n\n' +
-                              'Usage:\n' +
-                              '• `.antilink whitelist <url>` - Allow a link for 10 minutes\n' +
-                              '• `.antilink whitelist clear` - Remove all whitelisted links\n\n' +
-                              'Example: `.antilink whitelist https://example.com`'
-                    }, { quoted: message });
-                    return;
-                }
-
-                if (args[1].toLowerCase() === 'clear') {
-                    await store.saveSetting(chatId, 'antilink_whitelist', []);
-                    await sock.sendMessage(chatId, {
-                        text: '✅ *Whitelist cleared*\n\nAll temporarily allowed links have been removed.'
-                    }, { quoted: message });
-                    return;
-                }
-
-                const urlToWhitelist = args[1];
-                if (!urlToWhitelist.match(/^https?:\/\/.+/i)) {
-                    await sock.sendMessage(chatId, {
-                        text: '❌ *Invalid URL*\n\nPlease provide a valid URL starting with http:// or https://'
-                    }, { quoted: message });
-                    return;
-                }
-
-                const whitelistResult = await addToWhitelist(chatId, urlToWhitelist, context.senderId);
-                if (whitelistResult) {
-                    await sock.sendMessage(chatId, {
-                        text: `✅ *Link whitelisted for 10 minutes*\n\n` +
-                              `*URL:* ${urlToWhitelist}\n` +
-                              `*Expires:* In 10 minutes\n\n` +
-                              `This link can now be posted without triggering antilink protection.`
-                    }, { quoted: message });
+        // Handle each menu option
+        switch (result.value) {
+            case 'toggle':
+                if (enabled) {
+                    await removeAntilink(chatId, 'on');
+                    await sock.sendMessage(chatId, { text: '❌ Antilink disabled.' });
                 } else {
-                    await sock.sendMessage(chatId, {
-                        text: '❌ *Failed to whitelist link*'
-                    }, { quoted: message });
+                    await setAntilink(chatId, 'on', 'delete');
+                    await sock.sendMessage(chatId, { text: '✅ Antilink enabled with default action: delete.' });
                 }
                 break;
 
-            case 'warnings':
-                let targetUser = senderId;
-                if (message.mentions && message.mentions.length > 0) {
-                    targetUser = message.mentions[0];
-                } else if (args.length > 1 && args[1].startsWith('@')) {
-                    // Try to extract user from mention text
-                    targetUser = args[1].replace('@', '') + '@s.whatsapp.net';
+            case 'setaction': {
+                const actionOptions = [
+                    { label: 'Delete (warn & auto-kick after 3)', value: 'delete' },
+                    { label: 'Kick (warn 3 times then kick)', value: 'kick' },
+                    { label: 'Warn (only warnings)', value: 'warn' },
+                    { label: 'Cancel', value: 'cancel' }
+                ];
+                const actionResult = await promptMenu(sock, message, chatId, senderId, {
+                    title: '⚙️ Select Action',
+                    text: `Current action: ${action}\nChoose new action:`,
+                    options: actionOptions,
+                    ttlMs: 60000
+                });
+                if (actionResult.cancelled || actionResult.timedOut) {
+                    if (actionResult.timedOut) await sock.sendMessage(chatId, { text: '⏰ Timed out.' });
+                    break;
                 }
-
-                const userWarnings = await getWarnings(chatId, targetUser);
-                const username = targetUser.split('@')[0];
-
-                let warningHistory = '';
-                if (userWarnings.warnings.length > 0) {
-                    warningHistory = '\n*Warning History:*\n';
-                    userWarnings.warnings.forEach((warn, index) => {
-                        const date = new Date(warn.timestamp).toLocaleString();
-                        warningHistory += `${index + 1}. ${warn.linkType} - ${date}\n`;
-                    });
-                }
-
-                await sock.sendMessage(chatId, {
-                    text: `*⚠️ WARNINGS FOR @${username}*\n\n` +
-                          `*Total Warnings:* ${userWarnings.count}\n` +
-                          `*Last Warned:* ${userWarnings.lastWarned ? new Date(userWarnings.lastWarned).toLocaleString() : 'Never'}\n` +
-                          `${userWarnings.count >= 3 ? '\n⚠️ User has reached maximum warnings!' : ''}` +
-                          warningHistory,
-                    mentions: [targetUser]
-                }, { quoted: message });
+                if (actionResult.value === 'cancel') break;
+                await setAntilink(chatId, 'on', actionResult.value as AntilinkAction);
+                await sock.sendMessage(chatId, { text: `✅ Action set to: ${actionResult.value}` });
                 break;
+            }
 
-            case 'clearwarn':
-            case 'clearwarnings':
-                let clearTarget = senderId;
-                if (message.mentions && message.mentions.length > 0) {
-                    clearTarget = message.mentions[0];
-                } else if (args.length > 1 && args[1].startsWith('@')) {
-                    clearTarget = args[1].replace('@', '') + '@s.whatsapp.net';
+            case 'whitelist': {
+                const wlOptions = [
+                    { label: 'View Whitelist', value: 'view' },
+                    { label: 'Add URL to Whitelist', value: 'add' },
+                    { label: 'Clear Whitelist', value: 'clear' },
+                    { label: 'Cancel', value: 'cancel' }
+                ];
+                const wlResult = await promptMenu(sock, message, chatId, senderId, {
+                    title: '📋 Whitelist Management',
+                    text: 'Select an option:',
+                    options: wlOptions,
+                    ttlMs: 60000
+                });
+                if (wlResult.cancelled || wlResult.timedOut) {
+                    if (wlResult.timedOut) await sock.sendMessage(chatId, { text: '⏰ Timed out.' });
+                    break;
                 }
-
-                await clearWarnings(chatId, clearTarget);
-                const clearUsername = clearTarget.split('@')[0];
-                await sock.sendMessage(chatId, {
-                    text: `✅ *Warnings cleared for @${clearUsername}*\n\nTheir warning count has been reset to 0.`,
-                    mentions: [clearTarget]
-                }, { quoted: message });
+                switch (wlResult.value) {
+                    case 'view': {
+                        const wl = await getWhitelist(chatId);
+                        let wlText = '';
+                        if (wl.length === 0) {
+                            wlText = 'No whitelisted links.';
+                        } else {
+                            wlText = 'Active whitelisted links:\n';
+                            wl.forEach((item, idx) => {
+                                const timeLeft = Math.max(0, Math.ceil((item.expiresAt - Date.now()) / 60000));
+                                wlText += `${idx+1}. ${item.url} (expires in ${timeLeft} min)\n`;
+                            });
+                        }
+                        await sock.sendMessage(chatId, { text: `📋 Whitelist:\n${wlText}` });
+                        break;
+                    }
+                    case 'add': {
+                        await sock.sendMessage(chatId, { 
+                            text: '📝 Please reply with the URL you want to whitelist (e.g., https://example.com).\nReply *cancel* to abort.' 
+                        });
+                        const urlResult = await promptText(sock, chatId, senderId, 60000);
+                        if (urlResult.timedOut) {
+                            await sock.sendMessage(chatId, { text: '⏰ Timed out.' });
+                        } else if (urlResult.cancelled) {
+                            await sock.sendMessage(chatId, { text: 'Cancelled.' });
+                        } else {
+                            const url = urlResult.text.trim();
+                            if (!url.match(/^https?:\/\/.+/i)) {
+                                await sock.sendMessage(chatId, { text: '❌ Invalid URL. Must start with http:// or https://' });
+                            } else {
+                                const added = await addToWhitelist(chatId, url, senderId);
+                                if (added) {
+                                    await sock.sendMessage(chatId, { text: `✅ Whitelisted: ${url} for 10 minutes.` });
+                                } else {
+                                    await sock.sendMessage(chatId, { text: '❌ Failed to whitelist.' });
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    case 'clear': {
+                        await store.saveSetting(chatId, 'antilink_whitelist', []);
+                        await sock.sendMessage(chatId, { text: '✅ Whitelist cleared.' });
+                        break;
+                    }
+                    case 'cancel':
+                        break;
+                }
                 break;
+            }
 
-            case 'status':
-            case 'get':
-                const status = await getAntilink(chatId, 'on');
+            case 'viewwarnings': {
+                await sock.sendMessage(chatId, { 
+                    text: '🔍 Reply with the user\'s phone number (e.g., 1234567890) or mention them (e.g., @1234567890).\nReply *cancel* to abort.' 
+                });
+                const mentionResult = await promptText(sock, chatId, senderId, 60000);
+                if (mentionResult.timedOut || mentionResult.cancelled) {
+                    await sock.sendMessage(chatId, { text: mentionResult.timedOut ? '⏰ Timed out.' : 'Cancelled.' });
+                    break;
+                }
+                const msgText = mentionResult.text;
+                let targetUser = null;
+                const mentionMatch = msgText.match(/@(\d+)/);
+                if (mentionMatch) {
+                    targetUser = mentionMatch[1] + '@s.whatsapp.net';
+                } else {
+                    const phoneMatch = msgText.match(/\d{10,15}/);
+                    if (phoneMatch) {
+                        targetUser = phoneMatch[0] + '@s.whatsapp.net';
+                    } else {
+                        await sock.sendMessage(chatId, { text: '❌ Could not identify user. Please provide a valid phone number or mention.' });
+                        break;
+                    }
+                }
+                if (targetUser) {
+                    const warnings = await getWarnings(chatId, targetUser);
+                    let warnText = `⚠️ Warnings for @${targetUser.split('@')[0]}\n`;
+                    warnText += `Total: ${warnings.count}\n`;
+                    warnText += `Last warned: ${warnings.lastWarned ? new Date(warnings.lastWarned).toLocaleString() : 'Never'}\n`;
+                    if (warnings.warnings.length > 0) {
+                        warnText += 'History:\n';
+                        warnings.warnings.forEach((w, i) => {
+                            warnText += `${i+1}. ${w.linkType} at ${new Date(w.timestamp).toLocaleString()}\n`;
+                        });
+                    }
+                    await sock.sendMessage(chatId, { text: warnText, mentions: [targetUser] });
+                }
+                break;
+            }
+
+            case 'clearwarnings': {
+                await sock.sendMessage(chatId, { 
+                    text: '🧹 Reply with the user\'s phone number or mention to clear warnings.\nReply *cancel* to abort.' 
+                });
+                const clearResult = await promptText(sock, chatId, senderId, 60000);
+                if (clearResult.timedOut || clearResult.cancelled) {
+                    await sock.sendMessage(chatId, { text: clearResult.timedOut ? '⏰ Timed out.' : 'Cancelled.' });
+                    break;
+                }
+                const clearText = clearResult.text;
+                let clearTarget = null;
+                const clearMention = clearText.match(/@(\d+)/);
+                if (clearMention) {
+                    clearTarget = clearMention[1] + '@s.whatsapp.net';
+                } else {
+                    const phoneMatch = clearText.match(/\d{10,15}/);
+                    if (phoneMatch) {
+                        clearTarget = phoneMatch[0] + '@s.whatsapp.net';
+                    } else {
+                        await sock.sendMessage(chatId, { text: '❌ Could not identify user.' });
+                        break;
+                    }
+                }
+                if (clearTarget) {
+                    await clearWarnings(chatId, clearTarget);
+                    await sock.sendMessage(chatId, { text: `✅ Warnings cleared for @${clearTarget.split('@')[0]}`, mentions: [clearTarget] });
+                }
+                break;
+            }
+
+            case 'status': {
+                const statusConfig = await getAntilink(chatId, 'on');
                 const whitelistStatus = await getWhitelist(chatId);
-
-                let whitelistStatusText = '';
+                let statusTextFull = `🔗 Antilink Status\n`;
+                statusTextFull += `Status: ${statusConfig?.enabled ? '✅ Enabled' : '❌ Disabled'}\n`;
+                statusTextFull += `Action: ${statusConfig?.action || 'Not set'}\n`;
+                statusTextFull += `Whitelist: ${whitelistStatus.length} active\n`;
                 if (whitelistStatus.length > 0) {
-                    whitelistStatusText = '\n*Active Whitelisted Links:*\n';
-                    whitelistStatus.forEach((item: WhitelistInfo, index: number) => {
+                    statusTextFull += 'Whitelisted:\n';
+                    whitelistStatus.forEach((item, idx) => {
                         const timeLeft = Math.max(0, Math.ceil((item.expiresAt - Date.now()) / 60000));
-                        whitelistStatusText += `${index + 1}. ${item.url}\n   Expires in: ${timeLeft} minutes\n`;
+                        statusTextFull += `${idx+1}. ${item.url} (${timeLeft} min left)\n`;
                     });
-                } else {
-                    whitelistStatusText = '\n*No whitelisted links*';
                 }
-
-                await sock.sendMessage(chatId, {
-                    text: `*🔗 ANTILINK STATUS*\n\n` +
-                          `*Status:* ${status?.enabled ? '✅ Enabled' : '❌ Disabled'}\n` +
-                          `*Action:* ${status?.action || 'Not set'}\n` +
-                          `*Warning Limit:* 3 warnings before kick\n\n` +
-                          `*What happens when links are detected:*\n` +
-                          `${status?.action === 'delete' ? '• Message is deleted\n• User gets warning\n• Auto-kick after 3 warnings' : ''}` +
-                          `${status?.action === 'kick' ? '• Message is deleted\n• User warned 3 times\n• Kicked after 3rd warning' : ''}` +
-                          `${status?.action === 'warn' ? '• User gets warning\n• Message stays\n• No kicking' : ''}\n\n` +
-                          `*Exempt:* Admins, Owner, Sudo users\n` +
-                          `*Whitelist:* Use \`.antilink whitelist <url>\` to temporarily allow links` +
-                          whitelistStatusText
-                }, { quoted: message });
+                await sock.sendMessage(chatId, { text: statusTextFull });
                 break;
+            }
 
-            default:
-                await sock.sendMessage(chatId, {
-                    text: '❌ *Invalid command*\n\nUse `.antilink` to see available options.'
-                }, { quoted: message });
+            case 'cancel':
+                break;
         }
     },
 
+    // Expose internal functions for backward compatibility or external use
     handleLinkDetection,
     setAntilink,
     getAntilink,
@@ -604,3 +597,157 @@ export default {
     getWhitelist,
     cleanExpiredWhitelist
 };
+
+// --- LEGACY DIRECT COMMAND HANDLER (with senderId parameter) ---
+async function handleDirectCommand(
+    sock: any,
+    message: any,
+    args: string[],
+    chatId: string,
+    senderId: string,   // ✅ MUST BE PRESENT
+    context: BotContext
+) {
+    const action = args[0]?.toLowerCase();
+
+    if (!action) {
+        return;
+    }
+
+    switch (action) {
+        case 'on': {
+            const existingConfig = await getAntilink(chatId, 'on');
+            if (existingConfig?.enabled) {
+                await sock.sendMessage(chatId, {
+                    text: '⚠️ Antilink is already enabled. Use `.antilink` to see settings.'
+                }, { quoted: message });
+                return;
+            }
+            const result = await setAntilink(chatId, 'on', 'delete');
+            await sock.sendMessage(chatId, {
+                text: result
+                    ? '✅ Antilink enabled (default action: delete).'
+                    : '❌ Failed to enable antilink.'
+            }, { quoted: message });
+            break;
+        }
+
+        case 'off': {
+            await removeAntilink(chatId, 'on');
+            await sock.sendMessage(chatId, {
+                text: '❌ Antilink disabled.'
+            }, { quoted: message });
+            break;
+        }
+
+        case 'set': {
+            if (args.length < 2) {
+                await sock.sendMessage(chatId, {
+                    text: '❌ Usage: .antilink set <delete|kick|warn>'
+                }, { quoted: message });
+                return;
+            }
+            const setAction = args[1].toLowerCase() as AntilinkAction;
+            if (!['delete', 'kick', 'warn'].includes(setAction)) {
+                await sock.sendMessage(chatId, {
+                    text: '❌ Invalid action. Choose: delete, kick, or warn'
+                }, { quoted: message });
+                return;
+            }
+            const setResult = await setAntilink(chatId, 'on', setAction);
+            await sock.sendMessage(chatId, {
+                text: setResult
+                    ? `✅ Action set to: ${setAction}`
+                    : '❌ Failed to set action.'
+            }, { quoted: message });
+            break;
+        }
+
+        case 'whitelist': {
+            if (args.length < 2) {
+                await sock.sendMessage(chatId, {
+                    text: '❌ Usage: .antilink whitelist <url> or .antilink whitelist clear'
+                }, { quoted: message });
+                return;
+            }
+            if (args[1].toLowerCase() === 'clear') {
+                await store.saveSetting(chatId, 'antilink_whitelist', []);
+                await sock.sendMessage(chatId, { text: '✅ Whitelist cleared.' }, { quoted: message });
+                return;
+            }
+            const url = args[1];
+            if (!url.match(/^https?:\/\/.+/i)) {
+                await sock.sendMessage(chatId, {
+                    text: '❌ Invalid URL. Must start with http:// or https://'
+                }, { quoted: message });
+                return;
+            }
+            const added = await addToWhitelist(chatId, url, senderId);   // ✅ senderId used here
+            if (added) {
+                await sock.sendMessage(chatId, {
+                    text: `✅ Whitelisted: ${url} for 10 minutes.`
+                }, { quoted: message });
+            } else {
+                await sock.sendMessage(chatId, {
+                    text: '❌ Failed to whitelist.'
+                }, { quoted: message });
+            }
+            break;
+        }
+
+        case 'warnings': {
+            let targetUser = senderId;   // ✅ senderId used here
+            if (message.mentions && message.mentions.length > 0) {
+                targetUser = message.mentions[0];
+            } else if (args.length > 1 && args[1].startsWith('@')) {
+                targetUser = args[1].replace('@', '') + '@s.whatsapp.net';
+            }
+            const warnings = await getWarnings(chatId, targetUser);
+            let warnText = `⚠️ Warnings for @${targetUser.split('@')[0]}\n`;
+            warnText += `Total: ${warnings.count}\n`;
+            warnText += `Last warned: ${warnings.lastWarned ? new Date(warnings.lastWarned).toLocaleString() : 'Never'}`;
+            await sock.sendMessage(chatId, { text: warnText, mentions: [targetUser] }, { quoted: message });
+            break;
+        }
+
+        case 'clearwarn':
+        case 'clearwarnings': {
+            let clearTarget = senderId;   // ✅ senderId used here
+            if (message.mentions && message.mentions.length > 0) {
+                clearTarget = message.mentions[0];
+            } else if (args.length > 1 && args[1].startsWith('@')) {
+                clearTarget = args[1].replace('@', '') + '@s.whatsapp.net';
+            }
+            await clearWarnings(chatId, clearTarget);
+            await sock.sendMessage(chatId, {
+                text: `✅ Warnings cleared for @${clearTarget.split('@')[0]}`,
+                mentions: [clearTarget]
+            }, { quoted: message });
+            break;
+        }
+
+        case 'status':
+        case 'get': {
+            const statusConfig = await getAntilink(chatId, 'on');
+            const whitelistStatus = await getWhitelist(chatId);
+            let statusTextFull = `🔗 Antilink Status\n`;
+            statusTextFull += `Status: ${statusConfig?.enabled ? '✅ Enabled' : '❌ Disabled'}\n`;
+            statusTextFull += `Action: ${statusConfig?.action || 'Not set'}\n`;
+            statusTextFull += `Whitelist: ${whitelistStatus.length} active\n`;
+            if (whitelistStatus.length > 0) {
+                statusTextFull += 'Whitelisted:\n';
+                whitelistStatus.forEach((item, idx) => {
+                    const timeLeft = Math.max(0, Math.ceil((item.expiresAt - Date.now()) / 60000));
+                    statusTextFull += `${idx+1}. ${item.url} (${timeLeft} min left)\n`;
+                });
+            }
+            await sock.sendMessage(chatId, { text: statusTextFull }, { quoted: message });
+            break;
+        }
+
+        default: {
+            await sock.sendMessage(chatId, {
+                text: '❌ Unknown subcommand. Use `.antilink` for interactive menu.'
+            }, { quoted: message });
+        }
+    }
+}
