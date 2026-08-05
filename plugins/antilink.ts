@@ -3,6 +3,7 @@ import store from '../lib/lightweight_store.js';
 import isOwnerOrSudo from '../lib/isOwner.js';
 import isAdmin from '../lib/isAdmin.js';
 import { promptMenu } from '../lib/menuSession.js';
+import { cleanJid } from '../lib/isOwner.js';
 
 interface AntilinkSettings {
     enabled: boolean;
@@ -468,7 +469,11 @@ export default {
 
     async handler(sock: any, message: any, args: any, context: BotContext) {
         const chatId = context.chatId || message.key.remoteJid;
-        const senderJid = message.key.participant || message.key.remoteJid;
+        // Must match cleanJid(...) the same way menuSession's listener cleans
+        // the replying sender's JID before comparing — otherwise a raw @lid
+        // JID here never matches the cleaned JID on reply, and the menu
+        // silently never responds (forex.ts does this too; see cleanJid(senderId)).
+        const senderJid = cleanJid(message.key.participant || message.key.remoteJid);
         const action = args[0]?.toLowerCase();
 
         // No arguments → USSD-style interactive menu.
