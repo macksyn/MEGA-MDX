@@ -11,14 +11,19 @@
  * typed-number reply that quotes the menu message works cleanly. This
  * module is built on that confirmed path, not on buttons.
  *
+ * Renders a clean USSD-style numbered list (keycap digits, thin dividers,
+ * optional subtitle/description lines) since that's the format people
+ * already instinctively know how to answer.
+ *
  * ── Usage ────────────────────────────────────────────────────────────
  *   import { promptMenu } from '../lib/menuSession.js';
  *
  *   const result = await promptMenu(sock, message, chatId, userId, {
  *     title: '💹 FOREX',
+ *     subtitle: 'Balance: 12,400 coins',
  *     text: 'What would you like to do?',
  *     options: [
- *       { label: 'Place a trade', value: 'trade' },
+ *       { label: 'Place a trade', value: 'trade', description: 'Open a new position' },
  *       { label: 'Check prices', value: 'prices' },
  *     ],
  *   });
@@ -45,6 +50,10 @@
  * - An invalid-but-quoted reply (wrong number, gibberish) does NOT consume
  *   the prompt — it gets a quick nudge and can still answer before the TTL.
  * - Default TTL is 3 minutes; pass `ttlMs` to override per-call.
+ * - This module only handles numbered *selection*. Free-text input (a URL,
+ *   a name, an amount) isn't in scope here by design — collect that with a
+ *   normal command argument, then use promptMenu for whatever's left that's
+ *   a pick-from-a-list decision.
  */
 
 import { cleanJid } from './isOwner.js';
@@ -52,14 +61,20 @@ import { cleanJid } from './isOwner.js';
 export interface MenuOption {
   label: string;
   value: string;
+  /** Short USSD-style sub-line shown under the option, e.g. "Delete + warn". */
+  description?: string;
 }
 
 export interface MenuPromptConfig {
   title?: string;
+  /** One-line status/context shown under the title, e.g. "Status: ✅ Enabled". */
+  subtitle?: string;
   text: string;
   options: MenuOption[];
   footer?: string;
   ttlMs?: number;
+  /** Custom label for the cancel line. Defaults to "Cancel". */
+  cancelLabel?: string;
   /** Merged into the sendMessage payload (e.g. channelInfo). */
   extra?: Record<string, any>;
 }
@@ -71,6 +86,7 @@ export interface MenuResult {
 }
 
 const DEFAULT_TTL_MS = 3 * 60_000; // within the validated 2-5 minute window
+const DIVIDER = '┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄';
 
 interface PendingPrompt {
   chatId: string;
@@ -82,6 +98,40 @@ interface PendingPrompt {
 
 const pending = new Map<string, PendingPrompt>(); // keyed by the sent menu message's own id
 let listenerRegistered = false;
+
+const KEYCAP_DIGITS: Record<string, string> = {
+  '0': '0️⃣', '1': '1️⃣', '2': '2️⃣', '3': '3️⃣', '4': '4️⃣',
+  '5': '5️⃣', '6': '6️⃣', '7': '7️⃣', '8': '8️⃣', '9': '9️⃣',
+};
+
+/** Renders any non-negative integer as concatenated keycap digits (works past 9, unlike a single "N️⃣"). */
+function keycapNumber(n: number): string {
+  return String(n).split('').map(d => KEYCAP_DIGITS[d] ?? d).join('');
+}
+
+function buildMenuText(config: MenuPromptConfig, ttlMs: number): string {
+  const minutes = Math.round(ttlMs / 60_000);
+  const cancelLabel = config.cancelLabel || 'Cancel';
+
+  const lines: string[] = [];
+
+  if (config.title) lines.push(`*${config.title}*`);
+  if (config.subtitle) lines.push(`_${config.subtitle}_`);
+  if (config.title || config.subtitle) lines.push(DIVIDER);
+
+  lines.push(config.text, '');
+
+  config.options.forEach((o, i) => {
+    lines.push(`${keycapNumber(i + 1)}  *${o.label}*`);
+    if (o.description) lines.push(`     ${o.description}`);
+  });
+
+  lines.push('', DIVIDER);
+  lines.push(`↩️ _Reply to this message with a number_`);
+  lines.push(`${keycapNumber(0)} ${cancelLabel}   ⏳ Expires in ${minutes} min${minutes === 1 ? '' : 's'}`);
+
+  return lines.join('\n');
+}
 
 function getQuotedStanzaId(msg: any): string | null {
   const m = msg.message;
@@ -160,15 +210,9 @@ export async function promptMenu(
   registerListener(sock);
 
   const ttlMs = config.ttlMs ?? DEFAULT_TTL_MS;
-  const body = config.options.map((o, i) => `${i + 1}️⃣ ${o.label}`).join('\n');
-  const minutes = Math.round(ttlMs / 60_000);
 
   const sent = await sock.sendMessage(chatId, {
-    text:
-      `${config.title ? `${config.title}\n\n` : ''}` +
-      `${config.text}\n\n${body}\n\n` +
-      `_Reply to this message with a number (or 0 to cancel)._\n` +
-      `_Expires in ${minutes} minute${minutes === 1 ? '' : 's'}._`,
+    text: buildMenuText(config, ttlMs),
     footer: config.footer,
     ...(config.extra || {}),
   }, { quoted: message });
