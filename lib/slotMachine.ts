@@ -391,9 +391,9 @@ export function getStakeProfile(stake: number, spinsPlayed: number = 100, consec
   const normalized = 0.2 + 0.8 * ((clampedStake - minBet) / (maxBet - minBet));
 
   // Base probabilities scale dynamically against the normalized value
-  let bigWinChance = Math.max(0.015, 0.045 - 0.025 * normalized);
-  let megaWinChance = Math.max(0.005, 0.015 - 0.009 * normalized);
-  let superMegaWinChance = Math.max(0.0015, 0.004 - 0.0028 * normalized);
+  let bigWinChance = Math.max(0.020, 0.050 - 0.030 * normalized);
+  let megaWinChance = Math.max(0.009, 0.019 - 0.013 * normalized);
+  let superMegaWinChance = Math.max(0.0019, 0.008 - 0.0032 * normalized);
   let loseChance = Math.max(0.42, 0.44 + 0.12 * normalized);
   let recover30Chance = Math.max(0.12, 0.17 - 0.05 * normalized);
   let recover70Chance = Math.max(0.08, 0.14 - 0.06 * normalized);
