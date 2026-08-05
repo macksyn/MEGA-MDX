@@ -66,8 +66,8 @@ export const JACKPOT_SEED = 500;
 // ── RTP policy ──────────────────────────────────────────────────────────
 // Same numbers as Jungle Hunt (lib/slotMachine.ts) so both games are
 // financially consistent with each other.
-const MIN_STAKE_BASE_RTP = 0.94; // at bet 5  (normalized = 0)
-const MAX_STAKE_BASE_RTP = 0.915; // at bet 100 (normalized = 1)
+const MIN_STAKE_BASE_RTP = 0.96; // at bet 5  (normalized = 0)
+const MAX_STAKE_BASE_RTP = 0.92; // at bet 100 (normalized = 1)
 export const HARD_CEILING_RTP = 0.96;
 export const EMERGENCY_CEILING_RTP = 0.90;
 
