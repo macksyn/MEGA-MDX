@@ -49,13 +49,13 @@ interface EconomySettings {
 }
 
 const DEFAULT_SETTINGS: EconomySettings = {
-  coinsPerGroqCoin: Number(process.env.ECONOMY_COINS_PER_GROQCOIN) || 100,
+  coinsPerGroqCoin: Number(process.env.ECONOMY_COINS_PER_GROQCOIN) || 1,
   groqCoinWithdrawThreshold: Number(process.env.ECONOMY_GROQCOIN_WITHDRAW_THRESHOLD) || 50,
   workMin: Number(process.env.ECONOMY_WORK_MIN) || 50,
   workMax: Number(process.env.ECONOMY_WORK_MAX) || 300,
   workCooldownMs: Number(process.env.ECONOMY_WORK_COOLDOWN_MS) || 60 * 60 * 1000, // 1hr
   top3Rewards: [300, 200, 100],
-  exchangeFeePercent: Number(process.env.ECONOMY_EXCHANGE_FEE_PERCENT) || 15,
+  exchangeFeePercent: Number(process.env.ECONOMY_EXCHANGE_FEE_PERCENT) || 5,
   exchangeAllowedAmounts: [10, 20, 50, 100],
   fineAmount: Number(process.env.ECONOMY_FINE_AMOUNT) || 20,
   economyGroupId: process.env.ECONOMY_GROUP_ID || null,
