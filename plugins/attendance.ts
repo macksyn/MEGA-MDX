@@ -8,6 +8,7 @@ import { createStore } from '../lib/pluginStore.js';
 import bus           from '../lib/pluginBus.js';
 import { awardAttendanceBonus, syncIdentity } from '../lib/economy.js';
 import { cleanJid } from '../lib/isOwner.js';
+
 // Activity tracker is optional — loaded via dynamic import (ESM-safe)
 let activityTracker: any = null;
 import('../lib/activitytracker.js')
@@ -22,14 +23,12 @@ import('../lib/activitytracker.js')
 moment.tz.setDefault('Africa/Lagos');
 
 // ── Storage ───────────────────────────────────────────────────────────────────
-
 const db         = createStore('attendance');
 const dbUsers    = db.table!('users');
 const dbRecords  = db.table!('records');
 const dbSettings = db.table!('settings');
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-
 interface AttendanceSettings {
   rewardAmount:           number;
   requireImage:           boolean;
@@ -77,7 +76,6 @@ interface ValidationResult {
 }
 
 // ── Defaults ──────────────────────────────────────────────────────────────────
-
 const defaultSettings: AttendanceSettings = {
   rewardAmount:          5,
   requireImage:          false,
@@ -93,7 +91,6 @@ const defaultSettings: AttendanceSettings = {
 };
 
 // ── User cache ────────────────────────────────────────────────────────────────
-
 const userCache    = new Map<string, { user: UserData; timestamp: number }>();
 const cacheTimeout = 5 * 60 * 1000;
 
@@ -107,7 +104,6 @@ setInterval(() => {
 let attendanceSettings: AttendanceSettings = { ...defaultSettings };
 
 // ── Settings persistence ──────────────────────────────────────────────────────
-
 async function loadSettings(): Promise<void> {
   try {
     const saved = await dbSettings.get('config');
@@ -129,7 +125,6 @@ async function saveSettings(): Promise<void> {
 }
 
 // ── User helpers ──────────────────────────────────────────────────────────────
-
 async function initUser(userId: string): Promise<UserData> {
   const cached = userCache.get(userId);
   if (cached && Date.now() - cached.timestamp < cacheTimeout) return cached.user;
@@ -158,7 +153,6 @@ async function updateUserData(userId: string, patch: Partial<UserData>): Promise
 }
 
 // ── Date / birthday helpers ───────────────────────────────────────────────────
-
 const MONTH_NAMES: Record<string, number> = {
   january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
   july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
@@ -265,7 +259,6 @@ function formatBirthday(
 }
 
 // ── Record helpers ────────────────────────────────────────────────────────────
-
 async function saveAttendanceRecord(userId: string, attendanceData: any): Promise<boolean> {
   try {
     const record = {
@@ -312,7 +305,6 @@ async function cleanupRecords(): Promise<number> {
 }
 
 // ── Form helpers ──────────────────────────────────────────────────────────────
-
 function hasImage(message: any): boolean {
   try {
     return !!(
@@ -332,20 +324,16 @@ function getImageStatus(hasImg: boolean, isRequired: boolean): string {
     : hasImg ? '📸 Image detected ✅' : '📸 No image (optional)';
 }
 
-// Converts "fancy" Unicode letters/digits (e.g. 𝗡𝗮𝗺𝗲, 𝗧𝗶𝗺𝗲 — Mathematical
-// Sans-Serif Bold / Bold styles commonly produced by "fancy text" generators)
-// back to plain ASCII so the field-label regexes below still match. Leaves
-// everything else (emoji, punctuation, spacing, plain ASCII) untouched.
 function normalizeStyledText(text: string): string {
   if (!text) return text;
   return text.replace(/[\u{1D400}-\u{1D7FF}]/gu, (ch) => {
     const code = ch.codePointAt(0)!;
-    if (code >= 0x1D400 && code <= 0x1D419) return String.fromCharCode(code - 0x1D400 + 65); // Bold A-Z
-    if (code >= 0x1D41A && code <= 0x1D433) return String.fromCharCode(code - 0x1D41A + 97); // Bold a-z
-    if (code >= 0x1D5D4 && code <= 0x1D5ED) return String.fromCharCode(code - 0x1D5D4 + 65); // Sans-Serif Bold A-Z
-    if (code >= 0x1D5EE && code <= 0x1D607) return String.fromCharCode(code - 0x1D5EE + 97); // Sans-Serif Bold a-z
-    if (code >= 0x1D7CE && code <= 0x1D7D7) return String.fromCharCode(code - 0x1D7CE + 48); // Bold 0-9
-    if (code >= 0x1D7EC && code <= 0x1D7F5) return String.fromCharCode(code - 0x1D7EC + 48); // Sans-Serif Bold 0-9
+    if (code >= 0x1D400 && code <= 0x1D419) return String.fromCharCode(code - 0x1D400 + 65);
+    if (code >= 0x1D41A && code <= 0x1D433) return String.fromCharCode(code - 0x1D41A + 97);
+    if (code >= 0x1D5D4 && code <= 0x1D5ED) return String.fromCharCode(code - 0x1D5D4 + 65);
+    if (code >= 0x1D5EE && code <= 0x1D607) return String.fromCharCode(code - 0x1D5EE + 97);
+    if (code >= 0x1D7CE && code <= 0x1D7D7) return String.fromCharCode(code - 0x1D7CE + 48);
+    if (code >= 0x1D7EC && code <= 0x1D7F5) return String.fromCharCode(code - 0x1D7EC + 48);
     return ch;
   });
 }
@@ -377,14 +365,16 @@ function validateAttendanceForm(rawBody: string, hasImg = false): ValidationResu
     validation.missingFields.push('📸 Image (required)');
   }
 
+  // FIXED: Changed \s* to [^\S\r\n]* so it matches spaces on the SAME line, 
+  // preventing empty fields from swallowing the label of the next line!
   const requiredFields = [
-    { name: 'Name',         pattern: /\*?Name\*?[:]\s*([^\n]+)/i,          fieldName: '👤 Name',              isBirthday: false },
-    { name: 'Location',     pattern: /\*?Location\*?[:]\s*([^\n]+)/i,      fieldName: '🌍 Location',           isBirthday: false },
-    { name: 'Time',         pattern: /\*?Time\*?[:]\s*([^\n]+)/i,          fieldName: '⌚ Time',               isBirthday: false },
-    { name: 'Weather',      pattern: /\*?Weather\*?[:]\s*([^\n]+)/i,       fieldName: '🌥 Weather',            isBirthday: false },
-    { name: 'Mood',         pattern: /\*?Mood\*?[:]\s*([^\n]+)/i,          fieldName: '❤️‍🔥 Mood',            isBirthday: false },
-    { name: 'DOB',          pattern: /\*?D\.?O\.?B\.?\*?[:]\s*([^\n]+)/i, fieldName: '🗓 D.O.B',             isBirthday: true  },
-    { name: 'Relationship', pattern: /\*?Relationship\*?[:]\s*([^\n]+)/i,  fieldName: '👩‍❤️‍👨 Relationship', isBirthday: false }
+    { name: 'Name',         pattern: /\*?Name\*?[:][^\S\r\n]*([^\n]+)/i,          fieldName: '👤 Name',              isBirthday: false },
+    { name: 'Location',     pattern: /\*?Location\*?[:][^\S\r\n]*([^\n]+)/i,      fieldName: '🌍 Location',           isBirthday: false },
+    { name: 'Time',         pattern: /\*?Time\*?[:][^\S\r\n]*([^\n]+)/i,          fieldName: '⌚ Time',               isBirthday: false },
+    { name: 'Weather',      pattern: /\*?Weather\*?[:][^\S\r\n]*([^\n]+)/i,       fieldName: '🌥 Weather',            isBirthday: false },
+    { name: 'Mood',         pattern: /\*?Mood\*?[:][^\S\r\n]*([^\n]+)/i,          fieldName: '❤️‍🔥 Mood',            isBirthday: false },
+    { name: 'DOB',          pattern: /\*?D\.?O\.?B\.?\*?[:][^\S\r\n]*([^\n]+)/i, fieldName: '🗓 D.O.B',             isBirthday: true  },
+    { name: 'Relationship', pattern: /\*?Relationship\*?[:][^\S\r\n]*([^\n]+)/i,  fieldName: '👩‍❤️‍👨 Relationship', isBirthday: false }
   ];
 
   requiredFields.forEach(field => {
@@ -402,10 +392,12 @@ function validateAttendanceForm(rawBody: string, hasImg = false): ValidationResu
     }
   });
 
-  const wakeUp1 = body.match(/1[:]\s*([^\n]+)/i);
-  const wakeUp2 = body.match(/2[:]\s*([^\n]+)/i);
-  const wakeUp3 = body.match(/3[:]\s*([^\n]+)/i);
+  // FIXED: Applied the same line-locking regex fix here
+  const wakeUp1 = body.match(/1[:][^\S\r\n]*([^\n]+)/i);
+  const wakeUp2 = body.match(/2[:][^\S\r\n]*([^\n]+)/i);
+  const wakeUp3 = body.match(/3[:][^\S\r\n]*([^\n]+)/i);
   const missingWakeUps: string[] = [];
+  
   if (!wakeUp1?.[1] || wakeUp1[1].trim().length < attendanceSettings.minFieldLength) missingWakeUps.push('1:');
   if (!wakeUp2?.[1] || wakeUp2[1].trim().length < attendanceSettings.minFieldLength) missingWakeUps.push('2:');
   if (!wakeUp3?.[1] || wakeUp3[1].trim().length < attendanceSettings.minFieldLength) missingWakeUps.push('3:');
@@ -436,7 +428,6 @@ function getNigeriaTime(): any  { return moment.tz('Africa/Lagos'); }
 function getCurrentDate(): string { return getNigeriaTime().format('DD-MM-YYYY'); }
 
 // ── Auto-detection (called by messageHandler directly) ────────────────────────
-
 async function handleAutoAttendance(message: any, sock: any): Promise<boolean> {
   try {
     const messageText: string = normalizeStyledText(
@@ -493,10 +484,6 @@ async function handleAutoAttendance(message: any, sock: any): Promise<boolean> {
       birthdayMessage = `\n🎂 Birthday saved/updated: ${validation.extractedData.parsedBirthday.displayDate}.`;
     }
 
-    // Resolve the full reward right here — attendance owns its own streak
-    // number (currentStreak, computed above) and its own bonus settings, so
-    // there's no need to hand raw ingredients to economy and let it recompute
-    // anything from a separate copy of the streak.
     let baseAward = attendanceSettings.rewardAmount;
     let streakBonus = 0;
     if (attendanceSettings.enableStreakBonus && currentStreak >= attendanceSettings.streakBonusThreshold) {
@@ -515,18 +502,12 @@ async function handleAutoAttendance(message: any, sock: any): Promise<boolean> {
         totalReward,
         currentStreak
       );
-      // Attendance forms often carry a real name field — prefer that, then
-      // fall back to WhatsApp's pushName, to keep the economy wallet
-      // recognizable in admin tooling and leaderboards.
       void syncIdentity(cleanJid(senderId), sock, validation.extractedData.name || message.pushName);
       if (bonusResult.success) {
         reward = bonusResult.reward;
         bonusMessage = `\n💰 Coins earned: ${reward.toLocaleString()}` +
           (streakBonus > 0 ? ` (incl. ${streakBonus.toLocaleString()} streak bonus, x${attendanceSettings.streakBonusMultiplier})` : '') +
           (imageBonus > 0 ? ` (incl. ${imageBonus.toLocaleString()} image bonus)` : '');
-        // Reward is drawn from the same shared bank that backs !slots/
-        // !coinflip/!dice — if the bank's reserve is currently low, the
-        // payout may have been capped below what was actually earned.
         if (bonusResult.capped) {
           bonusMessage += reward > 0
             ? `\n⚠️ _Bank reserve is low right now, so this was capped down from the full ${totalReward.toLocaleString()} earned. Check *.reserve* for details._`
@@ -564,7 +545,6 @@ async function handleAutoAttendance(message: any, sock: any): Promise<boolean> {
 }
 
 // ── Command sub-handlers ──────────────────────────────────────────────────────
-
 async function showAttendanceMenu(sock: any, chatId: string, message: any): Promise<void> {
   await sock.sendMessage(chatId, {
     text: `📋 *ATTENDANCE SYSTEM* 📋\n\n` +
@@ -851,7 +831,6 @@ async function handleCleanup(sock: any, chatId: string, senderId: string, messag
 }
 
 // ── Plugin export ─────────────────────────────────────────────────────────────
-
 const attendancePlugin = {
   command:     'attendance',
   aliases:     ['att', 'attendstats', 'mystats'],
