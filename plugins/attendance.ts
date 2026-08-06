@@ -332,10 +332,28 @@ function getImageStatus(hasImg: boolean, isRequired: boolean): string {
     : hasImg ? '📸 Image detected ✅' : '📸 No image (optional)';
 }
 
-// Updated regex to support both old (*Name*:) and new bold (𝗡𝗮𝗺𝗲:) formats
-const attendanceFormRegex = /GIST\s+HQ.*?(?:\*?Name\*?[:]|𝗡𝗮𝗺𝗲[:]).*?(?:\*?Relationship\*?[:]|𝗥𝗲𝗹𝗮𝘁𝗶𝗼𝗻𝘀𝗵𝗶𝗽[:])/is;
+// Converts "fancy" Unicode letters/digits (e.g. 𝗡𝗮𝗺𝗲, 𝗧𝗶𝗺𝗲 — Mathematical
+// Sans-Serif Bold / Bold styles commonly produced by "fancy text" generators)
+// back to plain ASCII so the field-label regexes below still match. Leaves
+// everything else (emoji, punctuation, spacing, plain ASCII) untouched.
+function normalizeStyledText(text: string): string {
+  if (!text) return text;
+  return text.replace(/[\u{1D400}-\u{1D7FF}]/gu, (ch) => {
+    const code = ch.codePointAt(0)!;
+    if (code >= 0x1D400 && code <= 0x1D419) return String.fromCharCode(code - 0x1D400 + 65); // Bold A-Z
+    if (code >= 0x1D41A && code <= 0x1D433) return String.fromCharCode(code - 0x1D41A + 97); // Bold a-z
+    if (code >= 0x1D5D4 && code <= 0x1D5ED) return String.fromCharCode(code - 0x1D5D4 + 65); // Sans-Serif Bold A-Z
+    if (code >= 0x1D5EE && code <= 0x1D607) return String.fromCharCode(code - 0x1D5EE + 97); // Sans-Serif Bold a-z
+    if (code >= 0x1D7CE && code <= 0x1D7D7) return String.fromCharCode(code - 0x1D7CE + 48); // Bold 0-9
+    if (code >= 0x1D7EC && code <= 0x1D7F5) return String.fromCharCode(code - 0x1D7EC + 48); // Sans-Serif Bold 0-9
+    return ch;
+  });
+}
 
-function validateAttendanceForm(body: string, hasImg = false): ValidationResult {
+const attendanceFormRegex = /GIST\s+HQ.*?\*?Name\*?[:].*?\*?Relationship\*?[:]/is;
+
+function validateAttendanceForm(rawBody: string, hasImg = false): ValidationResult {
+  const body = normalizeStyledText(rawBody);
   const validation: ValidationResult = {
     isValidForm:      false,
     missingFields:    [],
@@ -346,11 +364,10 @@ function validateAttendanceForm(body: string, hasImg = false): ValidationResult 
     extractedData:    {}
   };
 
-  // Check for GIST HQ and both Name and Relationship (old or new style)
   if (
     !/GIST\s+HQ/i.test(body) ||
-    !/(?:\*?Name\*?[:]|𝗡𝗮𝗺𝗲[:])/i.test(body) ||
-    !/(?:\*?Relationship\*?[:]|𝗥𝗲𝗹𝗮𝘁𝗶𝗼𝗻𝘀𝗵𝗶𝗽[:])/i.test(body)
+    !/\*?Name\*?[:]/i.test(body) ||
+    !/\*?Relationship\*?[:]/i.test(body)
   ) {
     validation.errors.push('❌ Invalid attendance form format');
     return validation;
@@ -361,13 +378,13 @@ function validateAttendanceForm(body: string, hasImg = false): ValidationResult 
   }
 
   const requiredFields = [
-    { name: 'Name',         pattern: /(?:\*?Name\*?[:]|𝗡𝗮𝗺𝗲[:])\s*([^\n]+)/i,          fieldName: '👤 Name',              isBirthday: false },
-    { name: 'Location',     pattern: /(?:\*?Location\*?[:]|𝗟𝗼𝗰𝗮𝘁𝗶𝗼𝗻[:])\s*([^\n]+)/i,    fieldName: '🌍 Location',           isBirthday: false },
-    { name: 'Time',         pattern: /(?:\*?Time\*?[:]|𝗧𝗶𝗺𝗲[:])\s*([^\n]+)/i,            fieldName: '⌚ Time',               isBirthday: false },
-    { name: 'Weather',      pattern: /(?:\*?Weather\*?[:]|𝗪𝗲𝗮𝘁𝗵𝗲𝗿[:])\s*([^\n]+)/i,     fieldName: '🌥 Weather',            isBirthday: false },
-    { name: 'Mood',         pattern: /(?:\*?Mood\*?[:]|𝗠𝗼𝗼𝗱[:])\s*([^\n]+)/i,            fieldName: '❤️‍🔥 Mood',            isBirthday: false },
-    { name: 'DOB',          pattern: /(?:\*?D\.?O\.?B\.?\*?[:]|𝗗\.𝗢\.𝗕[:])\s*([^\n]+)/i, fieldName: '🗓 D.O.B',             isBirthday: true  },
-    { name: 'Relationship', pattern: /(?:\*?Relationship\*?[:]|𝗥𝗲𝗹𝗮𝘁𝗶𝗼𝗻𝘀𝗵𝗶𝗽[:])\s*([^\n]+)/i, fieldName: '👩‍❤️‍👨 Relationship', isBirthday: false }
+    { name: 'Name',         pattern: /\*?Name\*?[:]\s*([^\n]+)/i,          fieldName: '👤 Name',              isBirthday: false },
+    { name: 'Location',     pattern: /\*?Location\*?[:]\s*([^\n]+)/i,      fieldName: '🌍 Location',           isBirthday: false },
+    { name: 'Time',         pattern: /\*?Time\*?[:]\s*([^\n]+)/i,          fieldName: '⌚ Time',               isBirthday: false },
+    { name: 'Weather',      pattern: /\*?Weather\*?[:]\s*([^\n]+)/i,       fieldName: '🌥 Weather',            isBirthday: false },
+    { name: 'Mood',         pattern: /\*?Mood\*?[:]\s*([^\n]+)/i,          fieldName: '❤️‍🔥 Mood',            isBirthday: false },
+    { name: 'DOB',          pattern: /\*?D\.?O\.?B\.?\*?[:]\s*([^\n]+)/i, fieldName: '🗓 D.O.B',             isBirthday: true  },
+    { name: 'Relationship', pattern: /\*?Relationship\*?[:]\s*([^\n]+)/i,  fieldName: '👩‍❤️‍👨 Relationship', isBirthday: false }
   ];
 
   requiredFields.forEach(field => {
@@ -422,12 +439,13 @@ function getCurrentDate(): string { return getNigeriaTime().format('DD-MM-YYYY')
 
 async function handleAutoAttendance(message: any, sock: any): Promise<boolean> {
   try {
-    const messageText: string =
+    const messageText: string = normalizeStyledText(
       message.message?.conversation ||
       message.message?.extendedTextMessage?.text ||
       message.message?.imageMessage?.caption ||
       message.message?.videoMessage?.caption ||
-      message.body || '';
+      message.body || ''
+    );
 
     const senderId: string = message.key.participant || message.key.remoteJid;
     const chatId: string   = message.key.remoteJid;

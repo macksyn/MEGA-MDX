@@ -2,9 +2,13 @@
 /***
  * plugins/forex.ts
  *
- * Forex – WhatsApp Command Handler (Phase 1: instant rounds).
- * Commands: .forex <pair> <bet> <call|put>
- *           .forex menu   — guided, type-a-number menu (no syntax to memorize)
+ * Forex – WhatsApp Command Handler.
+ * Phase 1 (instant rounds): .forex <pair> <bet> <call|put>
+ * Phase 2 (leveraged positions): .forex open <pair> <margin> <leverage> <call|put>
+ *           .forex positions | .forex pos
+ *           .forex close <id>
+ *           .forex sl <id> <price>  |  .forex tp <id> <price>
+ * Shared:   .forex menu   — guided, type-a-number menu (no syntax to memorize)
  *           .forex prices | .forex market
  *           .forex profile | .forex stats
  *           .forex help | .forex guide
@@ -29,12 +33,54 @@ import {
 import { getMarketSnapshot, getPairQuote, PAIRS } from '../lib/forexMarket.js';
 import { validateForexRound, recordForexOutcome } from '../lib/forexAntiExploit.js';
 import { promptMenu } from '../lib/menuSession.js';
+import {
+  openPosition,
+  getOpenPositions,
+  closePositionManually,
+  setStopLoss,
+  setTakeProfit,
+  getFloatingPnL,
+  checkAllPositions,
+  ALLOWED_LEVERAGE,
+  ALLOWED_MARGINS,
+  ForexPosition,
+  CloseResult,
+} from '../lib/forexPositions.js';
 import { cleanJid } from '../lib/isOwner.js';
 
 export const command = 'forex';
 export const aliases = ['fx', 'forextrade'];
 export const category = 'economy-games';
 export const cooldown = 3000;
+
+// ── Phase 2 position watcher ─────────────────────────────────────────
+// Runs every minute via the same schedules mechanism as your scheduler
+// plugin's checkLiveNotifications (also a per-minute, time-sensitive
+// check). checkAllPositions() is pure — it does the liquidation/SL/TP/
+// funding work and just returns what auto-closed; formatting and sending
+// the notification happens here, in the plugin, same separation as the
+// rest of forex.
+export const schedules = [
+  {
+    every: 60_000,
+    handler: async (sock: any) => {
+      let closedEvents: CloseResult[] = [];
+      try {
+        closedEvents = await checkAllPositions();
+      } catch (e: any) {
+        console.error('[forex] position check error:', e.message);
+        return;
+      }
+      for (const evt of closedEvents) {
+        try {
+          await sendAutoCloseNotification(sock, evt);
+        } catch (e: any) {
+          console.error('[forex] auto-close notification failed:', e.message);
+        }
+      }
+    },
+  },
+];
 
 const ALLOWED_BETS = [5, 20, 50, 100];
 
@@ -406,6 +452,205 @@ async function runMenuFlow(sock: any, message: any, context: any) {
   await executeTrade(sock, message, context, pairChoice.value, parseInt(betChoice.value, 10), dirChoice.value as Direction);
 }
 
+// ── Position display helpers ────────────────────────────────────────────
+
+function positionSummaryLine(p: ForexPosition, floatingPnl: number): string {
+  const cfg = PAIRS[p.pair];
+  const dirLabel = p.direction === 'call' ? 'CALL 📈' : 'PUT 📉';
+  const pnlStr = floatingPnl >= 0 ? `+${formatNumber(Math.round(floatingPnl))}` : `-${formatNumber(Math.round(Math.abs(floatingPnl)))}`;
+  const pnlEmoji = floatingPnl >= 0 ? '▲' : '▼';
+  return (
+    ` 🆔 \`${p.id}\`  ${cfg.display} ${dirLabel}  ${p.leverage}x\n` +
+    `    Margin: ${formatNumber(p.margin)} GC   ${pnlEmoji} ${pnlStr} GC\n`
+  );
+}
+
+async function sendAutoCloseNotification(sock: any, evt: CloseResult) {
+  const { position, pnl, payout, closePrice, reason } = evt;
+  const cfg = PAIRS[position.pair];
+  const dirLabel = position.direction === 'call' ? 'CALL 📈' : 'PUT 📉';
+  const reasonLabel =
+    reason === 'liquidation' ? '💥 *LIQUIDATED*' :
+    reason === 'stop_loss' ? '🛑 *STOP-LOSS HIT*' :
+    '🎯 *TAKE-PROFIT HIT*';
+
+  const text =
+    `${header()}\n` +
+    `${reasonLabel}\n${DIVIDER}\n` +
+    `${cfg.display}  ${dirLabel}  ${position.leverage}x\n` +
+    `Entry: ${fmtPrice(position.entryPrice, cfg.decimals)}   Exit: ${fmtPrice(closePrice, cfg.decimals)}\n` +
+    `${DIVIDER}\n` +
+    `${deltaLine(pnl)}\n` +
+    `💰 Returned: *${formatNumber(payout)}* Groq Coins`;
+
+  await sock.sendMessage(position.chatId, { text });
+}
+
+// ── Position command handlers ───────────────────────────────────────────
+
+async function handleOpen(sock: any, message: any, context: any, args: string[]) {
+  const { chatId, senderId, channelInfo } = context;
+  const userId = cleanJid(senderId);
+
+  // args after 'open': <pair> <margin> <leverage> <call|put>, any order —
+  // same flexible-order philosophy as the instant-round parser.
+  let pair: string | undefined, margin: number | undefined, leverage: number | undefined, direction: Direction | undefined;
+  for (const raw of args) {
+    const token = raw.toLowerCase();
+    if (!pair && PAIR_ALIASES[token]) { pair = PAIR_ALIASES[token]; continue; }
+    if (!direction && CALL_ALIASES.has(token)) { direction = 'call'; continue; }
+    if (!direction && PUT_ALIASES.has(token)) { direction = 'put'; continue; }
+    const n = parseInt(raw, 10);
+    if (!isNaN(n)) {
+      if (margin === undefined) { margin = n; continue; }
+      if (leverage === undefined) { leverage = n; continue; }
+    }
+  }
+
+  if (!pair || !margin || !leverage || !direction || !ALLOWED_MARGINS.includes(margin) || !ALLOWED_LEVERAGE.includes(leverage)) {
+    return sock.sendMessage(chatId, {
+      text:
+        `${header()}\n` +
+        `📈 *OPEN A POSITION*\n\n` +
+        `\`.forex open <pair> <margin> <leverage> <call|put>\`\n\n` +
+        `  Pairs      EUR/USD · GBP/USD · USD/JPY · AUD/USD\n` +
+        `  Margin     ${ALLOWED_MARGINS.map(m => `*${m}*`).join(' · ')} _(Groq Coins)_\n` +
+        `  Leverage   ${ALLOWED_LEVERAGE.map(l => `*${l}x*`).join(' · ')}\n` +
+        `  Direction  call/buy/up/long · put/sell/down/short\n\n` +
+        `_e.g. .forex open eurusd 20 10 call_\n\n` +
+        `⚠️ Higher leverage = faster liquidation risk. Positions\n` +
+        `auto-close if losses reach 90% of margin, and accrue a\n` +
+        `small hourly funding fee while open.`,
+        ...channelInfo,
+    }, { quoted: message });
+  }
+
+  const { allowed, reason } = await validateForexRound(userId, margin, pair, direction);
+  if (!allowed) {
+    return sock.sendMessage(chatId, { text: `${header()}\n❌ ${reason || 'Order blocked.'}`, ...channelInfo }, { quoted: message });
+  }
+
+  const deducted = await deductGroqCoins(userId, margin, { type: 'forex_position' });
+  if (!deducted.success) {
+    return sock.sendMessage(chatId, {
+      text: `${header()}\n❌ You don't have enough Groq Coins for that margin.\n_Ask a member to run \`.exchange <coins> @you\`._`,
+      ...channelInfo,
+    }, { quoted: message });
+  }
+
+  const result = await openPosition(userId, chatId, pair, direction, margin, leverage);
+  if (!result.success || !result.position) {
+    await addGroqCoins(userId, margin, { type: 'forex_position_refund' }); // refund on unexpected failure
+    return sock.sendMessage(chatId, { text: `${header()}\n❌ Couldn't open that position — try again.`, ...channelInfo }, { quoted: message });
+  }
+
+  const p = result.position;
+  const cfg = PAIRS[pair];
+  const dirLabel = direction === 'call' ? 'CALL 📈' : 'PUT 📉';
+  const liqWarning = p.leverage >= 15 ? '\n⚠️ _High leverage — watch this one closely._' : '';
+
+  return sock.sendMessage(chatId, {
+    text:
+      `${header()}\n` +
+      `✅ *Position Opened*\n${DIVIDER}\n` +
+      `🆔 \`${p.id}\`\n` +
+      `${cfg.display}  ${dirLabel}  ${p.leverage}x\n` +
+      `Entry: ${fmtPrice(p.entryPrice, cfg.decimals)}\n` +
+      `Margin: ${formatNumber(p.margin)} GC   Size: ${formatNumber(p.size)} GC\n` +
+      `${liqWarning}\n\n` +
+      `_Manage it: \`.forex positions\` · \`.forex close ${p.id}\`_\n` +
+      `_Set exits: \`.forex sl ${p.id} <price>\` · \`.forex tp ${p.id} <price>\`_`,
+    ...channelInfo,
+  }, { quoted: message });
+}
+
+async function handlePositions(sock: any, message: any, context: any) {
+  const { chatId, senderId, channelInfo } = context;
+  const userId = cleanJid(senderId);
+
+  const positions = await getOpenPositions(userId);
+  if (positions.length === 0) {
+    return sock.sendMessage(chatId, {
+      text: `${header()}\n_No open positions._\n\n\`.forex open <pair> <margin> <leverage> <call|put>\` to start one.`,
+      ...channelInfo,
+    }, { quoted: message });
+  }
+
+  let text = `${header()}\n📊 *OPEN POSITIONS* (${positions.length})\n${DIVIDER}\n`;
+  for (const p of positions) {
+    const floatingPnl = await getFloatingPnL(p);
+    text += positionSummaryLine(p, floatingPnl);
+    if (p.stopLoss || p.takeProfit) {
+      const cfg = PAIRS[p.pair];
+      const parts = [];
+      if (p.stopLoss) parts.push(`SL ${fmtPrice(p.stopLoss, cfg.decimals)}`);
+      if (p.takeProfit) parts.push(`TP ${fmtPrice(p.takeProfit, cfg.decimals)}`);
+      text += `    _${parts.join(' · ')}_\n`;
+    }
+    text += '\n';
+  }
+  text += `${DIVIDER}\n_\`.forex close <id>\` to exit a position._`;
+
+  return sock.sendMessage(chatId, { text, ...channelInfo }, { quoted: message });
+}
+
+async function handleClose(sock: any, message: any, context: any, args: string[]) {
+  const { chatId, senderId, channelInfo } = context;
+  const userId = cleanJid(senderId);
+  const id = args[0];
+
+  if (!id) {
+    return sock.sendMessage(chatId, { text: `${header()}\n⚠️ Usage: \`.forex close <id>\` — see \`.forex positions\` for ids.`, ...channelInfo }, { quoted: message });
+  }
+
+  const { success, result, reason } = await closePositionManually(id, userId);
+  if (!success || !result) {
+    const msg = reason === 'not_owner' ? "❌ That's not your position." : '❌ Position not found — check `.forex positions`.';
+    return sock.sendMessage(chatId, { text: `${header()}\n${msg}`, ...channelInfo }, { quoted: message });
+  }
+
+  const { position, pnl, payout } = result;
+  const cfg = PAIRS[position.pair];
+  const dirLabel = position.direction === 'call' ? 'CALL 📈' : 'PUT 📉';
+
+  return sock.sendMessage(chatId, {
+    text:
+      `${header()}\n` +
+      `✅ *Position Closed*\n${DIVIDER}\n` +
+      `${cfg.display}  ${dirLabel}  ${position.leverage}x\n` +
+      `Entry: ${fmtPrice(position.entryPrice, cfg.decimals)}   Exit: ${fmtPrice(result.closePrice, cfg.decimals)}\n` +
+      `${DIVIDER}\n` +
+      `${deltaLine(pnl)}\n` +
+      `💰 Returned: *${formatNumber(payout)}* Groq Coins`,
+    ...channelInfo,
+  }, { quoted: message });
+}
+
+async function handleSetExit(sock: any, message: any, context: any, args: string[], kind: 'sl' | 'tp') {
+  const { chatId, senderId, channelInfo } = context;
+  const userId = cleanJid(senderId);
+  const id = args[0];
+  const price = parseFloat(args[1]);
+
+  if (!id || isNaN(price)) {
+    const label = kind === 'sl' ? 'stop-loss' : 'take-profit';
+    return sock.sendMessage(chatId, { text: `${header()}\n⚠️ Usage: \`.forex ${kind} <id> <price>\` — sets a ${label}.`, ...channelInfo }, { quoted: message });
+  }
+
+  const result = kind === 'sl' ? await setStopLoss(id, userId, price) : await setTakeProfit(id, userId, price);
+  if (!result.success) {
+    const reasonText =
+      result.reason === 'not_found' ? "Position not found — check `.forex positions`." :
+      result.reason === 'not_owner' ? "That's not your position." :
+      result.reason === 'wrong_side' ? `That price is on the wrong side of your entry for a ${kind === 'sl' ? 'stop-loss' : 'take-profit'}.` :
+      'Could not set that.';
+    return sock.sendMessage(chatId, { text: `${header()}\n❌ ${reasonText}`, ...channelInfo }, { quoted: message });
+  }
+
+  const label = kind === 'sl' ? 'Stop-loss' : 'Take-profit';
+  return sock.sendMessage(chatId, { text: `${header()}\n✅ ${label} set at *${price}* for \`${id}\`.`, ...channelInfo }, { quoted: message });
+}
+
 // ── Handler ───────────────────────────────────────────────────────────
 
 async function _handler(sock: any, message: any, args: string[], context: any) {
@@ -415,6 +660,20 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   // ── Menu (type-a-number alternative to memorizing syntax) ────────
   if (args[0] === 'menu') {
     return runMenuFlow(sock, message, context);
+  }
+
+  // ── Phase 2: leveraged positions ──────────────────────────────
+  if (args[0] === 'open') {
+    return handleOpen(sock, message, context, args.slice(1));
+  }
+  if (args[0] === 'positions' || args[0] === 'pos') {
+    return handlePositions(sock, message, context);
+  }
+  if (args[0] === 'close') {
+    return handleClose(sock, message, context, args.slice(1));
+  }
+  if (args[0] === 'sl' || args[0] === 'tp') {
+    return handleSetExit(sock, message, context, args.slice(1), args[0] as 'sl' | 'tp');
   }
 
   // ── Help / full guide ────────────────────────────────────────────

@@ -81,6 +81,54 @@ function fmtTimeLeft(e: WhitelistEntry): string {
     return `${Math.max(1, Math.round((e.expiresAt - Date.now()) / 60000))}m left`;
 }
 
+// 'delete' was the old name for what is now the 'warn' action, and 'strike'
+// the old name for 'warnremove'. Kept so existing saved settings from
+// before the renames still behave correctly instead of silently matching
+// nothing.
+function normalizeAction(action: string | null | undefined): string {
+    if (action === 'delete') return 'warn';
+    if (action === 'strike') return 'warnremove';
+    return action || 'warn';
+}
+
+// ── Warn & Remove (persistent warning count → auto-kick) ────────────────
+// Counts stay until an admin/sudo/owner clears them — no time-based decay.
+interface WarnRecord {
+    count: number;
+    lastAt: number;
+}
+
+const warnRecords = new Map<string, Map<string, WarnRecord>>(); // chatId -> userId -> record
+const WARN_LIMIT = 3;
+
+function getWarnRecord(chatId: string, userId: string): WarnRecord {
+    let chatMap = warnRecords.get(chatId);
+    if (!chatMap) {
+        chatMap = new Map();
+        warnRecords.set(chatId, chatMap);
+    }
+    let rec = chatMap.get(userId);
+    if (!rec) {
+        rec = { count: 0, lastAt: Date.now() };
+        chatMap.set(userId, rec);
+    }
+    return rec;
+}
+
+function getActiveWarnEntries(chatId: string): [string, WarnRecord][] {
+    const chatMap = warnRecords.get(chatId);
+    if (!chatMap) return [];
+    return [...chatMap.entries()].filter(([, r]) => r.count > 0);
+}
+
+function resetWarnings(chatId: string, userId: string) {
+    warnRecords.get(chatId)?.delete(userId);
+}
+
+function resetAllWarnings(chatId: string) {
+    warnRecords.delete(chatId);
+}
+
 async function setAntilink(chatId: string, action: string, allowedDomains?: string[]) {
     try {
         const existing = await getAntilink(chatId);
@@ -142,7 +190,7 @@ export async function handleLinkDetection(sock: any, chatId: string, message: an
             console.error('Error checking admin status in antilink (failing closed):', e);
         }
 
-        const action = config.action || 'delete';
+        const action = normalizeAction(config.action);
         let shouldAct = false;
         let linkType = '';
 
@@ -181,26 +229,26 @@ export async function handleLinkDetection(sock: any, chatId: string, message: an
         const messageId = message.key.id;
         const participant = message.key.participant || senderId;
 
-        if (action === 'delete' || action === 'kick') {
-            try {
-                await sock.sendMessage(chatId, {
-                    delete: {
-                        remoteJid: chatId,
-                        fromMe: false,
-                        id: messageId,
-                        participant: participant
-                    }
-                });
-            } catch(error: any) {
-                console.error('Failed to delete message:', error);
-            }
+        // All three actions (warn / kick / warn & remove) delete the offending message.
+        try {
+            await sock.sendMessage(chatId, {
+                delete: {
+                    remoteJid: chatId,
+                    fromMe: false,
+                    id: messageId,
+                    participant: participant
+                }
+            });
+        } catch(error: any) {
+            console.error('Failed to delete message:', error);
         }
 
-        if (action === 'warn' || action === 'delete') {
+        if (action === 'warn') {
             await sock.sendMessage(chatId, {
                 text: `⚠️ *Warning!!!*\n\n@${senderId.split('@')[0]}, posting ${linkType} links is not allowed here!`,
                 mentions: [senderId]
             });
+            return;
         }
 
         if (action === 'kick') {
@@ -216,6 +264,35 @@ export async function handleLinkDetection(sock: any, chatId: string, message: an
                     text: `⚠️ Failed to remove user. Make sure the bot is an admin.`
                 });
             }
+            return;
+        }
+
+        if (action === 'warnremove') {
+            const rec = getWarnRecord(chatId, senderId);
+            rec.count += 1;
+            rec.lastAt = Date.now();
+
+            if (rec.count >= WARN_LIMIT) {
+                resetWarnings(chatId, senderId);
+                try {
+                    await sock.groupParticipantsUpdate(chatId, [senderId], 'remove');
+                    await sock.sendMessage(chatId, {
+                        text: `🚫 @${senderId.split('@')[0]} has been removed after ${WARN_LIMIT} warnings for posting ${linkType} links.`,
+                        mentions: [senderId]
+                    });
+                } catch(error: any) {
+                    console.error('Failed to kick user after warnings:', error);
+                    await sock.sendMessage(chatId, {
+                        text: `⚠️ Warning limit reached but failed to remove user. Make sure the bot is an admin.`
+                    });
+                }
+            } else {
+                const remaining = WARN_LIMIT - rec.count;
+                const text = remaining === 1
+                    ? `🚨 *LAST WARNING!*\n\n@${senderId.split('@')[0]}, posting ${linkType} links is not allowed here!\n_One more and you'll be removed._`
+                    : `⚠️ *Warning ${rec.count}/${WARN_LIMIT}*\n\n@${senderId.split('@')[0]}, posting ${linkType} links is not allowed here!\n_${remaining} more and you'll be removed._`;
+                await sock.sendMessage(chatId, { text, mentions: [senderId] });
+            }
         }
 
     } catch(error: any) {
@@ -230,25 +307,32 @@ export async function handleLinkDetection(sock: any, chatId: string, message: an
 // text-input step the menu system isn't built for.
 
 const ACTION_DESCRIPTIONS: Record<string, string> = {
-    delete: 'Delete the message + warn the sender',
-    kick:   'Delete the message + remove the sender',
-    warn:   'Warn the sender, message stays',
+    warn:       'Delete the message + warn the sender',
+    kick:       'Delete the message + remove the sender',
+    warnremove: `Delete + warn, remove after ${WARN_LIMIT} warnings (persists until reset)`,
+};
+
+const ACTION_LABELS: Record<string, string> = {
+    warn: 'Warn',
+    kick: 'Kick',
+    warnremove: 'Warn & Remove',
 };
 
 async function runMainMenu(sock: any, message: any, chatId: string, userId: string) {
     const config = await getAntilink(chatId);
     const enabled = !!config?.enabled;
-    const action = config?.action || 'delete';
+    const action = normalizeAction(config?.action);
 
     const result = await promptMenu(sock, message, chatId, userId, {
         title: '🔗 ANTILINK',
-        subtitle: `Status: ${enabled ? '✅ Enabled' : '❌ Disabled'}  ·  Action: ${action}`,
+        subtitle: `Status: ${enabled ? '✅ Enabled' : '❌ Disabled'}  ·  Action: ${ACTION_LABELS[action] || action}`,
         text: 'What would you like to do?',
         options: [
             { label: enabled ? 'Turn OFF' : 'Turn ON', value: 'toggle' },
-            { label: 'Change action', value: 'action', description: 'delete · kick · warn' },
+            { label: 'Change action', value: 'action', description: 'warn · kick · warn & remove' },
             { label: 'Allowed domains', value: 'domains', description: 'Links that are never blocked' },
             { label: 'Temporary whitelist', value: 'whitelist', description: 'Time-limited exemptions' },
+            { label: 'Warnings', value: 'warnings', description: 'View / reset link warnings' },
             { label: 'Full status', value: 'status' },
         ],
     });
@@ -261,14 +345,15 @@ async function runMainMenu(sock: any, message: any, chatId: string, userId: stri
                 await removeAntilink(chatId);
                 await sock.sendMessage(chatId, { text: '❌ *Antilink disabled*\n\nUsers can now send links freely.' });
             } else {
-                await setAntilink(chatId, 'delete');
-                await sock.sendMessage(chatId, { text: '✅ *Antilink enabled*\n\nDefault action: Delete messages\n\n*Exempt:* Admins, Owner, Sudo users' });
+                await setAntilink(chatId, 'warn');
+                await sock.sendMessage(chatId, { text: '✅ *Antilink enabled*\n\nDefault action: Warn (delete + warn)\n\n*Exempt:* Admins, Owner, Sudo users' });
             }
             return;
         }
         case 'action': return runActionMenu(sock, message, chatId, userId);
         case 'domains': return runDomainsMenu(sock, message, chatId, userId);
         case 'whitelist': return runWhitelistMenu(sock, message, chatId, userId);
+        case 'warnings': return runWarningsMenu(sock, message, chatId, userId);
         case 'status': return sendStatus(sock, message, chatId);
     }
 }
@@ -277,8 +362,8 @@ async function runActionMenu(sock: any, message: any, chatId: string, userId: st
     const result = await promptMenu(sock, message, chatId, userId, {
         title: '🔗 ANTILINK · Action',
         text: 'Choose what happens when a link is caught:',
-        options: (['delete', 'kick', 'warn'] as const).map(a => ({
-            label: a[0].toUpperCase() + a.slice(1),
+        options: (['warn', 'kick', 'warnremove'] as const).map(a => ({
+            label: ACTION_LABELS[a],
             value: a,
             description: ACTION_DESCRIPTIONS[a],
         })),
@@ -289,7 +374,7 @@ async function runActionMenu(sock: any, message: any, chatId: string, userId: st
     const ok = await setAntilink(chatId, result.value);
     await sock.sendMessage(chatId, {
         text: ok
-            ? `✅ *Antilink action set to: ${result.value}*\n\n${ACTION_DESCRIPTIONS[result.value]}\n\n*Exempt:* Admins, Owner, Sudo users`
+            ? `✅ *Antilink action set to: ${ACTION_LABELS[result.value]}*\n\n${ACTION_DESCRIPTIONS[result.value]}\n\n*Exempt:* Admins, Owner, Sudo users`
             : '❌ *Failed to set antilink action*'
     });
 }
@@ -338,7 +423,7 @@ async function runDomainsMenu(sock: any, message: any, chatId: string, userId: s
         if (pick.cancelled || pick.timedOut || !pick.value) return;
 
         const updated = domains.filter(d => d !== pick.value);
-        await setAntilink(chatId, config?.action || 'delete', updated);
+        await setAntilink(chatId, normalizeAction(config?.action), updated);
         await sock.sendMessage(chatId, { text: `✅ *${pick.value}* removed from allowed domains.` });
     }
 }
@@ -444,16 +529,91 @@ async function runWhitelistMenu(sock: any, message: any, chatId: string, userId:
     }
 }
 
+async function runWarningsMenu(sock: any, message: any, chatId: string, userId: string) {
+    const targetUser = extractTargetUser(message);
+    const activeEntries = getActiveWarnEntries(chatId);
+
+    const result = await promptMenu(sock, message, chatId, userId, {
+        title: '🔗 ANTILINK · Warnings',
+        subtitle: `${activeEntries.length} user(s) with active warnings`,
+        text: 'Warnings persist until manually reset:',
+        options: [
+            {
+                label: "Reset this user's warnings",
+                value: 'resetuser',
+                description: targetUser ? `@${targetUser.split('@')[0]} (tagged/replied)` : 'Tag or reply to someone first',
+            },
+            { label: 'View all warnings', value: 'view' },
+            { label: 'Reset a specific user', value: 'resetpick' },
+            { label: 'Reset ALL warnings', value: 'resetall', description: 'Clears every user in this group' },
+        ],
+    });
+
+    if (result.cancelled || result.timedOut) return;
+
+    if (result.value === 'resetuser') {
+        if (!targetUser) {
+            await sock.sendMessage(chatId, {
+                text: '❌ Tag the user or reply to their message, then run `.antilink` again and pick this option.'
+            });
+            return;
+        }
+        resetWarnings(chatId, targetUser);
+        await sock.sendMessage(chatId, {
+            text: `✅ Warnings reset for @${targetUser.split('@')[0]}.`,
+            mentions: [targetUser]
+        });
+        return;
+    }
+
+    if (result.value === 'view') {
+        const lines = activeEntries.length
+            ? activeEntries.map(([uid, r], i) => `${i + 1}. @${uid.split('@')[0]} — ${r.count}/${WARN_LIMIT}`).join('\n')
+            : '_No active warnings._';
+        await sock.sendMessage(chatId, {
+            text: `*🔗 ACTIVE WARNINGS*\n\n${lines}`,
+            mentions: activeEntries.map(([uid]) => uid)
+        });
+        return;
+    }
+
+    if (result.value === 'resetpick') {
+        if (!activeEntries.length) {
+            await sock.sendMessage(chatId, { text: '_No active warnings to reset._' });
+            return;
+        }
+        const pick = await promptMenu(sock, message, chatId, userId, {
+            title: '🔗 Reset whose warnings?',
+            text: 'Pick a user:',
+            options: activeEntries.map(([uid, r]) => ({ label: `@${uid.split('@')[0]} (${r.count}/${WARN_LIMIT})`, value: uid })),
+        });
+        if (pick.cancelled || pick.timedOut || !pick.value) return;
+
+        resetWarnings(chatId, pick.value);
+        await sock.sendMessage(chatId, {
+            text: `✅ Warnings reset for @${pick.value.split('@')[0]}.`,
+            mentions: [pick.value]
+        });
+        return;
+    }
+
+    if (result.value === 'resetall') {
+        resetAllWarnings(chatId);
+        await sock.sendMessage(chatId, { text: '✅ All warnings reset for this group.' });
+    }
+}
+
 async function sendStatus(sock: any, message: any, chatId: string) {
     const status = await getAntilink(chatId);
+    const action = status?.enabled ? normalizeAction(status.action) : null;
     await sock.sendMessage(chatId, {
         text: `*🔗 ANTILINK STATUS*\n\n` +
               `*Status:* ${status?.enabled ? '✅ Enabled' : '❌ Disabled'}\n` +
-              `*Action:* ${status?.action || 'Not set'}\n\n` +
+              `*Action:* ${action ? ACTION_LABELS[action] : 'Not set'}\n\n` +
               `*What happens when links are detected:*\n` +
-              `${status?.action === 'delete' ? '• Message is deleted\n• User gets warning' : ''}` +
-              `${status?.action === 'kick' ? '• Message is deleted\n• User is removed from group' : ''}` +
-              `${status?.action === 'warn' ? '• User gets warning\n• Message stays' : ''}\n\n` +
+              `${action === 'warn' ? '• Message is deleted\n• User gets warning' : ''}` +
+              `${action === 'kick' ? '• Message is deleted\n• User is removed from group' : ''}` +
+              `${action === 'warnremove' ? `• Message is deleted\n• User gets warned\n• Removed after ${WARN_LIMIT} warnings (persists until an admin resets it)` : ''}\n\n` +
               `*Exempt:* Admins, Owner, Sudo users`
     }, { quoted: message });
 }
@@ -463,7 +623,7 @@ export default {
     aliases: ['alink', 'linkblock'],
     category: 'admin',
     description: 'Prevent users from sending links in the group',
-    usage: '.antilink — opens the menu. Or: .antilink <on|off|set|whitelist|domain>',
+    usage: '.antilink — opens the menu. Or: .antilink <on|off|set|whitelist|domain|warnings>',
     groupOnly: true,
     adminOnly: true,
 
@@ -491,9 +651,9 @@ export default {
                     }, { quoted: message });
                     return;
                 }
-                const result = await setAntilink(chatId, 'delete');
+                const result = await setAntilink(chatId, 'warn');
                 await sock.sendMessage(chatId, {
-                    text: result ? '✅ *Antilink enabled successfully!*\n\nDefault action: Delete messages\n\n*Exempt:* Admins, Owner, Sudo users' : '❌ *Failed to enable antilink*'
+                    text: result ? '✅ *Antilink enabled successfully!*\n\nDefault action: Warn (delete + warn)\n\n*Exempt:* Admins, Owner, Sudo users' : '❌ *Failed to enable antilink*'
                 }, { quoted: message });
                 break;
             }
@@ -509,14 +669,14 @@ export default {
             case 'set': {
                 if (args.length < 2) {
                     await sock.sendMessage(chatId, {
-                        text: '❌ *Please specify an action*\n\nUsage: `.antilink set delete | kick | warn`'
+                        text: '❌ *Please specify an action*\n\nUsage: `.antilink set warn | kick | warnremove`'
                     }, { quoted: message });
                     return;
                 }
                 const setAction = args[1].toLowerCase();
-                if (!['delete', 'kick', 'warn'].includes(setAction)) {
+                if (!['warn', 'kick', 'warnremove'].includes(setAction)) {
                     await sock.sendMessage(chatId, {
-                        text: '❌ *Invalid action*\n\nChoose: delete, kick, or warn'
+                        text: '❌ *Invalid action*\n\nChoose: warn, kick, or warnremove'
                     }, { quoted: message });
                     return;
                 }
@@ -524,7 +684,7 @@ export default {
 
                 await sock.sendMessage(chatId, {
                     text: setResult
-                        ? `✅ *Antilink action set to: ${setAction}*\n\n${ACTION_DESCRIPTIONS[setAction]}\n\n*Exempt:* Admins, Owner, Sudo users`
+                        ? `✅ *Antilink action set to: ${ACTION_LABELS[setAction]}*\n\n${ACTION_DESCRIPTIONS[setAction]}\n\n*Exempt:* Admins, Owner, Sudo users`
                         : '❌ *Failed to set antilink action*'
                 }, { quoted: message });
                 break;
@@ -620,6 +780,53 @@ export default {
                 break;
             }
 
+            case 'warnings': {
+                const sub = args[1]?.toLowerCase();
+
+                if (!sub) {
+                    await runWarningsMenu(sock, message, chatId, senderJid);
+                    return;
+                }
+
+                if (sub === 'reset') {
+                    if (args[2]?.toLowerCase() === 'all') {
+                        resetAllWarnings(chatId);
+                        await sock.sendMessage(chatId, { text: '✅ All warnings reset for this group.' }, { quoted: message });
+                        return;
+                    }
+                    const target = extractTargetUser(message);
+                    if (!target) {
+                        await sock.sendMessage(chatId, {
+                            text: '❌ Tag the user or reply to their message.\n\nUsage: `.antilink warnings reset` (with mention/reply) or `.antilink warnings reset all`'
+                        }, { quoted: message });
+                        return;
+                    }
+                    resetWarnings(chatId, target);
+                    await sock.sendMessage(chatId, {
+                        text: `✅ Warnings reset for @${target.split('@')[0]}.`,
+                        mentions: [target]
+                    }, { quoted: message });
+                    return;
+                }
+
+                if (sub === 'list' || sub === 'view') {
+                    const activeEntries = getActiveWarnEntries(chatId);
+                    const lines = activeEntries.length
+                        ? activeEntries.map(([uid, r], i) => `${i + 1}. @${uid.split('@')[0]} — ${r.count}/${WARN_LIMIT}`).join('\n')
+                        : '_No active warnings._';
+                    await sock.sendMessage(chatId, {
+                        text: `*🔗 ACTIVE WARNINGS*\n\n${lines}`,
+                        mentions: activeEntries.map(([uid]) => uid)
+                    }, { quoted: message });
+                    return;
+                }
+
+                await sock.sendMessage(chatId, {
+                    text: '❌ Usage: `.antilink warnings reset [all]` or `.antilink warnings list`'
+                }, { quoted: message });
+                break;
+            }
+
             case 'domain': {
                 const sub = args[1]?.toLowerCase();
 
@@ -638,7 +845,7 @@ export default {
                         return;
                     }
                     if (!domains.includes(domain)) domains.push(domain);
-                    await setAntilink(chatId, config?.action || 'delete', domains);
+                    await setAntilink(chatId, normalizeAction(config?.action), domains);
                     await sock.sendMessage(chatId, { text: `✅ *${domain}* added to permanently allowed domains.` }, { quoted: message });
                     return;
                 }
@@ -650,7 +857,7 @@ export default {
                         return;
                     }
                     const updated = domains.filter(d => d !== domain);
-                    await setAntilink(chatId, config?.action || 'delete', updated);
+                    await setAntilink(chatId, normalizeAction(config?.action), updated);
                     await sock.sendMessage(chatId, { text: `✅ *${domain}* removed from allowed domains.` }, { quoted: message });
                     return;
                 }
