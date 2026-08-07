@@ -1,35 +1,6 @@
 // @ts-nocheck
 /***
- * plugins/globalTrader.ts
- *
- * Global Trader – WhatsApp Trading Game, Menu Layer.
- *
- * Mirrors two existing patterns rather than inventing a third:
- *   - Visual language (header/divider/progressBar/deltaLine) from
- *     plugins/oceanSlots.ts.
- *   - Numbered menu navigation from lib/menuSession.ts's promptMenu(),
- *     same primitive antilink.ts uses.
- *
- * Every decision in this file — including quantity — is a numbered pick.
- * No freeform text input anywhere, since quantities are fixed presets
- * (5/10/20/50/70/100) rather than typed amounts.
- *
- * ── "0 = Back" navigation ────────────────────────────────────────────
- * menuSession.ts already lets a menu customize what "0" means via
- * `cancelLabel` (it renders "0️⃣ {cancelLabel}", still resolves
- * result.cancelled = true either way) — no changes needed to the shared
- * library. Every submenu here passes cancelLabel: 'Back' and, on
- * result.cancelled, returns the sentinel string 'back' to its caller.
- * The caller, on receiving 'back' from a child it invoked, simply
- * re-invokes itself (recursion = redisplay), which walks the player up
- * exactly one menu level per "0" press. Only the root main menu uses
- * cancelLabel: 'Exit', since there's no level above it to return to.
- *
- * NOTE: this file is UI/navigation only. It assumes a lib/globalTraderEconomy.js
- * module (shipments, market board, licenses, stock) shaped like
- * lib/economy.ts / lib/oceanSlotMachine.ts — referenced here by the calls
- * it would need to expose, so the menu tree can be reviewed before that
- * module is built.
+ * plugins/globalTrader.ts – UI with in‑transit event handling.
  */
 
 import { promptMenu } from '../lib/menuSession.js';
@@ -38,7 +9,8 @@ import { cleanJid } from '../lib/isOwner.js';
 import {
   COUNTRIES,
   FREIGHT_TIERS,
-  GOODS,                    // new goods registry
+  GOODS,
+  HUBS,
   getPlayerRank,
   getStockLevel,
   getActiveShipments,
@@ -48,6 +20,11 @@ import {
   sellGoods,
   getLicenseStatus,
   renewLicense,
+  getMarketPrice,
+  getPendingEvents,
+  resolveEvent,
+  EVENT_CONFIG,
+  EVENT_TYPES,
 } from '../lib/globalTraderEconomy.js';
 
 export const command = 'global';
@@ -55,7 +32,8 @@ export const aliases = ['trader', 'gt', 'trade', 'port', 'portking', 'pk'];
 export const category = 'economy-games';
 export const cooldown = 3000;
 
-// ── Visual language (matches oceanSlots.ts) ─────────────────────────────
+// ── Visual language ─────────────────────────────────────────────────
+
 const DIVIDER = '┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈';
 
 function header(subtitle?: string): string {
@@ -119,7 +97,7 @@ async function runMainMenu(sock: any, message: any, chatId: string, userId: stri
   if (outcome === 'back') return runMainMenu(sock, message, chatId, userId);
 }
 
-// ── Source Goods: country -> freight -> quantity -> confirm ────────────
+// ── Source Goods ─────────────────────────────────────────────────────
 
 async function runSourceMenu(sock: any, message: any, chatId: string, userId: string) {
   const rank = await getPlayerRank(userId);
@@ -131,7 +109,7 @@ async function runSourceMenu(sock: any, message: any, chatId: string, userId: st
     return {
       label: `${c.emoji} ${c.label}`,
       value: c.key,
-      description: `${good.label} · ${good.baseCost} · ${stock.remaining}/${stock.cap} left today`,
+      description: `${good.label} (${formatNumber(good.baseCost)} coins/unit) · ${stock.remaining}/${stock.cap} left today`,
     };
   }));
 
@@ -224,12 +202,12 @@ async function runQuantityMenu(sock: any, message: any, chatId: string, userId: 
       `ETA: ${s.etaLabel}\n\n` +
       `_Track it anytime from the main menu → My Shipments_`,
   });
-  // Terminal action — no auto-loop back, player picks their next step via .global
 }
 
-// ── My Shipments: live tracker card ─────────────────────────────────────
+// ── Shipments with Event Handling ──────────────────────────────────
 
 async function runShipmentsMenu(sock: any, message: any, chatId: string, userId: string) {
+  // First, get all active shipments and check for pending events
   const shipments = await getActiveShipments(userId);
 
   if (!shipments.length) {
@@ -239,6 +217,25 @@ async function runShipmentsMenu(sock: any, message: any, chatId: string, userId:
     return;
   }
 
+  // Find any shipment with pending events (in‑transit)
+  for (const s of shipments) {
+    if (s.status === 'in_transit') {
+      const pending = getPendingEvents(s);
+      if (pending.length > 0) {
+        // Handle the first event
+        const handled = await runEventMenu(sock, message, chatId, userId, s, pending[0]);
+        if (handled) {
+          // After handling, re‑enter this function to show the updated list
+          return runShipmentsMenu(sock, message, chatId, userId);
+        } else {
+          // Player cancelled or timed out – just go back to main menu
+          return 'back';
+        }
+      }
+    }
+  }
+
+  // No pending events – show the shipment list
   const cards = await Promise.all(shipments.map(async s => {
     const p = await getShipmentProgress(s);
     const emoji = STAGE_EMOJI[p.stage] || '📦';
@@ -276,7 +273,38 @@ async function runShipmentsMenu(sock: any, message: any, chatId: string, userId:
   return outcome;
 }
 
-// ── Customs Clearance: animated, license-gated, hidden bribe odds ───────
+// ── Event Menu ───────────────────────────────────────────────────────
+
+async function runEventMenu(sock: any, message: any, chatId: string, userId: string, shipment: any, eventType: string) {
+  const config = EVENT_CONFIG[eventType];
+  if (!config) return false;
+
+  const result = await promptMenu(sock, message, chatId, userId, {
+    title: `⚠️ Shipment #${shipment.id} Event`,
+    subtitle: `${shipment.goodLabel} (${shipment.countryLabel})`,
+    text: `${config.description}\n\nCost: ${formatNumber(config.cost)} coins`,
+    options: [
+      { label: 'Pay', value: 'pay', description: `Spend ${formatNumber(config.cost)} to resolve` },
+      { label: 'Decline', value: 'decline', description: 'Accept the consequences' },
+    ],
+    cancelLabel: 'Skip for now',
+  });
+
+  if (result.cancelled || result.timedOut) return false; // player wants to skip
+
+  const resolution = await resolveEvent(userId, shipment.id, eventType, result.value);
+  if (!resolution.success) {
+    await sock.sendMessage(chatId, { text: `${header()}\n❌ ${resolution.reason}` });
+    return false;
+  }
+
+  await sock.sendMessage(chatId, {
+    text: `${header()}\n${resolution.outcome}`,
+  });
+  return true; // event handled, continue
+}
+
+// ── Customs Clearance ──────────────────────────────────────────────
 
 async function runClearMenu(sock: any, message: any, chatId: string, userId: string, shipment: any) {
   const result = await promptMenu(sock, message, chatId, userId, {
@@ -317,19 +345,22 @@ async function runClearMenu(sock: any, message: any, chatId: string, userId: str
     return; // terminal
   }
 
+  const renewalMsg = clearResult.renewalSucceeded
+    ? `✅ License renewed (forced)`
+    : `⚠️ License renewal failed — you must renew manually.`;
   await sock.sendMessage(chatId, {
     text:
       `🚨 SEIZED\n${DIVIDER}\n` +
       `${header()}\n#${shipment.id} — ${shipment.goodLabel}\n${DIVIDER}\n` +
       `❌ License expired — goods confiscated.\n` +
-      `${deltaLine(-clearResult.fine)} (fine + forced renewal)\n` +
+      `${deltaLine(-clearResult.fine)} (fine)\n` +
+      `${renewalMsg}\n` +
       `⏳ Release in ${clearResult.holdHours}h after processing.`,
     edit: sent.key,
   });
-  // terminal
 }
 
-// ── Sell / Market ─────────────────────────────────────────────────────
+// ── Sell Menu ───────────────────────────────────────────────────────
 
 async function runSellMenu(sock: any, message: any, chatId: string, userId: string) {
   const sellable = (await getActiveShipments(userId)).filter(s => s.stage === 'cleared_unsold');
@@ -339,29 +370,44 @@ async function runSellMenu(sock: any, message: any, chatId: string, userId: stri
     return;
   }
 
+  const options = await Promise.all(sellable.map(async s => {
+    const price = await getMarketPrice(s.goodKey, 'lagos');
+    const gross = Math.round(price * s.qty * (s.quality || 1));
+    return {
+      label: `#${s.id} — ${s.goodLabel} (${s.qty})`,
+      value: s.id,
+      description: `Est. @Lagos: ${formatNumber(price)}/unit → ${formatNumber(gross)} gross`,
+    };
+  }));
+
   const result = await promptMenu(sock, message, chatId, userId, {
     title: '🏪 GLOBAL TRADER · Sell',
     text: 'Which shipment are you selling?',
-    options: sellable.map(s => ({ label: `#${s.id} — ${s.goodLabel} (${s.qty})`, value: s.id })),
+    options,
     cancelLabel: 'Back',
   });
   if (result.cancelled) return 'back';
   if (result.timedOut || !result.value) return;
 
   const shipment = sellable.find(s => s.id === result.value);
+  const good = GOODS[shipment.goodKey];
+
+  const hubOptions = await Promise.all(
+    HUBS.map(async hub => {
+      const price = await getMarketPrice(good.key, hub.key);
+      const gross = Math.round(price * shipment.qty * (shipment.quality || 1));
+      const desc = `${hub.courierRequired ? '🚚 courier fee incl.' : '🛳 port'} · ${formatNumber(price)}/unit → ${formatNumber(gross)} gross`;
+      return { label: hub.label, value: hub.key, description: desc };
+    })
+  );
+
   const hubResult = await promptMenu(sock, message, chatId, userId, {
     title: `🏪 Sell #${shipment.id}`,
     text: 'Where?',
-    options: [
-      { label: 'Lagos (Port)', value: 'lagos', description: 'No extra cost, no risk' },
-      { label: 'Onitsha', value: 'onitsha', description: 'Road courier required' },
-      { label: 'Aba', value: 'aba', description: 'Road courier required' },
-      { label: 'Kano', value: 'kano', description: 'Road courier required' },
-      { label: 'Port Harcourt', value: 'ph', description: 'Road courier required' },
-    ],
+    options: hubOptions,
     cancelLabel: 'Back',
   });
-  if (hubResult.cancelled) return runSellMenu(sock, message, chatId, userId); // back to shipment pick
+  if (hubResult.cancelled) return runSellMenu(sock, message, chatId, userId);
   if (hubResult.timedOut || !hubResult.value) return;
 
   const sale = await sellGoods(userId, shipment.id, hubResult.value, shipment.qty);
@@ -370,18 +416,22 @@ async function runSellMenu(sock: any, message: any, chatId: string, userId: stri
     return;
   }
 
+  let lossNote = '';
+  if (sale.qty < shipment.qty) {
+    lossNote = `\n_Note: ${shipment.qty - sale.qty} units lost to spoilage/courier – cost included in basis._`;
+  }
   await sock.sendMessage(chatId, {
     text:
       `${header()}\nSold: ${shipment.goodLabel} → ${sale.hubLabel}\n${DIVIDER}\n` +
       `${sale.qty} × ${formatNumber(sale.unitPrice)} = ${formatNumber(sale.gross)}\n` +
       `${deltaLine(sale.gross)}\n\n` +
       `Cost basis: ${formatNumber(sale.costBasis)}\n` +
-      `Profit: ${deltaLine(sale.profit)} (${sale.marginPct > 0 ? '+' : ''}${sale.marginPct}%)`,
+      `Profit: ${deltaLine(sale.profit)} (${sale.marginPct > 0 ? '+' : ''}${sale.marginPct}%)` +
+      lossNote,
   });
-  // terminal
 }
 
-// ── License & Rank ───────────────────────────────────────────────────
+// ── License Menu ────────────────────────────────────────────────────
 
 async function runLicenseMenu(sock: any, message: any, chatId: string, userId: string) {
   const rank = await getPlayerRank(userId);
@@ -400,7 +450,8 @@ async function runLicenseMenu(sock: any, message: any, chatId: string, userId: s
     subtitle: `Rank: ${rank.label}`,
     text: `${lines}\n\nWhat next?`,
     options: [
-      { label: 'Renew a license', value: 'renew' },
+      { label: 'Buy new license', value: 'buy', description: 'Purchase a license for an unlocked country' },
+      { label: 'Renew a license', value: 'renew', description: 'Extend an existing license' },
       { label: 'View rank progress', value: 'rank' },
     ],
     cancelLabel: 'Back',
@@ -413,7 +464,44 @@ async function runLicenseMenu(sock: any, message: any, chatId: string, userId: s
     await sock.sendMessage(chatId, {
       text: `${header()}\nRank: *${rank.label}*\nLifetime profit: ${formatNumber(rank.lifetimeProfit)}\nNext rank at: ${formatNumber(rank.nextThreshold)}`,
     });
-    return runLicenseMenu(sock, message, chatId, userId); // redisplay after viewing
+    return runLicenseMenu(sock, message, chatId, userId);
+  }
+
+  if (result.value === 'buy') {
+    const unlockedCountries = COUNTRIES.filter(c => rank.unlockedCountries.includes(c.key));
+    const validKeys = new Set(
+      licenses.filter(l => l.expiresAt > Date.now()).map(l => l.countryKey)
+    );
+    const buyable = unlockedCountries.filter(c => !validKeys.has(c.key));
+
+    if (!buyable.length) {
+      await sock.sendMessage(chatId, {
+        text: `${header()}\n✅ You already have valid licenses for all your unlocked countries.`,
+      });
+      return runLicenseMenu(sock, message, chatId, userId);
+    }
+
+    const pick = await promptMenu(sock, message, chatId, userId, {
+      title: '🪪 Buy new license',
+      text: 'Choose a country to buy a 7‑day license for:',
+      options: buyable.map(c => ({
+        label: `${c.emoji} ${c.label}`,
+        value: c.key,
+        description: `Cost: ${formatNumber(c.licenseRenewCost)} coins`,
+      })),
+      cancelLabel: 'Back',
+    });
+
+    if (pick.cancelled) return runLicenseMenu(sock, message, chatId, userId);
+    if (pick.timedOut || !pick.value) return;
+
+    const bought = await renewLicense(userId, pick.value, false);
+    await sock.sendMessage(chatId, {
+      text: bought.success
+        ? `${header()}\n✅ License for ${pick.value} bought! Expires in 7 days.\n${deltaLine(-bought.cost)}`
+        : `${header()}\n❌ ${bought.reason}`,
+    });
+    return runLicenseMenu(sock, message, chatId, userId);
   }
 
   if (result.value === 'renew') {
@@ -424,7 +512,11 @@ async function runLicenseMenu(sock: any, message: any, chatId: string, userId: s
     const pick = await promptMenu(sock, message, chatId, userId, {
       title: '🪪 Renew which license?',
       text: 'Pick a country:',
-      options: licenses.map(l => ({ label: l.countryLabel, value: l.countryKey, description: `Cost: ${formatNumber(l.renewCost)} coins` })),
+      options: licenses.map(l => ({
+        label: l.countryLabel,
+        value: l.countryKey,
+        description: `Cost: ${formatNumber(l.renewCost)} coins`,
+      })),
       cancelLabel: 'Back',
     });
     if (pick.cancelled) return runLicenseMenu(sock, message, chatId, userId);
@@ -436,7 +528,6 @@ async function runLicenseMenu(sock: any, message: any, chatId: string, userId: s
         ? `${header()}\n✅ Renewed for 7 days.\n${deltaLine(-renewed.cost)}`
         : `${header()}\n❌ ${renewed.reason}`,
     });
-    // terminal
   }
 }
 

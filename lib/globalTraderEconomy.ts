@@ -1,20 +1,6 @@
 // @ts-nocheck
 /***
- * lib/globalTraderEconomy.ts – Global Trader core trading engine.
- *
- * Mirrors the structure of lib/economy.ts (wallets/ledger) and lib/slotMachine.ts
- * (shared bank pool) rather than inventing new plumbing. Nothing here talks to
- * WhatsApp — plugins/globalTrader.ts calls these functions and handles messaging.
- *
- * Storage: same pluginStore pattern as economy.ts, under a 'globaltrader'
- * namespace, split into tables: shipments, licenses, stock, market, stats.
- *
- * Shared bank pool: this module deliberately reuses lib/slotMachine.ts's
- * jackpot pool (getJackpotPool / contributeToJackpot / deductFromJackpot /
- * settleWin) rather than keeping its own — every coin a trader spends on
- * goods, freight, duty, bribes, fines, or license renewal becomes real bank
- * capital the same instant a slot bet does, and every sale draws back out
- * of that same pool. Ocean Hunt and Global Trader are one shared economy.
+ * lib/globalTraderEconomy.ts – Global Trader core trading engine with in‑transit events.
  */
 
 import { createStore } from './pluginStore.js';
@@ -33,14 +19,14 @@ const statsTbl     = store.table('stats');
 export interface GoodDef {
   key: string;
   label: string;
-  baseCost: number;             // per unit at source
-  priceVolatility: number;      // 0–1, daily price swing amplitude
-  demandStability: number;      // 0–1, 1 = stable (depletion hurts less)
-  expirationHours: number;      // after clearance, must sell within this many hours
-  customsRiskMod: number;       // multiplier on bribe failure chance
-  theftRisk: number;            // 0–1, extra chance of loss during road courier
-  legalFlags: string[];         // e.g. 'bannedInKano'
-  profitMarginBonus: number;    // added to base markup (e.g. 0.2 = 20% extra)
+  baseCost: number;
+  priceVolatility: number;
+  demandStability: number;
+  expirationHours: number;
+  customsRiskMod: number;
+  theftRisk: number;
+  legalFlags: string[];
+  profitMarginBonus: number;
 }
 
 export const GOODS: Record<string, GoodDef> = {
@@ -188,6 +174,18 @@ export const GOODS: Record<string, GoodDef> = {
     legalFlags: [],
     profitMarginBonus: 0.50,
   },
+  rice: {
+    key: 'rice',
+    label: 'Rice',
+    baseCost: 300,
+    priceVolatility: 0.1,
+    demandStability: 0.9,
+    expirationHours: 240,
+    customsRiskMod: 0.8,
+    theftRisk: 0.1,
+    legalFlags: [],
+    profitMarginBonus: 0.1,
+  },
 };
 
 // ── Country Defs ──────────────────────────────────────────────────────
@@ -198,7 +196,7 @@ export interface CountryDef {
   key: string;
   label: string;
   emoji: string;
-  goodKey: string;                // reference to GOODS
+  goodKey: string;
   baseFreightFee: number;
   distanceHrs: number;
   risk: RiskTier;
@@ -208,7 +206,7 @@ export interface CountryDef {
 }
 
 export const COUNTRIES: CountryDef[] = [
-  { key: 'benin',   label: 'Benin',        emoji: '🇧🇯', goodKey: 'electronics',   baseFreightFee: 800,  distanceHrs: 6,  risk: 'high',   dutyRatePercent: 10, dailyStockCap: 200, licenseRenewCost: 1500 },
+  { key: 'benin',   label: 'Cotonou',     emoji: '🇧🇯', goodKey: 'rice',          baseFreightFee: 800,  distanceHrs: 6,  risk: 'high',   dutyRatePercent: 10, dailyStockCap: 200, licenseRenewCost: 1500 },
   { key: 'india',   label: 'India',        emoji: '🇮🇳', goodKey: 'pharmaceuticals', baseFreightFee: 3000, distanceHrs: 30, risk: 'medium', dutyRatePercent: 12, dailyStockCap: 180, licenseRenewCost: 2500 },
   { key: 'thailand', label: 'Thailand',   emoji: '🇹🇭', goodKey: 'rubber',        baseFreightFee: 3000, distanceHrs: 30, risk: 'medium', dutyRatePercent: 12, dailyStockCap: 180, licenseRenewCost: 2500 },
   { key: 'turkey',   label: 'Turkey',      emoji: '🇹🇷', goodKey: 'textiles',      baseFreightFee: 2500, distanceHrs: 24, risk: 'low',    dutyRatePercent: 12, dailyStockCap: 130, licenseRenewCost: 4500 },
@@ -267,7 +265,7 @@ const FORCED_RENEWAL_MULT = 1.6;
 const FINE_MULT = 1.5;
 const CLEARANCE_HOLD_HOURS = 24;
 const BRIBE_COST_PERCENT = 30;
-const MARKET_MARKUP = 1.6;      // base multiplier (bonus added per good)
+const MARKET_MARKUP = 1.6;
 
 // ── Hubs ──────────────────────────────────────────────────────────────
 
@@ -277,7 +275,7 @@ export interface HubDef {
   courierRequired: boolean;
   courierFeePerUnit: number;
   priceMultiplier: number;
-  bannedGoods?: string[];       // goods that cannot be sold here
+  bannedGoods?: string[];
 }
 
 export const HUBS: HubDef[] = [
@@ -390,7 +388,7 @@ export async function renewLicense(userId: string, countryKey: string, forced = 
   return { success: true, cost };
 }
 
-// ── Shipment ──────────────────────────────────────────────────────────
+// ── Shipment with Events ─────────────────────────────────────────────
 
 export interface Shipment {
   id: string;
@@ -414,7 +412,135 @@ export interface Shipment {
   hub: string | null;
   soldAt: number | null;
   clearedAt: number | null;
+  triggeredEvents: string[];   // list of event types already fired
 }
+
+// ── Event definitions ────────────────────────────────────────────────
+
+export const EVENT_TYPES = {
+  DELAY: 'delay',
+  PIRATES: 'pirates',
+  TEMPERATURE: 'temperature',
+} as const;
+
+type EventType = typeof EVENT_TYPES[keyof typeof EVENT_TYPES];
+
+interface EventDef {
+  type: EventType;
+  cost: number;
+  description: string;
+  successEffect: (shipment: Shipment) => void;   // if player pays
+  failEffect: (shipment: Shipment) => void;      // if player declines
+}
+
+const EVENT_CONFIG: Record<EventType, EventDef> = {
+  delay: {
+    type: 'delay',
+    cost: 3000,
+    description: '⚠️ Your cargo ship is delayed. Pay 3,000 to reroute?',
+    successEffect: (s) => { s.travelTimeMs = Math.round(s.travelTimeMs * 0.8); },
+    failEffect: (s) => { s.travelTimeMs = Math.round(s.travelTimeMs * 1.3); },
+  },
+  pirates: {
+    type: 'pirates',
+    cost: 5000,
+    description: '⚠️ Pirates detected. Hire escort for 5,000?',
+    successEffect: (s) => { /* no loss */ },
+    failEffect: (s) => { s.quality *= 0.6; },
+  },
+  temperature: {
+    type: 'temperature',
+    cost: 2000,
+    description: '⚠️ Cargo temperature rising. Buy cooling for 2,000?',
+    successEffect: (s) => { /* no spoilage */ },
+    failEffect: (s) => { s.quality *= 0.75; },
+  },
+};
+
+// ── Event checking ───────────────────────────────────────────────────
+
+function getProgress(shipment: Shipment): number {
+  if (shipment.status !== 'in_transit') return 1;
+  const elapsed = Date.now() - shipment.createdAt;
+  return Math.min(1, elapsed / shipment.travelTimeMs);
+}
+
+const EVENT_MILESTONES = [0.20, 0.50, 0.80];
+
+function pickRandomEvent(): EventType {
+  const types = Object.values(EVENT_TYPES);
+  return types[Math.floor(Math.random() * types.length)];
+}
+
+/** Returns pending events for a shipment (those that haven't been triggered yet). */
+export function getPendingEvents(shipment: Shipment): EventType[] {
+  if (shipment.status !== 'in_transit') return [];
+  const progress = getProgress(shipment);
+  const triggered = new Set(shipment.triggeredEvents || []);
+  const pending: EventType[] = [];
+
+  for (const milestone of EVENT_MILESTONES) {
+    if (progress >= milestone) {
+      // For each milestone, we may have an event; we only trigger if not already triggered.
+      // We'll assign a deterministic event based on shipment id + milestone to avoid randomness on every check.
+      // But for simplicity, we'll use a pseudo-random based on id and milestone.
+      const seed = shipment.id + milestone.toString();
+      let hash = 0;
+      for (let i = 0; i < seed.length; i++) {
+        hash = (hash << 5) - hash + seed.charCodeAt(i);
+        hash |= 0;
+      }
+      const eventIndex = Math.abs(hash) % 3;
+      const eventType = Object.values(EVENT_TYPES)[eventIndex];
+      if (!triggered.has(eventType)) {
+        pending.push(eventType);
+      }
+    }
+  }
+  return pending;
+}
+
+/** Resolve an event – deduct coins if success, apply effects, mark as triggered. */
+export async function resolveEvent(
+  userId: string,
+  shipmentId: string,
+  eventType: EventType,
+  choice: 'pay' | 'decline'
+): Promise<{ success: boolean; reason?: string; outcome?: string }> {
+  const all = await getAllShipments(userId);
+  const idx = all.findIndex(s => s.id === shipmentId);
+  if (idx === -1) return { success: false, reason: 'Shipment not found.' };
+
+  const shipment = all[idx];
+  const config = EVENT_CONFIG[eventType];
+  if (!config) return { success: false, reason: 'Unknown event.' };
+
+  // Check if already triggered (should not happen)
+  if (shipment.triggeredEvents.includes(eventType)) {
+    return { success: false, reason: 'Event already resolved.' };
+  }
+
+  let outcome: string;
+  if (choice === 'pay') {
+    const deducted = await deductCoins(userId, config.cost, { type: 'admin_debit', note: `event payment: ${eventType}` });
+    if (!deducted.success) {
+      return { success: false, reason: 'Not enough coins to pay.' };
+    }
+    await contributeToJackpot(config.cost);
+    config.successEffect(shipment);
+    outcome = `✅ Paid ${config.cost} – event resolved successfully.`;
+  } else {
+    config.failEffect(shipment);
+    outcome = `❌ Declined – you suffered the consequences.`;
+  }
+
+  shipment.triggeredEvents.push(eventType);
+  all[idx] = shipment;
+  await saveShipments(userId, all);
+  return { success: true, outcome };
+}
+
+// ── Shipment helpers ─────────────────────────────────────────────────
 
 async function getAllShipments(userId: string): Promise<Shipment[]> {
   return (await shipmentsTbl.get(userId)) || [];
@@ -530,6 +656,7 @@ export async function sourceShipment(userId: string, countryKey: string, freight
     hub: null,
     soldAt: null,
     clearedAt: null,
+    triggeredEvents: [],   // <-- new field
   };
 
   const all = await getAllShipments(userId);
@@ -592,7 +719,6 @@ export async function clearShipment(userId: string, shipmentId: string, opts: { 
   if (!paid.success) return { outcome: 'error', reason: 'Not enough coins for duty + bribe.' };
   await contributeToJackpot(totalUpfront);
 
-  // Apply customs risk modifier
   const baseChance = RISK_BRIBE_SUCCESS[country.risk];
   const adjustedChance = Math.min(1, Math.max(0.1, baseChance / good.customsRiskMod));
   const success = Math.random() < adjustedChance;
@@ -607,7 +733,6 @@ export async function clearShipment(userId: string, shipmentId: string, opts: { 
     return { outcome: 'cleared', dutyPaid: duty, bribePaid: bribeCost };
   }
 
-  // Bribe failed
   return seizeShipment(userId, all, idx, shipment);
 }
 
@@ -617,16 +742,18 @@ async function seizeShipment(userId: string, all: Shipment[], idx: number, shipm
   if (finePaid.success) await contributeToJackpot(fine);
 
   const renewal = await renewLicense(userId, shipment.countryKey, true);
+  const renewalSucceeded = renewal.success;
 
   shipment.status = 'seized';
   all[idx] = shipment;
-  await shipmentsTbl.set(userId, all);
+  await saveShipments(userId, all);
 
   return {
     outcome: 'seized',
     fine: finePaid.success ? fine : 0,
     forcedRenewalCost: renewal.success ? renewal.cost : 0,
     holdHours: CLEARANCE_HOLD_HOURS,
+    renewalSucceeded,
   };
 }
 
@@ -681,12 +808,10 @@ export async function sellGoods(userId: string, shipmentId: string, hubKey: stri
   const good = GOODS[shipment.goodKey];
   if (!good) return { success: false, reason: 'Good data missing.' };
 
-  // Check legal flags
   if (hub.bannedGoods && hub.bannedGoods.includes(good.key)) {
     return { success: false, reason: `This good cannot be sold in ${hub.label}.` };
   }
 
-  // Check expiration
   if (shipment.clearedAt) {
     const age = Date.now() - shipment.clearedAt;
     const expiryMs = good.expirationHours * 3600000;
