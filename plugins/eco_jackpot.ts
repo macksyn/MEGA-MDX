@@ -18,6 +18,7 @@ import {
   TARGET_RTP, HARD_CEILING_RTP, EMERGENCY_CEILING_RTP,
 } from '../lib/slotMachine.js';
 import { cleanJid, isOwnerOnly } from '../lib/isOwner.js';
+import { checkEligibility } from '../lib/loans.js';
 
 export const command = 'reserve';
 export const aliases = ['jackpot', 'bank'];
@@ -65,6 +66,19 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const surplus = Math.max(0, pool - JACKPOT_SEED);
   const netSign = today.net > 0 ? '+' : '';
 
+  // Silent loan hint: only ever shown to a user who's actually eligible right
+  // now. Anyone not eligible (new account, active/defaulted loan, etc.) sees
+  // nothing here — they only learn why if they run !loan themselves.
+  let loanHint = '';
+  try {
+    const eligibility = await checkEligibility(userId);
+    if (eligibility.eligible) {
+      loanHint = `\n💳 _You're eligible for a loan up to ${formatNumber(eligibility.maxAmount)} coins — try !loan apply_\n`;
+    }
+  } catch (_) {
+    // Best-effort — a loan-hint failure should never break !reserve itself.
+  }
+
   await sock.sendMessage(chatId, {
     text:
       `🏦 *THE COMMUNITY BANK* 🏦\n\n` +
@@ -75,8 +89,9 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
       `   Wagered: ${formatNumber(today.bet)} coins\n` +
       `   Paid out: ${formatNumber(today.won)} coins\n` +
       `   Net: ${netSign}${formatNumber(today.net)} coins\n\n` +
-      `${MOOD_FLAVOR[mood.mood] || MOOD_FLAVOR.neutral}\n\n` +
-      `🎮 Fed by: *Jungle Hunt*, *Coinflip*, *Dice*\n` +
+      `${MOOD_FLAVOR[mood.mood] || MOOD_FLAVOR.neutral}\n` +
+      loanHint +
+      `\n🎮 Fed by: *Jungle Hunt*, *Coinflip*, *Dice*\n` +
       `_Happy Winning!!_`,
     ...channelInfo
   }, { quoted: message });

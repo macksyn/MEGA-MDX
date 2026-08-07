@@ -116,6 +116,10 @@ export interface Wallet {
   lastDailyDate: string | null;   // 'YYYY-MM-DD' in TZ
   lastWorkTs: number;
   lifetimeCoinsEarned: number;
+  peakCoins: number;       // highest wallet.coins has ever been — maintained centrally in
+                            // saveWallet() below, not by individual credit sites, so it
+                            // stays correct regardless of which function moved the balance
+                            // (addCoins, attendance bonus, work, etc.)
   lifetimeGroqCoinsEarned: number;
   exchangeCount: number;
   createdAt: number;
@@ -141,6 +145,7 @@ const EMPTY_WALLET: Wallet = {
   lastDailyDate: null,
   lastWorkTs: 0,
   lifetimeCoinsEarned: 0,
+  peakCoins: 0,
   lifetimeGroqCoinsEarned: 0,
   exchangeCount: 0,
   createdAt: Date.now(),
@@ -157,10 +162,20 @@ const EMPTY_WALLET: Wallet = {
 
 export async function getWallet(userId: string): Promise<Wallet> {
   const w = await wallets.get(userId);
-  return w ? { ...EMPTY_WALLET, ...w } : { ...EMPTY_WALLET };
+  const wallet = w ? { ...EMPTY_WALLET, ...w } : { ...EMPTY_WALLET };
+  // Self-healing backfill: wallets saved before peakCoins existed (or that
+  // haven't had a coin mutation since) could otherwise show a peak lower
+  // than their actual current balance.
+  if (wallet.peakCoins < wallet.coins) wallet.peakCoins = wallet.coins;
+  return wallet;
 }
 
 async function saveWallet(userId: string, wallet: Wallet): Promise<Wallet> {
+  // Centralized peak-balance tracking: every function that mutates wallet.coins
+  // (addCoins, awardAttendanceBonus, doWork, and anything added later) routes
+  // through here, so this is the one place that needs to know about it rather
+  // than patching every individual credit site.
+  if (wallet.coins > wallet.peakCoins) wallet.peakCoins = wallet.coins;
   await wallets.set(userId, wallet);
   return wallet;
 }
@@ -274,6 +289,7 @@ export type TransactionType =
   | 'exchange_out' | 'exchange_in'
   | 'convert'
   | 'slots' | 'coinflip' | 'dice'
+  | 'loan_disbursement' | 'loan_repayment'
   | 'admin_credit' | 'admin_debit' | 'admin_reset'
   | 'withdrawal_hold' | 'withdrawal_refund'
   | 'other';
@@ -328,12 +344,54 @@ export async function getTransactions(userId: string, limit = 20): Promise<Trans
   return existing.slice(0, Math.max(1, Math.min(limit, MAX_TRANSACTIONS_PER_USER)));
 }
 
+// ── Loan garnishment hook ──────────────────────────────────────────────────
+// lib/loans.ts already imports this module (getWallet/addCoins/deductCoins),
+// so economy.ts can't import loans.ts back without a circular dependency.
+// Instead, loans.ts registers itself here at module load — a plugin-style
+// hook, not a direct import. If a user has a defaulted loan, a slice of
+// every future earning gets diverted to pay it down before it ever lands in
+// their wallet. Explicitly does NOT apply to peer-to-peer transfers (see the
+// exclusion in loans.ts) — a friend's gift shouldn't get clawed toward a
+// stranger's debt just because it happened to pass through addCoins.
+//
+// IMPORTANT: this only takes effect once lib/loans.ts has actually been
+// imported somewhere (which happens automatically once plugins/eco_loan.ts
+// loads at bot startup, same as every other plugin). If loan enforcement
+// ever seems to not be firing, that's the first thing to check.
+export type GarnishmentHandler = (
+  userId: string,
+  amount: number,
+  meta: TransactionMeta
+) => Promise<{ garnished: number; remaining: number }>;
+
+let garnishmentHandler: GarnishmentHandler | null = null;
+
+export function registerGarnishmentHandler(fn: GarnishmentHandler): void {
+  garnishmentHandler = fn;
+}
+
+async function applyGarnishment(userId: string, amount: number, meta: TransactionMeta): Promise<{ credited: number; garnished: number }> {
+  if (amount <= 0 || !garnishmentHandler) return { credited: amount, garnished: 0 };
+  try {
+    const { garnished, remaining } = await garnishmentHandler(userId, amount, meta);
+    return { credited: remaining, garnished };
+  } catch (err) {
+    console.error('[economy] garnishment hook failed, crediting in full:', err);
+    return { credited: amount, garnished: 0 };
+  }
+}
+
 export async function addCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<Wallet> {
+  const { credited, garnished } = await applyGarnishment(userId, amount, meta);
+
   const wallet = await getWallet(userId);
-  wallet.coins += amount;
-  if (amount > 0) wallet.lifetimeCoinsEarned += amount;
+  wallet.coins += credited;
+  if (credited > 0) wallet.lifetimeCoinsEarned += credited;
   const saved = await saveWallet(userId, wallet);
-  await logTransaction(userId, { currency: 'coins', amount, balanceAfter: saved.coins, type: meta.type || 'admin_credit', ...meta });
+  await logTransaction(userId, {
+    currency: 'coins', amount: credited, balanceAfter: saved.coins, type: meta.type || 'admin_credit', ...meta,
+    ...(garnished > 0 ? { note: `${meta.note ? meta.note + ' · ' : ''}${garnished} garnished toward defaulted loan` } : {}),
+  });
   return saved;
 }
 
@@ -609,7 +667,7 @@ export async function awardAttendanceBonus(
   streak: number
 ): Promise<
   | { success: false; reason: 'already_awarded_today' }
-  | { success: true; reward: number; capped: boolean }
+  | { success: true; reward: number; garnished: number; capped: boolean }
 > {
   const wallet = await getWallet(userId);
   const today = todayStr();
@@ -626,30 +684,35 @@ export async function awardAttendanceBonus(
   if (payout > 0) await deductFromJackpot(payout);
   await recordHouseActivity(0, payout);
 
+  // Bypasses addCoins (streak/lastDailyDate need to update in this same
+  // wallet write), so garnishment is applied explicitly here too — same
+  // hook addCoins uses, just invoked directly.
+  const { credited, garnished } = await applyGarnishment(userId, payout, { type: 'attendance' });
+
   // Streak/attendance credit still updates even if the bank is completely
   // dry right now (payout === 0) — attendance itself was still valid, and
   // blocking that would unfairly penalize the member for the bank's state.
-  wallet.coins += payout;
-  if (payout > 0) wallet.lifetimeCoinsEarned += payout;
+  wallet.coins += credited;
+  if (credited > 0) wallet.lifetimeCoinsEarned += credited;
   wallet.dailyStreak = streak;
   wallet.lastDailyDate = today;
   const saved = await saveWallet(userId, wallet);
   await logTransaction(userId, {
     currency: 'coins',
-    amount: payout,
+    amount: credited,
     balanceAfter: saved.coins,
     type: 'attendance',
-    note: `streak: ${streak}${capped ? ' (capped — bank reserve low)' : ''}`,
+    note: `streak: ${streak}${capped ? ' (capped — bank reserve low)' : ''}${garnished > 0 ? ` · ${garnished} garnished toward defaulted loan` : ''}`,
   });
 
-  return { success: true, reward: payout, capped };
+  return { success: true, reward: credited, garnished, capped };
 }
 
 // ── Work command (cooldown-based random payout) ──────────────────────────────
 
 export async function doWork(userId: string): Promise<
   | { success: false; remainingMs: number }
-  | { success: true; reward: number }
+  | { success: true; reward: number; garnished: number }
 > {
   const settings = await getSettings();
   const wallet = await getWallet(userId);
@@ -660,14 +723,19 @@ export async function doWork(userId: string): Promise<
     return { success: false, remainingMs: readyAt - now };
   }
 
-  const reward = Math.floor(Math.random() * (settings.workMax - settings.workMin + 1)) + settings.workMin;
-  wallet.coins += reward;
-  wallet.lifetimeCoinsEarned += reward;
+  const rawReward = Math.floor(Math.random() * (settings.workMax - settings.workMin + 1)) + settings.workMin;
+  const { credited, garnished } = await applyGarnishment(userId, rawReward, { type: 'work' });
+
+  wallet.coins += credited;
+  wallet.lifetimeCoinsEarned += credited;
   wallet.lastWorkTs = now;
   const saved = await saveWallet(userId, wallet);
-  await logTransaction(userId, { currency: 'coins', amount: reward, balanceAfter: saved.coins, type: 'work' });
+  await logTransaction(userId, {
+    currency: 'coins', amount: credited, balanceAfter: saved.coins, type: 'work',
+    ...(garnished > 0 ? { note: `${garnished} garnished toward defaulted loan` } : {}),
+  });
 
-  return { success: true, reward };
+  return { success: true, reward: credited, garnished };
 }
 
 // ── Top-3-on-the-monthly-leaderboard payout ──────────────────────────────────
