@@ -42,18 +42,18 @@ export default {
         });
       }
 
-      // 新 API 端点
+      // New API endpoint (no API key required)
       const apiUrl = `https://jawad-tech.vercel.app/downloader?url=${encodeURIComponent(url)}`;
 
       const res = await axios.get(apiUrl, AXIOS_DEFAULTS);
 
-      // 新 API 响应结构: { status, creator, platform, result: [{ quality, type, url }], metadata }
+      // New API response: { status, creator, platform, result: [{ quality, type, url }], metadata }
       const videos = res?.data?.result;
       if (!res?.data?.status || !Array.isArray(videos) || !videos.length) {
         throw new Error('No downloadable video found');
       }
 
-      // 按质量排序：HD > SD > 其他
+      // Sort by quality: HD > 720p > SD (you can adjust rankings as needed)
       const qualityRank: Record<string, number> = { 'HD': 3, '720p': 2, 'SD': 1 };
       const sorted = videos.sort((a, b) => {
         const rankA = qualityRank[a.quality] || 0;
