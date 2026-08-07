@@ -42,30 +42,32 @@ export default {
         });
       }
 
-      const apiUrl = `https://gtech-api-xtp1.onrender.com/api/download/fb?url=${encodeURIComponent(
-        url
-      )}&apikey=APIKEY`;
+      // 新 API 端点
+      const apiUrl = `https://jawad-tech.vercel.app/downloader?url=${encodeURIComponent(url)}`;
 
       const res = await axios.get(apiUrl, AXIOS_DEFAULTS);
 
-      const videos = res?.data?.data?.data;
+      // 新 API 响应结构: { status, creator, platform, result: [{ quality, type, url }], metadata }
+      const videos = res?.data?.result;
       if (!res?.data?.status || !Array.isArray(videos) || !videos.length) {
         throw new Error('No downloadable video found');
       }
 
+      // 按质量排序：HD > SD > 其他
+      const qualityRank: Record<string, number> = { 'HD': 3, '720p': 2, 'SD': 1 };
       const sorted = videos.sort((a, b) => {
-        const qa = parseInt(a.resolution, 10) || 0;
-        const qb = parseInt(b.resolution, 10) || 0;
-        return qb - qa;
+        const rankA = qualityRank[a.quality] || 0;
+        const rankB = qualityRank[b.quality] || 0;
+        return rankB - rankA;
       });
 
       const selected = sorted[0];
       const videoUrl = selected.url.startsWith('http')
         ? selected.url
-        : `https://gtech-api-xtp1.onrender.com${selected.url}`;
+        : `https://jawad-tech.vercel.app${selected.url}`;
 
       const caption = `📘 *Facebook Downloader*
-🎞 Quality: *${selected.resolution || 'Unknown'}*
+🎞 Quality: *${selected.quality || 'Unknown'}*
 
 > 📥 *_Groq™_*`;
 
