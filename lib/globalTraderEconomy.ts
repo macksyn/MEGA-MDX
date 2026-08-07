@@ -433,7 +433,7 @@ interface EventDef {
   failEffect: (shipment: Shipment) => void;      // if player declines
 }
 
-const EVENT_CONFIG: Record<EventType, EventDef> = {
+export const EVENT_CONFIG: Record<EventType, EventDef> = {
   delay: {
     type: 'delay',
     cost: 3000,
@@ -481,9 +481,6 @@ export function getPendingEvents(shipment: Shipment): EventType[] {
 
   for (const milestone of EVENT_MILESTONES) {
     if (progress >= milestone) {
-      // For each milestone, we may have an event; we only trigger if not already triggered.
-      // We'll assign a deterministic event based on shipment id + milestone to avoid randomness on every check.
-      // But for simplicity, we'll use a pseudo-random based on id and milestone.
       const seed = shipment.id + milestone.toString();
       let hash = 0;
       for (let i = 0; i < seed.length; i++) {
@@ -515,7 +512,6 @@ export async function resolveEvent(
   const config = EVENT_CONFIG[eventType];
   if (!config) return { success: false, reason: 'Unknown event.' };
 
-  // Check if already triggered (should not happen)
   if (shipment.triggeredEvents.includes(eventType)) {
     return { success: false, reason: 'Event already resolved.' };
   }
@@ -656,7 +652,7 @@ export async function sourceShipment(userId: string, countryKey: string, freight
     hub: null,
     soldAt: null,
     clearedAt: null,
-    triggeredEvents: [],   // <-- new field
+    triggeredEvents: [],
   };
 
   const all = await getAllShipments(userId);
@@ -693,7 +689,6 @@ export async function clearShipment(userId: string, shipmentId: string, opts: { 
 
   const duty = Math.round(shipment.goodsCost * (country.dutyRatePercent / 100));
 
-  // Case 1: valid license
   if (valid) {
     const paid = await deductCoins(userId, duty, { type: 'admin_debit', note: `customs duty: ${shipmentId}` });
     if (!paid.success) return { outcome: 'error', reason: 'Not enough coins for duty.' };
@@ -707,12 +702,10 @@ export async function clearShipment(userId: string, shipmentId: string, opts: { 
     return { outcome: 'cleared', dutyPaid: duty, bribePaid: 0 };
   }
 
-  // Case 2: expired, no bribe
   if (!opts.bribe) {
     return seizeShipment(userId, all, idx, shipment);
   }
 
-  // Case 3: expired + bribe
   const bribeCost = Math.round(duty * (BRIBE_COST_PERCENT / 100));
   const totalUpfront = duty + bribeCost;
   const paid = await deductCoins(userId, totalUpfront, { type: 'admin_debit', note: `duty + bribe: ${shipmentId}` });
