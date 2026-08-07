@@ -1,6 +1,12 @@
 // @ts-nocheck
 /***
- * lib/globalTraderEconomy.ts – Global Trader core trading engine with in‑transit events.
+ * lib/globalTraderEconomy.ts – Global Trader core trading engine.
+ * 
+ * Features:
+ * - Goods with individual traits (volatility, expiration, theft, legal flags)
+ * - Tier‑based licenses (one license covers all countries in a rank tier)
+ * - In‑transit events (delay, pirates, temperature) with player choices
+ * - Shared jackpot pool with slotMachine.ts
  */
 
 import { createStore } from './pluginStore.js';
@@ -9,10 +15,10 @@ import { getJackpotPool, contributeToJackpot, deductFromJackpot, settleWin } fro
 
 const store = createStore('globaltrader');
 const shipmentsTbl = store.table('shipments');
-const licensesTbl  = store.table('licenses');
-const stockTbl     = store.table('stock');
-const marketTbl    = store.table('market');
-const statsTbl     = store.table('stats');
+const licensesTbl = store.table('licenses');
+const stockTbl = store.table('stock');
+const marketTbl = store.table('market');
+const statsTbl = store.table('stats');
 
 // ── Goods Registry ─────────────────────────────────────────────────────
 
@@ -227,7 +233,7 @@ const RISK_BRIBE_SUCCESS: Record<RiskTier, number> = {
   high: 0.50,
 };
 
-// ── Freight Defs ──────────────────────────────────────────────────────
+// ── Freight Defs (Real Shipping Companies) ──────────────────────────
 
 export interface FreightDef {
   key: string;
@@ -237,9 +243,11 @@ export interface FreightDef {
 }
 
 export const FREIGHT_TIERS: FreightDef[] = [
-  { key: 'economy', label: 'Economy Sea Freight', speedMult: 1,   costMult: 1 },
-  { key: 'express', label: 'Express Air Cargo',   speedMult: 2,   costMult: 2.2 },
-  { key: 'premium', label: 'Premium Charter',      speedMult: 4,   costMult: 4 },
+  { key: 'hapag', label: 'Hapag-Lloyd', speedMult: 1.0, costMult: 1.0 },
+  { key: 'cma', label: 'CMA CGM', speedMult: 1.8, costMult: 2.0 },
+  { key: 'maersk', label: 'Maersk', speedMult: 3.0, costMult: 3.5 },
+  { key: 'one', label: 'Ocean Network Express (ONE)', speedMult: 4.5, costMult: 5.0 },
+  { key: 'cosco', label: 'Cosco Shipping', speedMult: 6.0, costMult: 7.0 },
 ];
 
 // ── Rank Defs ─────────────────────────────────────────────────────────
@@ -247,18 +255,117 @@ export const FREIGHT_TIERS: FreightDef[] = [
 export interface RankDef {
   key: string;
   label: string;
+  emoji: string;
   lifetimeProfitThreshold: number;
   addsCountries: string[];
   addsFreight: string[];
 }
 
 const RANK_DEFS: RankDef[] = [
-  { key: 'hawker',      label: 'Hawker',       lifetimeProfitThreshold: 0,       addsCountries: ['benin', 'india', 'thailand'], addsFreight: ['economy'] },
-  { key: 'retailer',    label: 'Retailer',     lifetimeProfitThreshold: 50000,   addsCountries: ['turkey', 'china', 'brazil'],  addsFreight: ['express'] },
-  { key: 'wholesaler',  label: 'Wholesaler',   lifetimeProfitThreshold: 200000,  addsCountries: ['spain', 'saudi'],             addsFreight: ['premium'] },
-  { key: 'distributor', label: 'Distributor',  lifetimeProfitThreshold: 600000,  addsCountries: ['france', 'uae'],              addsFreight: [] },
-  { key: 'mogul',       label: 'Import Mogul', lifetimeProfitThreshold: 1500000, addsCountries: ['germany', 'usa'],             addsFreight: [] },
+  { 
+    key: 'dropshipper', 
+    label: 'Dropshipper', 
+    emoji: '📦',
+    lifetimeProfitThreshold: 0, 
+    addsCountries: ['benin', 'india', 'thailand'], 
+    addsFreight: ['hapag'] 
+  },
+  { 
+    key: 'mini_importer', 
+    label: 'Mini Importer', 
+    emoji: '📦',
+    lifetimeProfitThreshold: 30000, 
+    addsCountries: ['turkey', 'china', 'brazil'], 
+    addsFreight: ['cma'] 
+  },
+  { 
+    key: 'sme', 
+    label: 'SME', 
+    emoji: '🛍️',
+    lifetimeProfitThreshold: 100000, 
+    addsCountries: ['spain', 'saudi'], 
+    addsFreight: ['maersk'] 
+  },
+  { 
+    key: 'importer', 
+    label: 'Importer', 
+    emoji: '📦',
+    lifetimeProfitThreshold: 300000, 
+    addsCountries: ['france', 'uae'], 
+    addsFreight: ['one'] 
+  },
+  { 
+    key: 'pro_trader', 
+    label: 'Pro Trader', 
+    emoji: '🚚',
+    lifetimeProfitThreshold: 700000, 
+    addsCountries: ['germany'], 
+    addsFreight: ['cosco'] 
+  },
+  { 
+    key: 'global_trader', 
+    label: 'Global Trader', 
+    emoji: '🌍',
+    lifetimeProfitThreshold: 1500000, 
+    addsCountries: ['usa'], 
+    addsFreight: [] 
+  },
 ];
+
+// ── License Tiers ─────────────────────────────────────────────────────
+
+export const LICENSE_TIERS = {
+  dropshipper: {
+    key: 'dropshipper',
+    label: 'Dropshipper License',
+    emoji: '📦',
+    cost: 1500,
+    countries: ['benin', 'india', 'thailand'],
+    durationMs: 7 * 24 * 60 * 60 * 1000,
+  },
+  mini_importer: {
+    key: 'mini_importer',
+    label: 'Mini Importer License',
+    emoji: '📦',
+    cost: 4500,
+    countries: ['turkey', 'china', 'brazil'],
+    durationMs: 7 * 24 * 60 * 60 * 1000,
+  },
+  sme: {
+    key: 'sme',
+    label: 'SME License',
+    emoji: '🛍️',
+    cost: 7000,
+    countries: ['spain', 'saudi'],
+    durationMs: 7 * 24 * 60 * 60 * 1000,
+  },
+  importer: {
+    key: 'importer',
+    label: 'Importer License',
+    emoji: '📦',
+    cost: 14000,
+    countries: ['france', 'uae'],
+    durationMs: 7 * 24 * 60 * 60 * 1000,
+  },
+  pro_trader: {
+    key: 'pro_trader',
+    label: 'Pro Trader License',
+    emoji: '🚚',
+    cost: 20000,
+    countries: ['germany'],
+    durationMs: 7 * 24 * 60 * 60 * 1000,
+  },
+  global_trader: {
+    key: 'global_trader',
+    label: 'Global Trader License',
+    emoji: '🌍',
+    cost: 30000,
+    countries: ['usa'],
+    durationMs: 7 * 24 * 60 * 60 * 1000,
+  },
+} as const;
+
+type LicenseTierKey = keyof typeof LICENSE_TIERS;
 
 const LICENSE_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 const FORCED_RENEWAL_MULT = 1.6;
@@ -334,6 +441,7 @@ export async function getPlayerRank(userId: string) {
   return {
     key: current.key,
     label: current.label,
+    emoji: current.emoji,
     lifetimeProfit: profit,
     nextThreshold: next ? next.lifetimeProfitThreshold : profit,
     unlockedCountries,
@@ -341,50 +449,108 @@ export async function getPlayerRank(userId: string) {
   };
 }
 
-// ── License ───────────────────────────────────────────────────────────
+// ── License System ────────────────────────────────────────────────────
 
-interface License {
+interface LicenseRecord {
+  tier: LicenseTierKey;
   expiresAt: number;
 }
 
-async function getLicenseRecord(userId: string, countryKey: string): Promise<License | null> {
+async function getLicenseRecord(userId: string, tierKey: LicenseTierKey): Promise<LicenseRecord | null> {
   const all = (await licensesTbl.get(userId)) || {};
-  return all[countryKey] || null;
+  return all[tierKey] || null;
 }
 
-async function setLicenseRecord(userId: string, countryKey: string, expiresAt: number): Promise<void> {
+async function setLicenseRecord(userId: string, tierKey: LicenseTierKey, expiresAt: number): Promise<void> {
   const all = (await licensesTbl.get(userId)) || {};
-  all[countryKey] = { expiresAt };
+  all[tierKey] = { tier: tierKey, expiresAt };
   await licensesTbl.set(userId, all);
 }
 
-function isLicenseValid(license: License | null): boolean {
-  return !!license && license.expiresAt > Date.now();
+function isLicenseValid(record: LicenseRecord | null): boolean {
+  return !!record && record.expiresAt > Date.now();
+}
+
+async function hasValidLicenseForCountry(userId: string, countryKey: string): Promise<boolean> {
+  const all = (await licensesTbl.get(userId)) || {};
+  for (const [tierKey, record] of Object.entries(all)) {
+    if (!isLicenseValid(record as LicenseRecord)) continue;
+    const tier = LICENSE_TIERS[tierKey as LicenseTierKey];
+    if (tier && tier.countries.includes(countryKey)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export async function getLicenseStatus(userId: string) {
   const all = (await licensesTbl.get(userId)) || {};
-  return Object.entries(all).map(([countryKey, lic]: [string, License]) => {
-    const country = COUNTRIES.find(c => c.key === countryKey);
+  const rank = await getPlayerRank(userId);
+  const tierKeys = Object.keys(LICENSE_TIERS) as LicenseTierKey[];
+
+  return tierKeys.map(tierKey => {
+    const tier = LICENSE_TIERS[tierKey];
+    const record = all[tierKey] || null;
+    const isValid = isLicenseValid(record);
+    const isEligible = rank.unlockedCountries.some(c => tier.countries.includes(c));
+
     return {
-      countryKey,
-      countryLabel: country ? `${country.emoji} ${country.label}` : countryKey,
-      expiresAt: lic.expiresAt,
-      renewCost: country ? country.licenseRenewCost : 0,
+      tierKey,
+      tierLabel: `${tier.emoji} ${tier.label}`,
+      countries: tier.countries.map(c => {
+        const country = COUNTRIES.find(ct => ct.key === c);
+        return country ? `${country.emoji} ${country.label}` : c;
+      }).join(', '),
+      cost: tier.cost,
+      expiresAt: record ? record.expiresAt : null,
+      isValid,
+      isEligible,
+      hasLicense: !!record,
     };
   });
 }
 
-export async function renewLicense(userId: string, countryKey: string, forced = false): Promise<{ success: boolean; reason?: string; cost?: number }> {
-  const country = COUNTRIES.find(c => c.key === countryKey);
-  if (!country) return { success: false, reason: 'invalid_country' };
+export async function buyLicense(
+  userId: string,
+  tierKey: LicenseTierKey
+): Promise<{ success: boolean; reason?: string; cost?: number }> {
+  const tier = LICENSE_TIERS[tierKey];
+  if (!tier) return { success: false, reason: 'Invalid license tier.' };
 
-  const cost = forced ? Math.round(country.licenseRenewCost * FORCED_RENEWAL_MULT) : country.licenseRenewCost;
-  const result = await deductCoins(userId, cost, { type: 'admin_debit', note: `${forced ? 'forced ' : ''}license renewal: ${countryKey}` });
+  const rank = await getPlayerRank(userId);
+  const hasEligibility = rank.unlockedCountries.some(c => tier.countries.includes(c));
+  if (!hasEligibility) {
+    return { success: false, reason: 'You haven\'t unlocked this tier yet.' };
+  }
+
+  const existing = await getLicenseRecord(userId, tierKey);
+  if (existing && isLicenseValid(existing)) {
+    return { success: false, reason: 'You already have a valid license for this tier.' };
+  }
+
+  const cost = tier.cost;
+  const result = await deductCoins(userId, cost, { type: 'admin_debit', note: `buy license: ${tierKey}` });
   if (!result.success) return { success: false, reason: 'insufficient_funds' };
 
   await contributeToJackpot(cost);
-  await setLicenseRecord(userId, countryKey, Date.now() + LICENSE_DURATION_MS);
+  await setLicenseRecord(userId, tierKey, Date.now() + tier.durationMs);
+  return { success: true, cost };
+}
+
+export async function renewLicense(
+  userId: string,
+  tierKey: LicenseTierKey,
+  forced = false
+): Promise<{ success: boolean; reason?: string; cost?: number }> {
+  const tier = LICENSE_TIERS[tierKey];
+  if (!tier) return { success: false, reason: 'Invalid license tier.' };
+
+  const cost = forced ? Math.round(tier.cost * FORCED_RENEWAL_MULT) : tier.cost;
+  const result = await deductCoins(userId, cost, { type: 'admin_debit', note: `${forced ? 'forced ' : ''}renew license: ${tierKey}` });
+  if (!result.success) return { success: false, reason: 'insufficient_funds' };
+
+  await contributeToJackpot(cost);
+  await setLicenseRecord(userId, tierKey, Date.now() + tier.durationMs);
   return { success: true, cost };
 }
 
@@ -412,7 +578,7 @@ export interface Shipment {
   hub: string | null;
   soldAt: number | null;
   clearedAt: number | null;
-  triggeredEvents: string[];   // list of event types already fired
+  triggeredEvents: string[];
 }
 
 // ── Event definitions ────────────────────────────────────────────────
@@ -429,8 +595,8 @@ interface EventDef {
   type: EventType;
   cost: number;
   description: string;
-  successEffect: (shipment: Shipment) => void;   // if player pays
-  failEffect: (shipment: Shipment) => void;      // if player declines
+  successEffect: (shipment: Shipment) => void;
+  failEffect: (shipment: Shipment) => void;
 }
 
 export const EVENT_CONFIG: Record<EventType, EventDef> = {
@@ -445,14 +611,14 @@ export const EVENT_CONFIG: Record<EventType, EventDef> = {
     type: 'pirates',
     cost: 5000,
     description: '⚠️ Pirates detected. Hire escort for 5,000?',
-    successEffect: (s) => { /* no loss */ },
+    successEffect: () => {},
     failEffect: (s) => { s.quality *= 0.6; },
   },
   temperature: {
     type: 'temperature',
     cost: 2000,
     description: '⚠️ Cargo temperature rising. Buy cooling for 2,000?',
-    successEffect: (s) => { /* no spoilage */ },
+    successEffect: () => {},
     failEffect: (s) => { s.quality *= 0.75; },
   },
 };
@@ -467,12 +633,6 @@ function getProgress(shipment: Shipment): number {
 
 const EVENT_MILESTONES = [0.20, 0.50, 0.80];
 
-function pickRandomEvent(): EventType {
-  const types = Object.values(EVENT_TYPES);
-  return types[Math.floor(Math.random() * types.length)];
-}
-
-/** Returns pending events for a shipment (those that haven't been triggered yet). */
 export function getPendingEvents(shipment: Shipment): EventType[] {
   if (shipment.status !== 'in_transit') return [];
   const progress = getProgress(shipment);
@@ -497,7 +657,6 @@ export function getPendingEvents(shipment: Shipment): EventType[] {
   return pending;
 }
 
-/** Resolve an event – deduct coins if success, apply effects, mark as triggered. */
 export async function resolveEvent(
   userId: string,
   shipmentId: string,
@@ -684,8 +843,7 @@ export async function clearShipment(userId: string, shipmentId: string, opts: { 
   const good = GOODS[shipment.goodKey];
   if (!good) return { outcome: 'error', reason: 'Good data missing.' };
 
-  const license = await getLicenseRecord(userId, shipment.countryKey);
-  const valid = isLicenseValid(license);
+  const valid = await hasValidLicenseForCountry(userId, shipment.countryKey);
 
   const duty = Math.round(shipment.goodsCost * (country.dutyRatePercent / 100));
 
@@ -734,8 +892,19 @@ async function seizeShipment(userId: string, all: Shipment[], idx: number, shipm
   const finePaid = await deductCoins(userId, fine, { type: 'admin_debit', note: `customs seizure fine: ${shipment.id}` });
   if (finePaid.success) await contributeToJackpot(fine);
 
-  const renewal = await renewLicense(userId, shipment.countryKey, true);
-  const renewalSucceeded = renewal.success;
+  let tierKey: LicenseTierKey | null = null;
+  for (const [key, tier] of Object.entries(LICENSE_TIERS)) {
+    if (tier.countries.includes(shipment.countryKey)) {
+      tierKey = key as LicenseTierKey;
+      break;
+    }
+  }
+
+  let renewalSucceeded = false;
+  if (tierKey) {
+    const renewal = await renewLicense(userId, tierKey, true);
+    renewalSucceeded = renewal.success;
+  }
 
   shipment.status = 'seized';
   all[idx] = shipment;
@@ -744,7 +913,7 @@ async function seizeShipment(userId: string, all: Shipment[], idx: number, shipm
   return {
     outcome: 'seized',
     fine: finePaid.success ? fine : 0,
-    forcedRenewalCost: renewal.success ? renewal.cost : 0,
+    forcedRenewalCost: renewalSucceeded ? fine : 0,
     holdHours: CLEARANCE_HOLD_HOURS,
     renewalSucceeded,
   };
