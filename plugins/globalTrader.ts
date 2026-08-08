@@ -24,8 +24,14 @@ import {
   getMarketPrice,
   getPendingEvents,
   resolveEvent,
-  EVENT_CONFIG,
+  getEventCost,
+  getEventDescription,
   EVENT_TYPES,
+  getEventsStatusBlock,
+  CLEARING_AGENT_DEFS,
+  WAREHOUSE_DEFS,
+  getEquipment,
+  buyEquipment,
 } from '../lib/globalTraderEconomy.js';
 
 export const command = 'global';
@@ -69,16 +75,18 @@ function delay(ms: number) {
 async function runMainMenu(sock: any, message: any, chatId: string, userId: string) {
   const wallet = await getWallet(userId);
   const rank = await getPlayerRank(userId);
+  const events = await getEventsStatusBlock();
 
   const result = await promptMenu(sock, message, chatId, userId, {
     title: '🌍 GLOBAL TRADER',
-    subtitle: `${rank.emoji} Rank: ${rank.label}  ·  💰 ${formatNumber(wallet.coins)} coins`,
+    subtitle: `${rank.emoji} Rank: ${rank.label}  ·  💰 ${formatNumber(wallet.coins)} coins${events ? `\n${events}` : ''}`,
     text: 'What would you like to do?',
     options: [
       { label: 'Source Goods', value: 'source', description: 'Buy from a supplier country' },
       { label: 'My Shipments', value: 'shipments', description: 'Track everything in transit' },
       { label: 'Sell / Market', value: 'sell', description: 'Cash out cleared goods' },
       { label: 'License & Rank', value: 'license', description: 'Check expiry, renew, view rank' },
+      { label: 'Upgrades', value: 'upgrades', description: 'Clearing Agent & Warehouse tiers' },
       { label: 'Wallet', value: 'wallet' },
     ],
     cancelLabel: 'Exit',
@@ -92,6 +100,7 @@ async function runMainMenu(sock: any, message: any, chatId: string, userId: stri
     case 'shipments': outcome = await runShipmentsMenu(sock, message, chatId, userId); break;
     case 'sell':      outcome = await runSellMenu(sock, message, chatId, userId); break;
     case 'license':   outcome = await runLicenseMenu(sock, message, chatId, userId); break;
+    case 'upgrades':  outcome = await runUpgradesMenu(sock, message, chatId, userId); break;
     case 'wallet':    await sendWalletCard(sock, chatId, userId); outcome = 'back'; break;
   }
 
@@ -110,7 +119,7 @@ async function runSourceMenu(sock: any, message: any, chatId: string, userId: st
     return {
       label: `${c.emoji} ${c.label}`,
       value: c.key,
-      description: `${good.label} (${formatNumber(good.baseCost)} coins/unit) · ${stock.remaining}/${stock.cap} left today`,
+      description: `${good.label} (${formatNumber(good.baseCost)} coins/unit) · ${stock.remaining}/${stock.cap} left today\n     ${good.traitLine}`,
     };
   }));
 
@@ -217,17 +226,17 @@ async function runShipmentsMenu(sock: any, message: any, chatId: string, userId:
     return;
   }
 
+  // BUG FIX: this used to intercept BEFORE rendering anything — if any
+  // in-transit shipment had a pending event, the player couldn't see their
+  // tracker at all until they resolved it, and skipping via "0" left it
+  // pending forever, permanently re-blocking the screen on every visit.
+  // Now the tracker always renders; a pending event just shows as a flag
+  // on that shipment's card, and picking that shipment surfaces the event.
+  const pendingByShipment = new Map<string, string>();
   for (const s of shipments) {
     if (s.status === 'in_transit') {
       const pending = getPendingEvents(s);
-      if (pending.length > 0) {
-        const handled = await runEventMenu(sock, message, chatId, userId, s, pending[0]);
-        if (handled) {
-          return runShipmentsMenu(sock, message, chatId, userId);
-        } else {
-          return 'back';
-        }
-      }
+      if (pending.length > 0) pendingByShipment.set(s.id, pending[0]);
     }
   }
 
@@ -235,14 +244,23 @@ async function runShipmentsMenu(sock: any, message: any, chatId: string, userId:
     const p = await getShipmentProgress(s);
     const emoji = STAGE_EMOJI[p.stage] || '📦';
     const bar = progressBar(p.pct, 100);
+    const hasEvent = pendingByShipment.has(s.id);
     const clearHint = p.stage === 'awaiting_clearance' ? `\n_Ready — pick this shipment below to clear it_` : '';
-    return `📦 #${s.id} — ${s.goodLabel} (${s.countryLabel})\n${emoji} ${p.label}\n${bar}  ${p.pct}%${clearHint}`;
+    const eventHint = hasEvent ? `\n⚠️ _Action needed — pick this shipment below_` : '';
+    return `📦 #${s.id} — ${s.goodLabel} (${s.countryLabel})\n${emoji} ${p.label}\n${bar}  ${p.pct}%${clearHint}${eventHint}`;
   }));
 
-  const options = shipments.map(s => ({ label: `#${s.id} — ${s.goodLabel}`, value: s.id }));
+  const options = shipments.map(s => ({
+    label: `#${s.id} — ${s.goodLabel}${pendingByShipment.has(s.id) ? ' ⚠️' : ''}`,
+    value: s.id,
+  }));
+
+  const equip = await getEquipment(userId);
+  const activeCount = shipments.filter(s => s.stage === 'in_transit' || s.stage === 'awaiting_clearance' || s.stage === 'cleared_unsold').length;
 
   const result = await promptMenu(sock, message, chatId, userId, {
     title: '🚛 GLOBAL TRADER · Shipments',
+    subtitle: `Warehouse: ${activeCount}/${equip.warehouse.capacity} slots used`,
     text: cards.join(`\n${DIVIDER}\n`) + `\n\nSelect a shipment for actions:`,
     options,
     cancelLabel: 'Back',
@@ -252,16 +270,22 @@ async function runShipmentsMenu(sock: any, message: any, chatId: string, userId:
   if (result.timedOut || !result.value) return;
 
   const chosen = shipments.find(s => s.id === result.value);
-  const progress = await getShipmentProgress(chosen);
 
   let outcome: any;
-  if (progress.stage === 'awaiting_clearance') {
-    outcome = await runClearMenu(sock, message, chatId, userId, chosen);
+  if (pendingByShipment.has(chosen.id)) {
+    const handled = await runEventMenu(sock, message, chatId, userId, chosen, pendingByShipment.get(chosen.id)!);
+    outcome = 'back'; // whether resolved or skipped, return to the tracker — never eject to main menu
+    void handled;
   } else {
-    await sock.sendMessage(chatId, {
-      text: `${header()}\n📦 #${chosen.id} is still ${progress.label.toLowerCase()}. Nothing to do yet — check back later.`,
-    });
-    outcome = 'back';
+    const progress = await getShipmentProgress(chosen);
+    if (progress.stage === 'awaiting_clearance') {
+      outcome = await runClearMenu(sock, message, chatId, userId, chosen);
+    } else {
+      await sock.sendMessage(chatId, {
+        text: `${header()}\n📦 #${chosen.id} is still ${progress.label.toLowerCase()}. Nothing to do yet — check back later.`,
+      });
+      outcome = 'back';
+    }
   }
 
   if (outcome === 'back') return runShipmentsMenu(sock, message, chatId, userId);
@@ -271,18 +295,18 @@ async function runShipmentsMenu(sock: any, message: any, chatId: string, userId:
 // ── Event Menu ───────────────────────────────────────────────────────
 
 async function runEventMenu(sock: any, message: any, chatId: string, userId: string, shipment: any, eventType: string) {
-  const config = EVENT_CONFIG[eventType];
-  if (!config) return false;
+  const cost = getEventCost(shipment, eventType);
+  const description = getEventDescription(shipment, eventType);
 
   const result = await promptMenu(sock, message, chatId, userId, {
     title: `⚠️ Shipment #${shipment.id} Event`,
     subtitle: `${shipment.goodLabel} (${shipment.countryLabel})`,
-    text: `${config.description}\n\nCost: ${formatNumber(config.cost)} coins`,
+    text: description,
     options: [
-      { label: 'Pay', value: 'pay', description: `Spend ${formatNumber(config.cost)} to resolve` },
+      { label: 'Pay', value: 'pay', description: `Spend ${formatNumber(cost)} to resolve` },
       { label: 'Decline', value: 'decline', description: 'Accept the consequences' },
     ],
-    cancelLabel: 'Skip for now',
+    cancelLabel: 'Decide later',
   });
 
   if (result.cancelled || result.timedOut) return false;
@@ -341,7 +365,7 @@ async function runClearMenu(sock: any, message: any, chatId: string, userId: str
   }
 
   const renewalMsg = clearResult.renewalSucceeded
-    ? `✅ License renewed (forced)`
+    ? `✅ License renewed (forced)\n${deltaLine(-clearResult.forcedRenewalCost)}`
     : `⚠️ License renewal failed — you must renew manually.`;
   await sock.sendMessage(chatId, {
     text:
@@ -375,8 +399,10 @@ async function runSellMenu(sock: any, message: any, chatId: string, userId: stri
     };
   }));
 
+  const events = await getEventsStatusBlock();
   const result = await promptMenu(sock, message, chatId, userId, {
     title: '🏪 GLOBAL TRADER · Sell',
+    subtitle: events || undefined,
     text: 'Which shipment are you selling?',
     options,
     cancelLabel: 'Back',
@@ -389,9 +415,20 @@ async function runSellMenu(sock: any, message: any, chatId: string, userId: stri
 
   const hubOptions = await Promise.all(
     HUBS.map(async hub => {
+      const isRestricted = !!(hub.bannedGoods && hub.bannedGoods.includes(good.key));
       const price = await getMarketPrice(good.key, hub.key);
+      if (isRestricted) {
+        const bonusPrice = Math.round(price * good.blackMarketPriceBonus);
+        const bonusGross = Math.round(bonusPrice * shipment.qty * (shipment.quality || 1));
+        const seizurePct = Math.round(good.blackMarketSeizureChance * 100);
+        return {
+          label: `${hub.label} ⚠️ black market`,
+          value: hub.key,
+          description: `Restricted here — ~${seizurePct}% confiscation risk, but ${formatNumber(bonusGross)} gross if it clears`,
+        };
+      }
       const gross = Math.round(price * shipment.qty * (shipment.quality || 1));
-      const desc = `${hub.courierRequired ? '🚚 courier fee incl.' : '🛳 port'} · ${formatNumber(price)}/unit → ${formatNumber(gross)} gross`;
+      const desc = `${hub.courierRequired ? `🚚 ${hub.courierName} fee incl.` : '🛳 port'} · ${formatNumber(price)}/unit → ${formatNumber(gross)} gross`;
       return { label: hub.label, value: hub.key, description: desc };
     })
   );
@@ -417,10 +454,12 @@ async function runSellMenu(sock: any, message: any, chatId: string, userId: stri
   }
   await sock.sendMessage(chatId, {
     text:
-      `${header()}\nSold: ${shipment.goodLabel} → ${sale.hubLabel}\n${DIVIDER}\n` +
+      `${header()}\n${sale.blackMarket ? '⚠️ Black-market sale — ' : ''}Sold: ${shipment.goodLabel} → ${sale.hubLabel}\n${DIVIDER}\n` +
+      `${sale.courierNote ? `🚚 _${sale.courierNote}_\n` : ''}` +
       `${sale.qty} × ${formatNumber(sale.unitPrice)} = ${formatNumber(sale.gross)}\n` +
       `${deltaLine(sale.gross)}\n\n` +
-      `Cost basis: ${formatNumber(sale.costBasis)}\n` +
+      `Cost basis: ${formatNumber(sale.costBasis)}` +
+      `${sale.holdingFee ? `\n_includes ${formatNumber(sale.holdingFee)} warehouse holding fee_` : ''}\n` +
       `Profit: ${deltaLine(sale.profit)} (${sale.marginPct > 0 ? '+' : ''}${sale.marginPct}%)` +
       lossNote,
   });
@@ -505,6 +544,107 @@ async function runLicenseMenu(sock: any, message: any, chatId: string, userId: s
     });
     return runLicenseMenu(sock, message, chatId, userId);
   }
+}
+
+// ── Upgrades: Clearing Agent & Warehouse ────────────────────────────────
+// This entire section was missing from the last build — restoring it here,
+// same numbered-menu + back-nav pattern as everywhere else.
+
+async function runUpgradesMenu(sock: any, message: any, chatId: string, userId: string) {
+  const equip = await getEquipment(userId);
+
+  const result = await promptMenu(sock, message, chatId, userId, {
+    title: '🛠️ GLOBAL TRADER · Upgrades',
+    subtitle: `Agent: ${equip.agent.displayName}  ·  Warehouse: ${equip.warehouse.displayName}`,
+    text: 'What do you want to upgrade?',
+    options: [
+      { label: 'Clearing Agent', value: 'agent', description: 'Better bribe odds, smaller fines if seized' },
+      { label: 'Warehouse', value: 'warehouse', description: 'More concurrent shipments, slower spoilage, cheaper holding fees' },
+    ],
+    cancelLabel: 'Back',
+  });
+
+  if (result.cancelled) return 'back';
+  if (result.timedOut || !result.value) return;
+
+  const outcome = result.value === 'agent'
+    ? await runAgentShop(sock, message, chatId, userId, equip)
+    : await runWarehouseShop(sock, message, chatId, userId, equip);
+
+  if (outcome === 'back') return runUpgradesMenu(sock, message, chatId, userId);
+  return outcome;
+}
+
+async function runAgentShop(sock: any, message: any, chatId: string, userId: string, equip: any) {
+  const options = CLEARING_AGENT_DEFS.map(a => ({
+    label: a.displayName,
+    value: a.tier,
+    description: a.cost === 0
+      ? `FREE · +${Math.round(a.bribeSuccessBonus * 100)}% bribe odds`
+      : `${formatNumber(a.cost)} coins · +${Math.round(a.bribeSuccessBonus * 100)}% bribe odds · fine -${Math.round(a.fineMultReduction * 100)}%`,
+  }));
+
+  const result = await promptMenu(sock, message, chatId, userId, {
+    title: '🕵️ Clearing Agent',
+    subtitle: `Currently: ${equip.agent.displayName}`,
+    text: 'Pick a tier to equip:',
+    options,
+    cancelLabel: 'Back',
+  });
+
+  if (result.cancelled) return 'back';
+  if (result.timedOut || !result.value) return;
+
+  if (result.value === equip.tiers.clearingAgent) {
+    await sock.sendMessage(chatId, { text: `${header()}\n_Already equipped._` });
+    return runAgentShop(sock, message, chatId, userId, equip);
+  }
+
+  const purchase = await buyEquipment(userId, 'clearingAgent', result.value);
+  if (!purchase.success) {
+    await sock.sendMessage(chatId, { text: `${header()}\n❌ ${purchase.reason}` });
+    return runAgentShop(sock, message, chatId, userId, await getEquipment(userId));
+  }
+
+  await sock.sendMessage(chatId, {
+    text: `${header()}\n✅ Equipped *${purchase.def.displayName}*!\n${deltaLine(-purchase.def.cost)}`,
+  });
+}
+
+async function runWarehouseShop(sock: any, message: any, chatId: string, userId: string, equip: any) {
+  const options = WAREHOUSE_DEFS.map(w => ({
+    label: w.displayName,
+    value: w.tier,
+    description: w.cost === 0
+      ? `FREE · ${w.capacity} concurrent · ${w.freeHoldingDays}d free storage`
+      : `${formatNumber(w.cost)} coins · ${w.capacity} concurrent · ${w.freeHoldingDays}d free storage`,
+  }));
+
+  const result = await promptMenu(sock, message, chatId, userId, {
+    title: '🏭 Warehouse',
+    subtitle: `Currently: ${equip.warehouse.displayName}`,
+    text: 'Pick a tier to equip:',
+    options,
+    cancelLabel: 'Back',
+  });
+
+  if (result.cancelled) return 'back';
+  if (result.timedOut || !result.value) return;
+
+  if (result.value === equip.tiers.warehouse) {
+    await sock.sendMessage(chatId, { text: `${header()}\n_Already equipped._` });
+    return runWarehouseShop(sock, message, chatId, userId, equip);
+  }
+
+  const purchase = await buyEquipment(userId, 'warehouse', result.value);
+  if (!purchase.success) {
+    await sock.sendMessage(chatId, { text: `${header()}\n❌ ${purchase.reason}` });
+    return runWarehouseShop(sock, message, chatId, userId, await getEquipment(userId));
+  }
+
+  await sock.sendMessage(chatId, {
+    text: `${header()}\n✅ Equipped *${purchase.def.displayName}*!\n${deltaLine(-purchase.def.cost)}`,
+  });
 }
 
 // ── Wallet ────────────────────────────────────────────────────────────
