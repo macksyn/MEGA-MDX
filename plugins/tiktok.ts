@@ -3,7 +3,7 @@ import axios from 'axios';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Use the primary discardapi for vm.tiktok.com links */
+/** Use the primary discardapi for any TikTok link */
 async function fetchPrimaryApi(url: string) {
   const apiUrl = `https://discardapi.onrender.com/api/dl/tiktok?apikey=guru&url=${encodeURIComponent(url)}`;
   const { data } = await axios.get(apiUrl, {
@@ -36,21 +36,29 @@ async function fetchPrimaryApi(url: string) {
   };
 }
 
-/** Use the Jawad API for vt.tiktok.com links (or as a fallback) */
+/** Fallback API (JawadTech) – used only when the primary fails */
 async function fetchFallbackApi(url: string) {
   const apiUrl = `https://jawad-tech.vercel.app/download/ttdl?url=${encodeURIComponent(url)}`;
+  
+  // Accept all HTTP status codes so we can read the JSON error message
   const { data } = await axios.get(apiUrl, {
     timeout: 45000,
-    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+    validateStatus: () => true   // Don't throw on 4xx / 5xx
   });
 
-  if (!data?.status || !data?.result) throw new Error('Invalid API response from fallback');
+  // Check the API's own status field
+  if (!data?.status || !data?.result) {
+    const errorMsg = data?.error || 'Unknown fallback API error';
+    throw new Error(errorMsg);
+  }
 
+  // Flat, minimal metadata – safe parsing
   const m = data.metadata || {};
   
   return {
     videoUrl:  data.result,
-    isHd:      data.quality === 'hd',   // false, but safe
+    isHd:      data.quality === 'hd',   // usually false but keep it
     author:    typeof m.author === 'string' ? m.author : (m.author?.nickname || 'Unknown'),
     username:  m.username || 'Unknown',
     region:    m.region || 'N/A',
@@ -95,20 +103,14 @@ export default {
         });
       }
 
-      // Route: prefer fallback API for vt.tiktok.com; use primary for everything else.
-      // If the primary fails for any reason, fall back automatically.
-      const isVtLink = url.includes('vt.tiktok.com');
-
       let result;
-      if (isVtLink) {
+      try {
+        // Always try the primary API first
+        result = await fetchPrimaryApi(url);
+      } catch (primaryError: any) {
+        console.log('Primary API failed, trying fallback:', primaryError.message);
+        // If primary fails, attempt the fallback API
         result = await fetchFallbackApi(url);
-      } else {
-        try {
-          result = await fetchPrimaryApi(url);
-        } catch {
-          // Primary failed — try the fallback before giving up
-          result = await fetchFallbackApi(url);
-        }
       }
 
       const {
