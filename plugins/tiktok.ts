@@ -46,20 +46,21 @@ async function fetchFallbackApi(url: string) {
 
   if (!data?.status || !data?.result) throw new Error('Invalid API response from fallback');
 
-  const m = data.metadata;
+  const m = data.metadata || {};
+  
   return {
     videoUrl:  data.result,
-    isHd:      data.quality === 'hd',
-    author:    m.author.nickname,
-    username:  m.author.username,
-    region:    m.region,
-    duration:  `${m.duration}s`,
-    likes:     m.stats.likes,
-    comments:  m.stats.comments,
-    shares:    m.stats.shares,
-    views:     m.stats.views,
-    sound:     `${m.music.title} – ${m.music.author}`,
-    posted:    m.published,
+    isHd:      data.quality === 'hd',   // false, but safe
+    author:    typeof m.author === 'string' ? m.author : (m.author?.nickname || 'Unknown'),
+    username:  m.username || 'Unknown',
+    region:    m.region || 'N/A',
+    duration:  m.duration ? `${m.duration}s` : 'N/A',
+    likes:     m.stats?.likes ?? 0,
+    comments:  m.stats?.comments ?? 0,
+    shares:    m.stats?.shares ?? 0,
+    views:     m.stats?.views ?? 0,
+    sound:     m.music ? `${m.music.title || 'Unknown'} – ${m.music.author || ''}` : 'N/A',
+    posted:    m.published || 'N/A',
     title:     m.title || 'No caption'
   };
 }
