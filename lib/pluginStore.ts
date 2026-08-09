@@ -28,6 +28,7 @@ interface PluginStore {
   has(key: string): Promise<boolean>;
   getOrDefault(key: string, defaultValue: any): Promise<any>;
   patch(key: string, patch: Record<string, any>): Promise<void>;
+  mutate<T = any>(key: string, updater: (current: any) => T | Promise<T>): Promise<T>;
   table?(name: string): PluginStore;
   readonly namespace:     string;
   readonly tableName:     string | null;
@@ -356,6 +357,24 @@ async function _initAdapter(): Promise<Adapter> {
   };
 }
 
+// ── Per-key mutex to prevent lost updates on concurrent read→modify→write ────
+// get() and set() are independent round trips to the adapter — even the file
+// adapter's per-table queue only serializes individual calls, not a get+set
+// PAIR as one unit. Two concurrent callers can both read the same key before
+// either has written back, and whichever set() lands last silently overwrites
+// the other's change (e.g. a debit getting reverted by an unrelated identity
+// sync that read the wallet a moment earlier). mutate() — and patch(), which
+// is now built on it — hold a lock for the full read-modify-write cycle so
+// concurrent callers on the same key are serialized instead of racing.
+const keyLocks = new Map<string, Promise<any>>();
+
+function withKeyLock<T>(lockKey: string, task: () => Promise<T>): Promise<T> {
+  const previous = keyLocks.get(lockKey) || Promise.resolve();
+  const next = previous.then(task, task); // keep the chain moving even if a task throws
+  keyLocks.set(lockKey, next);
+  return next;
+}
+
 // ── Core store factory ────────────────────────────────────────────────────────
 function makeStore(namespace: string, tableName: string | undefined, isRoot: boolean): PluginStore {
   const physical = physicalName(namespace, tableName);
@@ -414,9 +433,23 @@ function makeStore(namespace: string, tableName: string | undefined, isRoot: boo
     },
 
     async patch(key, patch) {
-      // Re-routed through adapter implementation steps to safely keep transactional chains locked
-      const existing = (await this.get(key)) || {};
-      await this.set(key, { ...existing, ...patch });
+      const lockKey = `${physical}::${key}`;
+      await withKeyLock(lockKey, async () => {
+        const existing = (await this.get(key)) || {};
+        await this.set(key, { ...existing, ...patch });
+      });
+    },
+
+    async mutate(key, updater) {
+      // Same lock as patch() (keyed by physical table + key), so a patch()
+      // call and a mutate() call on the same record can never interleave.
+      const lockKey = `${physical}::${key}`;
+      return withKeyLock(lockKey, async () => {
+        const current = await this.get(key);
+        const updated = await updater(current);
+        await this.set(key, updated);
+        return updated;
+      });
     },
 
     get namespace()     { return namespace; },

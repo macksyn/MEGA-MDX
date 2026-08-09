@@ -180,6 +180,27 @@ async function saveWallet(userId: string, wallet: Wallet): Promise<Wallet> {
   return wallet;
 }
 
+/**
+ * Atomic read-modify-write for a wallet. Holds pluginStore's per-key lock for
+ * the ENTIRE get→mutate→save cycle (not just the save), so two concurrent
+ * callers touching the same wallet — a transfer racing an identity sync, two
+ * transfers landing back to back, a purchase racing a payout — can't both read
+ * the same starting balance and silently stomp on each other. Applies the same
+ * defaulting (EMPTY_WALLET merge) and peak-tracking that getWallet()/
+ * saveWallet() do, so it's a drop-in atomic replacement for that pair anywhere
+ * a function currently does `const w = await getWallet(id); mutate w; await
+ * saveWallet(id, w);`.
+ */
+async function mutateWallet(userId: string, mutator: (wallet: Wallet) => void | Promise<void>): Promise<Wallet> {
+  return wallets.mutate(userId, async (raw: Partial<Wallet> | null) => {
+    const wallet: Wallet = raw ? { ...EMPTY_WALLET, ...raw } : { ...EMPTY_WALLET };
+    if (wallet.peakCoins < wallet.coins) wallet.peakCoins = wallet.coins; // same self-heal as getWallet()
+    await mutator(wallet);
+    if (wallet.coins > wallet.peakCoins) wallet.peakCoins = wallet.coins; // same peak-tracking as saveWallet()
+    return wallet;
+  });
+}
+
 // ── Identity recognition (name + phone) ──────────────────────────────────────
 // Every economy wallet is keyed by a normalized JID, which on its own is
 // unrecognizable (raw digits, or a @lid identifier that isn't even a real
@@ -384,10 +405,10 @@ async function applyGarnishment(userId: string, amount: number, meta: Transactio
 export async function addCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<Wallet> {
   const { credited, garnished } = await applyGarnishment(userId, amount, meta);
 
-  const wallet = await getWallet(userId);
-  wallet.coins += credited;
-  if (credited > 0) wallet.lifetimeCoinsEarned += credited;
-  const saved = await saveWallet(userId, wallet);
+  const saved = await mutateWallet(userId, wallet => {
+    wallet.coins += credited;
+    if (credited > 0) wallet.lifetimeCoinsEarned += credited;
+  });
   await logTransaction(userId, {
     currency: 'coins', amount: credited, balanceAfter: saved.coins, type: meta.type || 'admin_credit', ...meta,
     ...(garnished > 0 ? { note: `${meta.note ? meta.note + ' · ' : ''}${garnished} garnished toward defaulted loan` } : {}),
@@ -396,36 +417,46 @@ export async function addCoins(userId: string, amount: number, meta: Transaction
 }
 
 export async function addGroqCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<Wallet> {
-  const wallet = await getWallet(userId);
-  wallet.groqCoins += amount;
-  if (amount > 0) wallet.lifetimeGroqCoinsEarned += amount;
-  const saved = await saveWallet(userId, wallet);
+  const saved = await mutateWallet(userId, wallet => {
+    wallet.groqCoins += amount;
+    if (amount > 0) wallet.lifetimeGroqCoinsEarned += amount;
+  });
   await logTransaction(userId, { currency: 'groqCoins', amount, balanceAfter: saved.groqCoins, type: meta.type || 'admin_credit', ...meta });
   return saved;
 }
 
 export async function deductCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<{ success: boolean; wallet: Wallet }> {
-  const wallet = await getWallet(userId);
-  if (wallet.coins < amount) return { success: false, wallet };
-  wallet.coins -= amount;
-  const saved = await saveWallet(userId, wallet);
+  // The sufficient-funds check and the decrement happen inside the SAME
+  // locked mutateWallet cycle, so two concurrent deductions for this user
+  // can't both read the same starting balance and both pass the check
+  // (the classic double-spend version of this bug — see the transfer race).
+  let success = false;
+  const saved = await mutateWallet(userId, wallet => {
+    if (wallet.coins < amount) return; // insufficient funds — leave the wallet untouched
+    wallet.coins -= amount;
+    success = true;
+  });
+  if (!success) return { success: false, wallet: saved };
   await logTransaction(userId, { currency: 'coins', amount: -amount, balanceAfter: saved.coins, type: meta.type || 'admin_debit', ...meta });
   return { success: true, wallet: saved };
 }
 
 export async function deductGroqCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<{ success: boolean; wallet: Wallet }> {
-  const wallet = await getWallet(userId);
-  if (wallet.groqCoins < amount) return { success: false, wallet };
-  wallet.groqCoins -= amount;
-  const saved = await saveWallet(userId, wallet);
+  let success = false;
+  const saved = await mutateWallet(userId, wallet => {
+    if (wallet.groqCoins < amount) return;
+    wallet.groqCoins -= amount;
+    success = true;
+  });
+  if (!success) return { success: false, wallet: saved };
   await logTransaction(userId, { currency: 'groqCoins', amount: -amount, balanceAfter: saved.groqCoins, type: meta.type || 'admin_debit', ...meta });
   return { success: true, wallet: saved };
 }
 
 export async function addExchange(userId: string, amount = 1): Promise<Wallet> {
-  const wallet = await getWallet(userId);
-  wallet.exchangeCount += amount;
-  return saveWallet(userId, wallet);
+  return mutateWallet(userId, wallet => {
+    wallet.exchangeCount += amount;
+  });
 }
 
 const LEVEL_DEFS = [
