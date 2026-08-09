@@ -88,7 +88,8 @@ export default {
     const prefix      = rawText.match(/^[.!#]/)?.[0] || '.';
     const commandPart = rawText.slice(prefix.length).trim();
     const parts       = commandPart.split(/\s+/);
-    const url         = parts.slice(1).join(' ').trim();
+    const url         = args[0]?.trim();
+ // const url         = parts.slice(1).join(' ').trim();
 
     if (!url) {
       return await sock.sendMessage(chatId, {
