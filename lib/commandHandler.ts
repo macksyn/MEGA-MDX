@@ -125,7 +125,7 @@ class CommandHandler {
 
       if (this.disabledCommands.has(cmdKey)) {
         return await sock.sendMessage(message.key.remoteJid, {
-          text: `🚫 The command *${cmdKey}* is currently disabled.`
+          text: `🚫 Sorry, *${cmdKey}* is temporarily unavailable for general maintenance. We will be back online soon!`
         }, { quoted: message });
       }
 
