@@ -72,8 +72,8 @@ const loansTbl = root.table('loans'); // userId -> Loan[] (full history, most re
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
-export const INTEREST_RATE = 0.10; // 10% weekly, compounding
-export const GRACE_PERIOD_MS = 3 * DAY_MS; // grace window past due before default
+export const INTEREST_RATE = 0.20; // 20% weekly, compounding
+export const GRACE_PERIOD_MS = 1 * DAY_MS; // grace window past due before default
 export const DUE_SOON_WINDOW_MS = DAY_MS; // reminder fires when a loan is within this window of dueAt
 export const GARNISHMENT_RATE = 0.50; // share of each future earning diverted to a defaulted balance
 export const MIN_LOAN_AMOUNT = 100;
@@ -94,10 +94,10 @@ export interface LoanTier {
 }
 
 export const LOAN_TIERS: LoanTier[] = [
-  { name: 'Starter',     minAccountAgeMs: 3  * DAY_MS, minPatronage: 100,   minPeakBalance: 150,   minRepaidStreak: 0, baseMaxAmount: 300,  termWeeks: 1 },
-  { name: 'Established', minAccountAgeMs: 7  * DAY_MS, minPatronage: 1000,  minPeakBalance: 800,   minRepaidStreak: 1, baseMaxAmount: 1000, termWeeks: 2 },
-  { name: 'Trusted',     minAccountAgeMs: 14 * DAY_MS, minPatronage: 5000,  minPeakBalance: 3000,  minRepaidStreak: 3, baseMaxAmount: 3000, termWeeks: 2 },
-  { name: 'Elite',       minAccountAgeMs: 30 * DAY_MS, minPatronage: 20000, minPeakBalance: 10000, minRepaidStreak: 6, baseMaxAmount: 8000, termWeeks: 3 },
+  { name: 'Starter',     minAccountAgeMs: 3  * DAY_MS, minPatronage: 100,   minPeakBalance: 150,   minRepaidStreak: 0, baseMaxAmount: 100,  termWeeks: 1 },
+  { name: 'Established', minAccountAgeMs: 7  * DAY_MS, minPatronage: 1000,  minPeakBalance: 800,   minRepaidStreak: 1, baseMaxAmount: 300, termWeeks: 2 },
+  { name: 'Trusted',     minAccountAgeMs: 14 * DAY_MS, minPatronage: 5000,  minPeakBalance: 3000,  minRepaidStreak: 3, baseMaxAmount: 5000, termWeeks: 2 },
+  { name: 'Elite',       minAccountAgeMs: 30 * DAY_MS, minPatronage: 20000, minPeakBalance: 10000, minRepaidStreak: 6, baseMaxAmount: 1000, termWeeks: 3 },
 ];
 
 // ── Types ────────────────────────────────────────────────────────────────────
