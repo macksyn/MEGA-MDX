@@ -9,7 +9,9 @@ export const cooldown = 3000;
 async function _handler(sock: any, message: any, args: string[], context: any) {
   const { chatId, channelInfo } = context;
   const type = (args[0] || 'coins').toLowerCase() === 'groqcoins' ? 'groqcoins' : 'coins';
-  const emoji = type === 'coins' ? '🪙' : '💲';
+  const isCoins = type === 'coins';
+  const emoji = isCoins ? '🪙' : '💲';
+  const label = isCoins ? 'Coins' : 'Groq Coins';
 
   const top = await getLeaderboard(type as any, 10);
 
@@ -17,7 +19,9 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     return sock.sendMessage(chatId, { text: '📭 No wallets yet — start earning by submitting your attendance or with *!work*!', ...channelInfo }, { quoted: message });
   }
 
-  const medals = ['🥇', '🥈', '🥉'];
+  // Medal for top 3, keycap number emoji for the rest — keeps every rank
+  // visually distinct without falling back to plain "4." text.
+  const RANK_ICONS = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
 
   // entry.userId is a cleanJid()'d key — bare digits, domain already
   // stripped, so it can never be safely turned back into a mention JID by
@@ -26,13 +30,13 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   // the only reliable source for a mention here.
   const wallets = await Promise.all(top.map(entry => getWallet(entry.userId)));
 
+  // Just the mention + their coins — the mention pill already shows their
+  // name, so printing it again in text before @number was pure duplication.
   const lines = top.map((entry, i) => {
     const w = wallets[i];
-    const label = w?.name ? `${w.name} ` : '';
-    // Display number: prefer the resolved real phone; entry.userId as a
-    // last resort may actually be a LID number, not a phone number, if this
-    // wallet has never been synced with a raw JID.
-    return `${medals[i] || `${i + 1}.`} ${label}@${w?.phone || entry.userId} — ${formatNumber(entry.amount)} ${emoji}`;
+    const number = w?.phone || entry.userId; // last-resort: may be a LID, not a real phone, until they run an economy command once
+    const rankIcon = RANK_ICONS[i] || `${i + 1}.`;
+    return `${rankIcon} @${number} ┈ ${emoji} *${formatNumber(entry.amount)}*`;
   });
 
   // Wallets that predate this fix (or that have never triggered an economy
@@ -41,11 +45,19 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   // economy command once (that alone will populate .jid going forward).
   const mentions = top.map((entry, i) => wallets[i]?.jid || `${entry.userId}@s.whatsapp.net`);
 
-  await sock.sendMessage(chatId, {
-    text: `🏆 *${type === 'coins' ? 'Coins' : 'Groq Coins'} Leaderboard*\n\n${lines.join('\n')}`,
-    mentions,
-    ...channelInfo
-  }, { quoted: message });
+  const divider = '┈'.repeat(24);
+  const tip = isCoins
+    ? '_Run *.exchange* to convert coins into Groq Coins_'
+    : '_Cash out anytime with *.withdraw* once you hit the threshold_';
+
+  const text =
+    `🏆 *${label.toUpperCase()} LEADERBOARD*\n` +
+    `${divider}\n\n` +
+    lines.join('\n') +
+    `\n\n${divider}\n` +
+    `${tip}`;
+
+  await sock.sendMessage(chatId, { text, mentions, ...channelInfo }, { quoted: message });
 }
 
 export const handler = withEconomyGuard(_handler);
