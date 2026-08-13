@@ -698,7 +698,7 @@ export async function awardAttendanceBonus(
   streak: number
 ): Promise<
   | { success: false; reason: 'already_awarded_today' }
-  | { success: true; reward: number; garnished: number; capped: boolean }
+  | { success: true; reward: number; garnished: number; capped: boolean; levelGated: boolean }
 > {
   const wallet = await getWallet(userId);
   const today = todayStr();
@@ -707,6 +707,19 @@ export async function awardAttendanceBonus(
     // Already credited today — attendance.ts already blocks a second
     // submission on the same day, this is just a defensive double-check.
     return { success: false, reason: 'already_awarded_today' };
+  }
+
+  // Attendance coin bonuses are restricted to level 2+ (economy exchangeCount
+  // level, see getLevelInfo/LEVEL_DEFS). Level 1 members still get their
+  // attendance recorded — streak and lastDailyDate update as normal — they
+  // just don't get paid out. No message/flag is surfaced to the user about
+  // this; attendance.ts simply omits the bonus line when levelGated is true.
+  const { levelNumber } = getLevelInfo(wallet.exchangeCount);
+  if (levelNumber < 2) {
+    wallet.dailyStreak = streak;
+    wallet.lastDailyDate = today;
+    await saveWallet(userId, wallet);
+    return { success: true, reward: 0, garnished: 0, capped: false, levelGated: true };
   }
 
   const pool = await getJackpotPool();
@@ -736,7 +749,7 @@ export async function awardAttendanceBonus(
     note: `streak: ${streak}${capped ? ' (capped — bank reserve low)' : ''}${garnished > 0 ? ` · ${garnished} garnished toward defaulted loan` : ''}`,
   });
 
-  return { success: true, reward: credited, garnished, capped };
+  return { success: true, reward: credited, garnished, capped, levelGated: false };
 }
 
 // ── Work command (cooldown-based random payout) ──────────────────────────────
