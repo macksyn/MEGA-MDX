@@ -9,15 +9,17 @@
  * protected floor, today's actual inflow/outflow, and (for admins) the
  * internal health signals driving the RTP ceiling.
  *
- * NOTE: assumes lib/isOwner.js exports `isOwner(userId): boolean`. Adjust the
- * import below if your actual export name/signature differs.
+ * Admin gate uses isOwnerOrSudo(senderId, sock, chatId) — the default export
+ * from lib/isOwner.js — rather than isOwnerOnly, since isOwnerOnly doesn't
+ * check the sudo list and can't resolve a group @lid identity back to the
+ * owner's real number.
  */
 import { withEconomyGuard, formatNumber } from '../lib/economy.js';
 import {
   getJackpotPool, getTodayStats, getSolvencyState, getHouseMood,
   TARGET_RTP, HARD_CEILING_RTP, EMERGENCY_CEILING_RTP,
 } from '../lib/slotMachine.js';
-import { cleanJid, isOwnerOnly } from '../lib/isOwner.js';
+import isOwnerOrSudo, { cleanJid } from '../lib/isOwner.js';
 import { checkEligibility } from '../lib/loans.js';
 
 export const command = 'reserve';
@@ -51,7 +53,11 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const wantsAdmin = (args[0] || '').toLowerCase() === 'admin';
 
   if (wantsAdmin) {
-    if (!isOwnerOnly(userId)) {
+    // Pass the raw senderId (not the pre-cleaned userId) plus sock/chatId so
+    // isOwnerOrSudo can resolve a group @lid identity back to the owner's
+    // real number, and so sudo users are recognized too — isOwnerOnly alone
+    // misses both of those.
+    if (!(await isOwnerOrSudo(senderId, sock, chatId))) {
       return sock.sendMessage(chatId, {
         text: `❌ That view is for admins only.`,
         ...channelInfo

@@ -16,7 +16,7 @@ import { cleanJid } from '../lib/isOwner.js';
 import { extractTargetId } from '../lib/resolveTarget.js';
 
 export const command = 'history';
-export const aliases = ['txns', 'ledger'];
+export const aliases = ['statement', 'ledger'];
 export const category = 'economy';
 export const cooldown = 3000;
 
