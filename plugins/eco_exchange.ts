@@ -82,10 +82,11 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
   // If this exchange happened to settle a reciprocal debt (target had
   // previously sent to sender and was still owed one back), say so instead
-  // of the generic nudge — closes the loop visibly for the group.
+  // of the generic nudge — closes the loop visibly for the group. Show the
+  // coin amount either way: the amount just settled, or the amount now owed.
   const followUp = result.debtResolved
-    ? `_That settles a reciprocal exchange you owed @${targetPhone} — nice!_`
-    : `_Ask them to run !exchange on you to get your own Groq Coins back! Check with *.exchange owed*_`;
+    ? `✅ _That settles the reciprocal exchange you owed @${targetPhone}${result.debtResolvedAmount ? ` (${formatNumber(result.debtResolvedAmount)} coins)` : ''} — debt cleared!_`
+    : `💳 _@${targetPhone} now owes you a reciprocal exchange (${formatNumber(result.coinsSpent)} coins). Check with *.exchange owed*_`;
 
   await sock.sendMessage(chatId, {
     text:
@@ -110,16 +111,22 @@ async function handleOwed(sock: any, chatId: string, message: any, userId: strin
     }, { quoted: message });
   }
 
-  // Group each list by counterparty id (a person can owe more than once).
-  const countBy = (ids: string[]) => ids.reduce((acc: Record<string, number>, id) => {
-    acc[id] = (acc[id] || 0) + 1;
-    return acc;
-  }, {});
+  // Aggregate each list by counterparty id (a person can owe more than
+  // once) — track both how many pending debts and the total coins involved,
+  // so the amount owed is visible, not just the fact that something's owed.
+  const aggregateBy = (entries: Array<{ amount: number }>, idOf: (e: any) => string) =>
+    entries.reduce((acc: Record<string, { count: number; total: number }>, entry: any) => {
+      const id = idOf(entry);
+      if (!acc[id]) acc[id] = { count: 0, total: 0 };
+      acc[id].count += 1;
+      acc[id].total += entry.amount;
+      return acc;
+    }, {});
 
-  const owedToMeCounts = countBy(owedToMe.map(d => d.debtorId));
-  const iOweCounts = countBy(iOwe.map(d => d.creditorId));
+  const owedToMeAgg = aggregateBy(owedToMe, d => d.debtorId);
+  const iOweAgg = aggregateBy(iOwe, d => d.creditorId);
 
-  const allIds = Array.from(new Set([...Object.keys(owedToMeCounts), ...Object.keys(iOweCounts)]));
+  const allIds = Array.from(new Set([...Object.keys(owedToMeAgg), ...Object.keys(iOweAgg)]));
   const wallets = await Promise.all(allIds.map(id => getWallet(id)));
   const walletById: Record<string, any> = {};
   allIds.forEach((id, i) => { walletById[id] = wallets[i]; });
@@ -136,18 +143,18 @@ async function handleOwed(sock: any, chatId: string, message: any, userId: strin
 
   let text = `🔄 *EXCHANGE STATUS*\n\n`;
 
-  if (Object.keys(owedToMeCounts).length > 0) {
+  if (Object.keys(owedToMeAgg).length > 0) {
     text += `*People who owe you a reciprocal exchange:*\n`;
-    text += Object.entries(owedToMeCounts)
-      .map(([id, count]) => `• ${displayFor(id)}${count > 1 ? ` (x${count})` : ''}`)
+    text += Object.entries(owedToMeAgg)
+      .map(([id, { count, total }]) => `• ${displayFor(id)} — ${formatNumber(total)} coins${count > 1 ? ` (${count} pending)` : ''}`)
       .join('\n');
     text += `\n\n`;
   }
 
-  if (Object.keys(iOweCounts).length > 0) {
+  if (Object.keys(iOweAgg).length > 0) {
     text += `*People you still owe a reciprocal exchange:*\n`;
-    text += Object.entries(iOweCounts)
-      .map(([id, count]) => `• ${displayFor(id)}${count > 1 ? ` (x${count})` : ''}`)
+    text += Object.entries(iOweAgg)
+      .map(([id, { count, total }]) => `• ${displayFor(id)} — ${formatNumber(total)} coins${count > 1 ? ` (${count} pending)` : ''}`)
       .join('\n');
   }
 
