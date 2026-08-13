@@ -2,7 +2,7 @@
 /***
  * lib/loans.ts
  *
- * Loan engine backing !loan. Loans are disbursed FROM and repaid TO the same
+ * Loan engine backing the loan command. Loans are disbursed FROM and repaid TO the same
  * jackpot bank that backs !slots/!coinflip/!dice (see lib/slotMachine.ts) —
  * NOT minted, NOT a separate isolated pool. Disbursement is a bank payout
  * capped by solvency exactly like the attendance bonus (settleWin); repayment
@@ -363,7 +363,7 @@ export interface LoanBookStats {
 /**
  * NOTE: active loan balances here reflect whatever was last persisted —
  * interest only accrues (and gets written back) when a user's own loan is
- * read via getLoanHistory/getActiveLoan. A borrower who hasn't checked !loan
+ * read via getLoanHistory/getActiveLoan. A borrower who hasn't checked the loan command
  * in a while may show a slightly stale (lower than true) balance here. This
  * is a display quirk, not a real accounting gap — their actual balance
  * catches up the moment they or an admin next reads it.
