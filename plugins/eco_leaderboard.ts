@@ -30,20 +30,29 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   // the only reliable source for a mention here.
   const wallets = await Promise.all(top.map(entry => getWallet(entry.userId)));
 
+  // CRITICAL: WhatsApp only renders "@digits" in the text as a tappable
+  // mention when those exact digits match an entry in `mentions`. For @lid
+  // wallets, the LID number and the real phone number are two totally
+  // different numbers — showing wallet.phone in the text while mentioning
+  // by wallet.jid (or vice versa) is a guaranteed mismatch, and WhatsApp
+  // silently falls back to plain text. So the number shown MUST be pulled
+  // from the exact same JID used in the mentions array, never from a
+  // separately-resolved field like wallet.phone.
+  const mentionJids = top.map((entry, i) => wallets[i]?.jid || `${entry.userId}@s.whatsapp.net`);
+
   // Just the mention + their coins — the mention pill already shows their
   // name, so printing it again in text before @number was pure duplication.
   const lines = top.map((entry, i) => {
-    const w = wallets[i];
-    const number = w?.phone || entry.userId; // last-resort: may be a LID, not a real phone, until they run an economy command once
+    const displayNumber = mentionJids[i].split('@')[0];
     const rankIcon = RANK_ICONS[i] || `${i + 1}.`;
-    return `${rankIcon} @${number} ┈ ${emoji} *${formatNumber(entry.amount)}*`;
+    return `${rankIcon} @${displayNumber} ┈ ${emoji} *${formatNumber(entry.amount)}*`;
   });
 
   // Wallets that predate this fix (or that have never triggered an economy
   // command since) won't have .jid yet — for those we fall back to the old
   // guess, which will keep failing for @lid users until they run any
   // economy command once (that alone will populate .jid going forward).
-  const mentions = top.map((entry, i) => wallets[i]?.jid || `${entry.userId}@s.whatsapp.net`);
+  const mentions = mentionJids;
 
   const divider = '┈'.repeat(24);
   const tip = isCoins
