@@ -100,7 +100,7 @@ async function sendLoanDetails(sock, message, chatId, channelInfo, loan) {
       `┏━━━ 💳 *ACTIVE LOAN* ━━━┓\n\n` +
       `Tier: *${loan.tier}*\n` +
       `Borrowed: ${formatNumber(loan.principal)} coins\n` +
-      `Owed now: *${formatNumber(loan.balance)} coins* _(20% standard interest; defaulted loans add 5% daily after grace)_\n\n` +
+      `Owed now: *${formatNumber(loan.balance)} coins* _(20% standard interest included; defaulted loans add 5% daily after grace)_\n\n` +
       `Repaid so far  ${bar(paidPct)} ${paidPct.toFixed(0)}%\n\n` +
       `${dueLabel(loan)}\n\n` +
       `┗━━━━━━━━━━━━━━━━━━┛\n` +
@@ -143,7 +143,7 @@ async function sendTiersInfo(sock, message, chatId, channelInfo) {
     text:
       `💳 *HOW LOAN TIERS WORK* 💳\n\n` +
       lines.join('\n\n') +
-      `\n\n_Level 2 is the minimum to qualify. Loans expire after 7 days with a 1-day grace period. Standard interest is ${(INTEREST_RATE * 100).toFixed(0)}%; after grace, defaulters are charged an additional ${(DEFAULT_INTEREST_RATE * 100).toFixed(0)}% daily until fully repaid. Each loan fully repaid by its due date adds +15% capacity (capped at 2x); late repayments and defaults do not increase your limit._`,
+      `\n\n_Level 2 is the minimum to qualify. Loans expire after 7 days with a 1-day grace period. The ${(INTEREST_RATE * 100).toFixed(0)}% standard interest is included upfront, even for same-day repayment. After grace, defaulters are charged an additional ${(DEFAULT_INTEREST_RATE * 100).toFixed(0)}% daily until fully repaid. Each loan fully repaid by its due date adds +15% capacity (capped at 2x); late repayments and defaults do not increase your limit._`,
     ...channelInfo
   }, { quoted: message });
 }
@@ -174,7 +174,7 @@ async function doApply(sock, message, chatId, channelInfo, userId, amount) {
         `✅ *LOAN APPROVED* ✅\n\n` +
         `${formatNumber(l.principal)} coins deposited into your wallet.\n\n` +
         `Tier: ${l.tier}\n` +
-        `Interest: ${(INTEREST_RATE * 100).toFixed(0)}% standard; defaulters add ${(DEFAULT_INTEREST_RATE * 100).toFixed(0)}% daily after grace\n` +
+        `Interest: ${(INTEREST_RATE * 100).toFixed(0)}% standard included upfront; defaulters add ${(DEFAULT_INTEREST_RATE * 100).toFixed(0)}% daily after grace\n` +
         `Due: 7 days from now, followed by 1 day grace\n\n` +
         `Check anytime with !loan · repay with !loan repay <amount>`,
       ...channelInfo

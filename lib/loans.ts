@@ -38,11 +38,12 @@
  * count as an on-time repayment because the loan was not actually repaid.
  *
  * ── Interest ──────────────────────────────────────────────────────────────
- * The standard loan interest is 20%, applied at the 7-day due point. The
- * 1-day grace period does not add another standard-interest charge. Once
- * grace expires, a defaulted balance also compounds at an additional 5% per
- * day until fully repaid. Accrual is lazy, so it is applied whenever the loan
- * is read or an earning is garnished.
+ * The standard loan interest is a fixed 20% charge included at issuance, so
+ * even same-day repayment includes it. The 1-day grace period does not add
+ * another standard-interest charge. Once grace expires, a defaulted balance
+ * also compounds at an additional 5% per day until fully repaid. Default
+ * accrual is lazy, so it is applied whenever the loan is read or an earning
+ * is garnished.
  */
 import { createStore } from './pluginStore.js';
 import { getWallet, getLevelInfo, addCoins, deductCoins, registerGarnishmentHandler, type TransactionMeta } from './economy.js';
@@ -53,7 +54,7 @@ const loansTbl = root.table('loans'); // userId -> Loan[] (full history, most re
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
-export const INTEREST_RATE = 0.20; // standard loan interest at the 7-day due point
+export const INTEREST_RATE = 0.20; // fixed standard loan interest at issuance
 export const DEFAULT_INTEREST_RATE = 0.05; // additional daily interest after grace
 export const GRACE_PERIOD_MS = 1 * DAY_MS; // grace window past due before default
 export const DUE_SOON_WINDOW_MS = DAY_MS; // reminder fires when a loan is within this window of dueAt
@@ -84,8 +85,9 @@ export interface Loan {
   id: string;
   userId: string;
   principal: number;
-  balance: number;          // current outstanding, incl. compounded interest
+  balance: number;          // current outstanding, incl. standard + default interest
   interestRate: number;
+  standardInterestApplied?: boolean; // fixed 20% charge applied at issuance
   issuedAt: number;
   dueAt: number;
   lastAccrualAt: number;
@@ -137,20 +139,17 @@ function accrue(loan: Loan): Loan {
   const cutoff = loan.dueAt + GRACE_PERIOD_MS;
   const now = Date.now();
 
-  const standardEffectiveNow = Math.min(now, cutoff);
-  const standardPeriods = Math.max(
-    0,
-    Math.floor((standardEffectiveNow - loan.lastAccrualAt) / WEEK_MS)
-  );
-
-  // Normalize older loans to the current standard policy. Their existing
-  // balance is preserved; future accrual follows the rules above.
-  loan.interestRate = INTEREST_RATE;
-
-  if (standardPeriods > 0 && loan.balance > 0) {
-    loan.balance = Math.round(loan.balance * Math.pow(1 + INTEREST_RATE, standardPeriods));
-    loan.lastAccrualAt += standardPeriods * WEEK_MS;
+  // New loans include the fixed 20% standard charge immediately, so early
+  // repayment cannot avoid it. Older loans created before this flag existed
+  // are migrated on first read; loans that already reached their due point
+  // have already received the old standard charge.
+  if (!loan.standardInterestApplied) {
+    if (loan.lastAccrualAt < loan.dueAt && loan.balance > 0) {
+      loan.balance = Math.round(loan.balance * (1 + INTEREST_RATE));
+    }
+    loan.standardInterestApplied = true;
   }
+  loan.interestRate = INTEREST_RATE;
 
   if (now > cutoff && loan.balance > 0) {
     loan.status = 'defaulted';
@@ -173,9 +172,9 @@ export async function getLoanHistory(userId: string): Promise<Loan[]> {
 
   const updated = list.map(l => {
     if (l.status !== 'active' && l.status !== 'defaulted') return l;
-    const before = `${l.balance}:${l.status}:${l.lastAccrualAt}:${l.interestRate}`;
+    const before = `${l.balance}:${l.status}:${l.lastAccrualAt}:${l.interestRate}:${l.standardInterestApplied}`;
     const accrued = accrue({ ...l });
-    if (`${accrued.balance}:${accrued.status}:${accrued.lastAccrualAt}:${accrued.interestRate}` !== before) mutated = true;
+    if (`${accrued.balance}:${accrued.status}:${accrued.lastAccrualAt}:${accrued.interestRate}:${accrued.standardInterestApplied}` !== before) mutated = true;
     return accrued;
   });
 
@@ -269,12 +268,14 @@ export async function applyForLoan(userId: string, requestedAmount: number): Pro
   await deductFromJackpot(amount);
 
   const now = Date.now();
+  const standardInterest = Math.round(amount * INTEREST_RATE);
   const loan: Loan = {
     id: `loan_${now}_${Math.random().toString(36).slice(2, 8)}`,
     userId,
     principal: amount,
-    balance: amount,
+    balance: amount + standardInterest,
     interestRate: INTEREST_RATE,
+    standardInterestApplied: true,
     issuedAt: now,
     dueAt: now + eligibility.tier!.termWeeks * WEEK_MS,
     lastAccrualAt: now,
