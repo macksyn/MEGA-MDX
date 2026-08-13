@@ -37,15 +37,11 @@
  * Admin forgiveness ('forgiven') stops garnishment immediately, but does not
  * count as an on-time repayment because the loan was not actually repaid.
  *
- * ── Interest is capped, not indefinite ───────────────────────────────────
- * Interest compounds weekly on the outstanding balance, but accrual is
- * capped at (dueAt + GRACE_PERIOD_MS) — the moment a loan would default.
- * Without this cap, a loan nobody checks in on would keep silently
- * compounding between reads indefinitely, so someone who forgets about it
- * for two months could come back to a wildly inflated balance they never
- * had a chance to see grow or pay down in time. Capping it bounds the
- * worst case to what they'd have seen if they'd checked right at the
- * deadline.
+ * ── Interest ──────────────────────────────────────────────────────────────
+ * There is no interest during the 7-day term or the 1-day grace period.
+ * After grace expires, the outstanding balance compounds at 5% per day until
+ * the loan is fully repaid. Accrual is lazy, so it is applied whenever the
+ * loan is read or an earning is garnished.
  */
 import { createStore } from './pluginStore.js';
 import { getWallet, getLevelInfo, addCoins, deductCoins, registerGarnishmentHandler, type TransactionMeta } from './economy.js';
@@ -56,7 +52,9 @@ const loansTbl = root.table('loans'); // userId -> Loan[] (full history, most re
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
-export const INTEREST_RATE = 0.20; // 20% weekly, compounding
+export const DAILY_INTEREST_RATE = 0.05; // 5% daily after the grace period
+// Kept as an alias for callers that already import INTEREST_RATE.
+export const INTEREST_RATE = DAILY_INTEREST_RATE;
 export const GRACE_PERIOD_MS = 1 * DAY_MS; // grace window past due before default
 export const DUE_SOON_WINDOW_MS = DAY_MS; // reminder fires when a loan is within this window of dueAt
 export const GARNISHMENT_RATE = 0.50; // share of each future earning diverted to a defaulted balance
@@ -134,18 +132,25 @@ function computeRepaidStreak(history: Loan[]): number {
 // ── Interest accrual (lazy — computed on read, no cron dependency) ──────────
 
 function accrue(loan: Loan): Loan {
-  if (loan.status !== 'active') return loan;
+  if (loan.status !== 'active' && loan.status !== 'defaulted') return loan;
 
   const cutoff = loan.dueAt + GRACE_PERIOD_MS;
-  const effectiveNow = Math.min(Date.now(), cutoff);
-  const weeksElapsed = Math.floor((effectiveNow - loan.lastAccrualAt) / WEEK_MS);
+  const now = Date.now();
+  const dailyAccrualStart = Math.max(loan.lastAccrualAt, cutoff);
+  const daysElapsed = now > cutoff
+    ? Math.floor((now - dailyAccrualStart) / DAY_MS)
+    : 0;
 
-  if (weeksElapsed > 0) {
-    loan.balance = Math.round(loan.balance * Math.pow(1 + loan.interestRate, weeksElapsed));
-    loan.lastAccrualAt += weeksElapsed * WEEK_MS;
+  // Normalize older loans to the current policy. Their existing balance is
+  // preserved; only future post-grace accrual uses the 5% daily rate.
+  loan.interestRate = DAILY_INTEREST_RATE;
+
+  if (daysElapsed > 0 && loan.balance > 0) {
+    loan.balance = Math.round(loan.balance * Math.pow(1 + DAILY_INTEREST_RATE, daysElapsed));
+    loan.lastAccrualAt = dailyAccrualStart + daysElapsed * DAY_MS;
   }
 
-  if (Date.now() > cutoff && loan.balance > 0) {
+  if (now > cutoff && loan.balance > 0) {
     loan.status = 'defaulted';
   }
 
@@ -158,8 +163,8 @@ export async function getLoanHistory(userId: string): Promise<Loan[]> {
   let mutated = false;
 
   const updated = list.map(l => {
-    if (l.status !== 'active') return l;
-    const before = `${l.balance}:${l.status}:${l.lastAccrualAt}`;
+    if (l.status !== 'active' && l.status !== 'defaulted') return l;
+    const before = `${l.balance}:${l.status}:${l.lastAccrualAt}:${l.interestRate}`;
     const accrued = accrue({ ...l });
     if (`${accrued.balance}:${accrued.status}:${accrued.lastAccrualAt}` !== before) mutated = true;
     return accrued;
@@ -172,6 +177,12 @@ export async function getLoanHistory(userId: string): Promise<Loan[]> {
 export async function getActiveLoan(userId: string): Promise<Loan | null> {
   const list = await getLoanHistory(userId);
   return list.find(l => l.status === 'active') || null;
+}
+
+/** An active or defaulted loan that can still receive direct repayments. */
+export async function getRepayableLoan(userId: string): Promise<Loan | null> {
+  const list = await getLoanHistory(userId);
+  return list.find(l => (l.status === 'active' || l.status === 'defaulted') && l.balance > 0) || null;
 }
 
 // ── Eligibility ───────────────────────────────────────────────────────────────
@@ -278,14 +289,14 @@ export async function applyForLoan(userId: string, requestedAmount: number): Pro
 // ── Repayment ────────────────────────────────────────────────────────────────
 
 export type RepayResult =
-  | { success: false; reason: 'no_active_loan' }
+  | { success: false; reason: 'no_outstanding_loan' }
   | { success: false; reason: 'invalid_amount' }
   | { success: false; reason: 'insufficient_funds'; needed: number }
   | { success: true; loan: Loan; paid: number; remaining: number; fullyRepaid: boolean; onTime: boolean };
 
 export async function repayLoan(userId: string, amount: number | 'all'): Promise<RepayResult> {
-  const loan = await getActiveLoan(userId);
-  if (!loan) return { success: false, reason: 'no_active_loan' };
+  const loan = await getRepayableLoan(userId);
+  if (!loan) return { success: false, reason: 'no_outstanding_loan' };
 
   const requested = amount === 'all' ? loan.balance : Math.floor(amount);
   if (!requested || requested <= 0) return { success: false, reason: 'invalid_amount' };
@@ -491,7 +502,7 @@ async function garnishIncomingCredit(
     return { garnished: 0, remaining: amount };
   }
 
-  const list: Loan[] = (await loansTbl.get(userId)) || [];
+  const list: Loan[] = await getLoanHistory(userId);
   const idx = list.findIndex(l => l.status === 'defaulted');
   if (idx === -1) return { garnished: 0, remaining: amount };
 
