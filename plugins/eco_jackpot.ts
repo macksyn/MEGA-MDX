@@ -73,7 +73,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   try {
     const eligibility = await checkEligibility(userId);
     if (eligibility.eligible) {
-      loanHint = `\n💳 _You're eligible for a loan up to ${formatNumber(eligibility.maxAmount)} coins — try !loan apply_\n`;
+      loanHint = `\n💳 _You're eligible for a loan up to ${formatNumber(eligibility.maxAmount)} coins — try *.loan* then apply_\n`;
     }
   } catch (_) {
     // Best-effort — a loan-hint failure should never break !reserve itself.
