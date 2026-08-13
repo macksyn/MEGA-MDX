@@ -2,11 +2,10 @@
 /***
  * plugins/eco_loan.ts
  *
- * !loan — borrow coins from the community bank. Eligibility is driven by
- * patronage (lifetime coins wagered — screens out attendance-only members
- * who never touch the economy) and peak balance held, on top of account
- * age and an unbroken repayment streak. See lib/loans.ts for the full
- * engine and rationale.
+ * !loan — borrow coins from the community bank. Eligibility starts at
+ * economy Level 2. The maximum grows after consecutive on-time full
+ * repayments, and late repayments/defaults do not increase it. See
+ * lib/loans.ts for the full engine and rationale.
  *
  * UX mirrors plugins/antilink.ts: bare `!loan` opens a USSD-style
  * promptMenu flow (numbered replies, no native buttons — confirmed
@@ -86,7 +85,7 @@ async function sendGarnishmentStatus(sock, message, chatId, channelInfo, userId)
       `Still owed: *${formatNumber(loan.balance)} coins*\n\n` +
       `New loans are on hold until this clears. It's being recovered automatically — *${(GARNISHMENT_RATE * 100).toFixed(0)}%* of every attendance/work/game-win credit goes toward it until it's paid off. Peer !transfer gifts you receive are never touched.\n\n` +
       `Paying it down faster works too: !loan repay <amount>\n\n` +
-      `_Heads up: even once this clears, it permanently caps your loan tier at Starter — a default is a lasting mark, not something that resets once the balance is paid. An admin can forgive it instead if there's a good reason, which does clear that mark._`,
+      `_Once this clears, you can borrow again at the Level 2+ base limit. Your repayment progress is reset, and future increases must be earned through on-time repayments._`,
     ...channelInfo
   }, { quoted: message });
 }
@@ -135,10 +134,8 @@ async function sendHistory(sock, message, chatId, channelInfo, userId) {
 
 async function sendTiersInfo(sock, message, chatId, channelInfo) {
   const lines = LOAN_TIERS.map(t => {
-    const days = Math.round(t.minAccountAgeMs / 86400000);
     return (
-      `*${t.name}* — up to ${formatNumber(t.baseMaxAmount)} coins, ${t.termWeeks}w term\n` +
-      `   ${days}d+ old · ${formatNumber(t.minPatronage)}+ wagered · ${formatNumber(t.minPeakBalance)}+ peak balance · ${t.minRepaidStreak}+ repaid streak`
+      `*Level ${t.minLevel}+ · ${t.name}* — base limit ${formatNumber(t.baseMaxAmount)} coins, ${t.termWeeks}w term`
     );
   });
 
@@ -146,23 +143,23 @@ async function sendTiersInfo(sock, message, chatId, channelInfo) {
     text:
       `💳 *HOW LOAN TIERS WORK* 💳\n\n` +
       lines.join('\n\n') +
-      `\n\n_Interest is ${(INTEREST_RATE * 100).toFixed(0)}%/week, compounding. Each loan you fully repay without defaulting adds +15% capacity on top of your tier's base (capped at 2x) — borrowing power grows the more you prove you pay it back._`,
+      `\n\n_Interest is ${(INTEREST_RATE * 100).toFixed(0)}%/week, compounding. Level 2 is the minimum to qualify. Each loan fully repaid by its due date adds +15% capacity on top of your level's base (capped at 2x). Late repayments and defaults do not increase your limit._`,
     ...channelInfo
   }, { quoted: message });
 }
 
 async function sendEligibilityBreakdown(sock, message, chatId, channelInfo, eligibility) {
   const t = eligibility.nextTier;
-  const p = eligibility.progress;
+  const level = eligibility.economyLevel;
+  const progress = eligibility.progress?.economyLevel || 0;
 
   await sock.sendMessage(chatId, {
     text:
       `🔒 *NOT YET ELIGIBLE* 🔒\n\n` +
-      `Working toward *${t.name}* tier:\n\n` +
-      `Account age    ${bar(p.accountAge * 100)} ${(p.accountAge * 100).toFixed(0)}%\n` +
-      `Patronage      ${bar(p.patronage * 100)} ${(p.patronage * 100).toFixed(0)}%  _(coins wagered)_\n` +
-      `Peak balance   ${bar(p.peakBalance * 100)} ${(p.peakBalance * 100).toFixed(0)}%\n\n` +
-      `_Patronage means actually playing !slots/!coinflip/!dice — attendance rewards alone won't move this bar. Keep playing and saving up, then check back!_`,
+      `You are currently *Level ${level?.levelNumber} · ${level?.levelName}*.\n` +
+      `Loan access starts at *Level ${t.minLevel} · ${t.name}*.\n\n` +
+      `Economy level  ${bar(progress * 100)} ${(progress * 100).toFixed(0)}%\n\n` +
+      `_Keep using the economy to reach Level 2, then you can apply for a loan. Your limit grows when you fully repay loans by their due date._`,
     ...channelInfo
   }, { quoted: message });
 }
@@ -218,7 +215,9 @@ async function doRepay(sock, message, chatId, channelInfo, userId, amount) {
 
   await sock.sendMessage(chatId, {
     text: result.fullyRepaid
-      ? `🎉 *LOAN FULLY REPAID!* 🎉\n\nPaid ${formatNumber(result.paid)} coins.\nYour repayment streak grew — higher tiers and bigger limits unlock as it climbs.`
+      ? result.onTime
+        ? `🎉 *LOAN FULLY REPAID ON TIME!* 🎉\n\nPaid ${formatNumber(result.paid)} coins.\nYour repayment streak grew — your borrowing limit increases as you keep repaying on time.`
+        : `✅ *LOAN FULLY REPAID!* \n\nPaid ${formatNumber(result.paid)} coins.\nThis repayment was after the due date, so your borrowing limit did not increase.`
       : `✅ Paid ${formatNumber(result.paid)} coins.\nRemaining balance: *${formatNumber(result.remaining)} coins*`,
     ...channelInfo
   }, { quoted: message });
@@ -322,7 +321,7 @@ async function runMainMenu(sock, message, chatId, userId, channelInfo) {
   if (eligibility.eligible) {
     const result = await promptMenu(sock, message, chatId, userId, {
       title: '💳 LOANS',
-      subtitle: `✅ Eligible — ${eligibility.tier.name} tier, up to ${formatNumber(eligibility.maxAmount)} coins${eligibility.dinged ? ' (capped: past default)' : ''}`,
+      subtitle: `✅ Eligible — Level ${eligibility.economyLevel.levelNumber} · ${eligibility.tier.name}, up to ${formatNumber(eligibility.maxAmount)} coins`,
       text: 'What would you like to do?',
       options: [
         { label: 'Apply for a loan', value: 'apply', description: `Up to ${formatNumber(eligibility.maxAmount)} coins` },
@@ -373,7 +372,7 @@ async function renderStatus(sock, message, chatId, channelInfo, userId, opts: { 
   if (eligibility.eligible) {
     await sock.sendMessage(chatId, {
       text:
-        `💳 *LOANS* 💳\n\n✅ Eligible — *${eligibility.tier.name}* tier${eligibility.dinged ? ' _(capped: past default on record)_' : ''}\n` +
+        `💳 *LOANS* 💳\n\n✅ Eligible — *Level ${eligibility.economyLevel.levelNumber} · ${eligibility.tier.name}*\n` +
         `Max loan: *${formatNumber(eligibility.maxAmount)} coins*\n` +
         `Term: ${eligibility.tier.termWeeks} week${eligibility.tier.termWeeks > 1 ? 's' : ''}\n\n` +
         `Borrow with: !loan apply <amount>`,
@@ -446,7 +445,7 @@ async function handleAdmin(sock, message, context, userId, args) {
     const result = await forgiveLoan(targetId, defaults[0].id);
     await sock.sendMessage(chatId, {
       text: result.success
-        ? `🕊️ Forgiven. Garnishment stops immediately and the Starter-tier cap is cleared — this counts as a genuine pardon, not just debt recovery. Their repayment streak still stays reset, since this loan wasn't actually repaid.`
+        ? `🕊️ Forgiven. Garnishment stops immediately. Their repayment progress stays reset, since this loan wasn't actually repaid.`
         : `❌ Couldn't forgive that loan (${result.reason}).`,
       ...channelInfo
     }, { quoted: message });
@@ -476,7 +475,7 @@ async function handleAdmin(sock, message, context, userId, args) {
       `Forgiven by admins: ${stats.forgivenCount}\n\n` +
       (activeLines.length ? `*Active:*\n${activeLines.join('\n')}\n\n` : '') +
       (defaultedLines.length ? `*In default:*\n${defaultedLines.join('\n')}\n\n` : '') +
-      `_Active/defaulted balances reflect last check-in — may lag true accrued interest/garnishment until the borrower next has activity. Forgive early with: !loan admin forgive @user (also clears the Starter-tier cap, unlike letting garnishment run its course)_`,
+      `_Active/defaulted balances reflect last check-in — may lag true accrued interest/garnishment until the borrower next has activity. Forgive early with: !loan admin forgive @user_`,
     ...channelInfo
   }, { quoted: message });
 }
@@ -515,7 +514,7 @@ async function sendReminderDM(sock: any, loan: any, kind: 'due_soon' | 'grace') 
   const text = kind === 'due_soon'
     ? `⏰ *LOAN REMINDER* ⏰\n\n` +
       `Your loan balance of *${formatNumber(loan.balance)} coins* is due within 24 hours.\n\n` +
-      `Pay it off with !loan repay <amount> or !loan repay all. Miss it and it enters a ${formatDuration(GRACE_PERIOD_MS)} grace window — interest keeps compounding the whole time, and defaulting after that means garnishment on future earnings plus a permanent cap on your loan tier.`
+       `Pay it off with !loan repay <amount> or !loan repay all. Miss it and it enters a ${formatDuration(GRACE_PERIOD_MS)} grace window — interest keeps compounding the whole time, and defaulting after that means garnishment on future earnings and a reset repayment streak.`
     : `🔴 *LOAN OVERDUE — GRACE PERIOD* 🔴\n\n` +
       `Your loan balance of *${formatNumber(loan.balance)} coins* is now overdue. You have a ${formatDuration(GRACE_PERIOD_MS)} grace window left before it defaults.\n\n` +
       `Clear it now: !loan repay all`;

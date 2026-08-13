@@ -12,28 +12,16 @@
  * wagering activity, and mixing loan cashflow in would make "today's
  * wagered/paid" misleading. Loans get their own stats via getLoanBookStats().
  *
- * ── Eligibility: patronage + peak balance, not just tenure ──────────────
- * Account age alone rewards anyone who's been in the group a while,
- * including the large share of members who only ever collect the daily
- * attendance bonus and never actually engage with the coin economy. Two
- * signals fix that:
- *
- *   - Patronage = getPlayerProfile(userId).totalBet — lifetime coins
- *     WAGERED across slots/coinflip/dice, already tracked in slotMachine.ts.
- *     Attendance-only members sit at 0 forever, so this alone screens them
- *     out without needing new tracking.
- *   - Peak balance = the highest wallet.coins a member has ever actually
- *     held (see peakCoins on the Wallet — needs a small economy.ts patch,
- *     see notes shipped alongside this file). Signals real financial
- *     footing, not just a lucky moment-in-time balance.
- *
- * Both are required alongside account age and an unbroken repayment streak
- * — see LOAN_TIERS below.
+ * ── Eligibility: economy level ────────────────────────────────────────────
+ * A member becomes eligible as soon as their economy level reaches Level 2.
+ * Account age, wagering, wallet balance, and any other financial activity are
+ * deliberately not eligibility gates. The level is already maintained by the
+ * economy module from the member's exchange activity.
  *
  * ── Capacity grows gradually, not just at tier boundaries ───────────────
- * Each consecutive fully-repaid loan (no default since) adds +15% onto the
- * tier's base max, capped at 2x. The streak resets to zero the moment a
- * loan defaults.
+ * Each consecutive fully-repaid loan that is repaid by its due date adds
+ * +15% onto the level's base max, capped at 2x. The streak resets to zero
+ * after a default or a late repayment.
  *
  * ── Default: garnishment, not a permanent block ──────────────────────────
  * A defaulted loan isn't written off — GARNISHMENT_RATE of every future
@@ -42,16 +30,12 @@
  * explicitly excluded, see garnishIncomingCredit below). New loans are
  * blocked only while a defaulted balance is still being actively recovered.
  *
- * Once garnishment fully clears it, the loan is marked 'recovered' — access
- * returns, BUT defaulting (whether later recovered or not) permanently caps
- * future eligibility at the Starter tier, the same way a real default dings
- * a credit score rather than disappearing once the balance is paid (see
- * checkEligibility's hasDinged check).
+ * Once garnishment fully clears it, the loan is marked 'recovered' and access
+ * returns. The repayment streak remains reset, so future limit growth must be
+ * earned again through on-time repayments.
  *
- * Admin forgiveness ('forgiven') is deliberately stronger than natural
- * recovery: it stops garnishment immediately AND does not count toward the
- * Starter-tier cap, since it's a genuine clean-slate pardon rather than the
- * bank just getting its money back the hard way.
+ * Admin forgiveness ('forgiven') stops garnishment immediately, but does not
+ * count as an on-time repayment because the loan was not actually repaid.
  *
  * ── Interest is capped, not indefinite ───────────────────────────────────
  * Interest compounds weekly on the outstanding balance, but accrual is
@@ -64,8 +48,8 @@
  * deadline.
  */
 import { createStore } from './pluginStore.js';
-import { getWallet, addCoins, deductCoins, registerGarnishmentHandler, type TransactionMeta } from './economy.js';
-import { getJackpotPool, deductFromJackpot, contributeToJackpot, settleWin, getPlayerProfile } from './slotMachine.js';
+import { getWallet, getLevelInfo, addCoins, deductCoins, registerGarnishmentHandler, type TransactionMeta } from './economy.js';
+import { getJackpotPool, deductFromJackpot, contributeToJackpot, settleWin } from './slotMachine.js';
 
 const root = createStore('loans');
 const loansTbl = root.table('loans'); // userId -> Loan[] (full history, most recent first)
@@ -85,19 +69,13 @@ const MAX_REPAID_BONUS_MULTIPLIER = 2.0; // capacity growth caps at 2x tier base
 
 export interface LoanTier {
   name: string;
-  minAccountAgeMs: number;
-  minPatronage: number;      // lifetime coins wagered (getPlayerProfile().totalBet)
-  minPeakBalance: number;    // highest coins balance ever held
-  minRepaidStreak: number;   // consecutive fully-repaid loans since last default
+  minLevel: number;
   baseMaxAmount: number;
   termWeeks: number;
 }
 
 export const LOAN_TIERS: LoanTier[] = [
-  { name: 'Starter',     minAccountAgeMs: 3  * DAY_MS, minPatronage: 100,   minPeakBalance: 150,   minRepaidStreak: 0, baseMaxAmount: 100,  termWeeks: 1 },
-  { name: 'Established', minAccountAgeMs: 7  * DAY_MS, minPatronage: 1000,  minPeakBalance: 800,   minRepaidStreak: 1, baseMaxAmount: 300, termWeeks: 2 },
-  { name: 'Trusted',     minAccountAgeMs: 14 * DAY_MS, minPatronage: 5000,  minPeakBalance: 3000,  minRepaidStreak: 3, baseMaxAmount: 5000, termWeeks: 2 },
-  { name: 'Elite',       minAccountAgeMs: 30 * DAY_MS, minPatronage: 20000, minPeakBalance: 10000, minRepaidStreak: 6, baseMaxAmount: 1000, termWeeks: 3 },
+  { name: 'Active',  minLevel: 2, baseMaxAmount: 100,  termWeeks: 1 },
 ];
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -127,14 +105,10 @@ export interface EligibilityResult {
   tier?: LoanTier;
   maxAmount?: number;        // streak-bonus-adjusted max for this tier
   repaidStreak?: number;
-  patronage?: number;
-  peakBalance?: number;
-  accountAgeMs?: number;
-  dinged?: boolean;          // true if a past default (never forgiven) is capping the tier at Starter
-  // populated on below_minimum_tier — the lowest tier they're working toward,
-  // plus 0-1 progress fractions against each of its requirements for UI bars
+  economyLevel?: ReturnType<typeof getLevelInfo>;
+  // populated on below_minimum_tier — the first loan level they're working toward
   nextTier?: LoanTier;
-  progress?: { accountAge: number; patronage: number; peakBalance: number };
+  progress?: { economyLevel: number };
 }
 
 // ── Repayment streak (drives the gradual-growth bonus) ───────────────────────
@@ -142,7 +116,15 @@ export interface EligibilityResult {
 function computeRepaidStreak(history: Loan[]): number {
   let streak = 0;
   for (const loan of history) { // most recent first
-    if (loan.status === 'repaid') { streak++; continue; }
+    if (loan.status === 'repaid') {
+      // A repayment made after the due date is successful, but it must not
+      // increase future borrowing power.
+      if (loan.repaidAt && loan.repaidAt <= loan.dueAt) {
+        streak++;
+        continue;
+      }
+      break;
+    }
     if (loan.status === 'active') continue; // shouldn't occur here, but harmless
     break; // defaulted or forgiven breaks the streak
   }
@@ -203,37 +185,16 @@ export async function checkEligibility(userId: string): Promise<EligibilityResul
   }
   // Only an UNRECOVERED default blocks borrowing outright — garnishment is
   // actively working on it. Once garnishment (or admin forgiveness) clears
-  // it, borrowing opens back up (subject to the tier cap below).
+  // it, borrowing opens back up with the repayment streak reset.
   if (history.some(l => l.status === 'defaulted')) {
     return { eligible: false, reason: 'defaulted_loan' };
   }
 
   const repaidStreak = computeRepaidStreak(history);
-  const accountAgeMs = Date.now() - wallet.createdAt;
-  const peakBalance = wallet.peakCoins ?? wallet.coins;
-  const profile = await getPlayerProfile(userId);
-  const patronage = profile.totalBet;
-
-  // A past default permanently caps eligibility at Starter, even after full
-  // garnishment recovery — same as a real credit ding not disappearing just
-  // because the balance eventually got paid. Admin forgiveness is excluded
-  // on purpose: it's a deliberate clean-slate pardon, not automatic recovery.
-  const dinged = history.some(l => l.status === 'defaulted' || l.status === 'recovered');
-
-  let qualifiedTier: LoanTier | null = null;
-  for (let i = LOAN_TIERS.length - 1; i >= 0; i--) {
-    const t = LOAN_TIERS[i];
-    if (dinged && t !== LOAN_TIERS[0]) continue; // capped at Starter
-    if (
-      accountAgeMs >= t.minAccountAgeMs &&
-      patronage >= t.minPatronage &&
-      peakBalance >= t.minPeakBalance &&
-      repaidStreak >= t.minRepaidStreak
-    ) {
-      qualifiedTier = t;
-      break;
-    }
-  }
+  const economyLevel = getLevelInfo(wallet.exchangeCount);
+  const qualifiedTier = [...LOAN_TIERS]
+    .reverse()
+    .find(t => economyLevel.levelNumber >= t.minLevel) || null;
 
   if (!qualifiedTier) {
     const t = LOAN_TIERS[0];
@@ -241,19 +202,16 @@ export async function checkEligibility(userId: string): Promise<EligibilityResul
       eligible: false,
       reason: 'below_minimum_tier',
       nextTier: t,
-      repaidStreak, patronage, peakBalance, accountAgeMs, dinged,
-      progress: {
-        accountAge: Math.min(1, accountAgeMs / t.minAccountAgeMs),
-        patronage: Math.min(1, patronage / t.minPatronage),
-        peakBalance: Math.min(1, peakBalance / t.minPeakBalance),
-      },
+      repaidStreak,
+      economyLevel,
+      progress: { economyLevel: Math.min(1, economyLevel.progressPercent / 100) },
     };
   }
 
   const bonusMultiplier = Math.min(MAX_REPAID_BONUS_MULTIPLIER, 1 + repaidStreak * REPAID_BONUS_PER_LOAN);
   const maxAmount = Math.round(qualifiedTier.baseMaxAmount * bonusMultiplier);
 
-  return { eligible: true, tier: qualifiedTier, maxAmount, repaidStreak, patronage, peakBalance, accountAgeMs, dinged };
+  return { eligible: true, tier: qualifiedTier, maxAmount, repaidStreak, economyLevel };
 }
 
 // ── Issuance ─────────────────────────────────────────────────────────────────
@@ -323,7 +281,7 @@ export type RepayResult =
   | { success: false; reason: 'no_active_loan' }
   | { success: false; reason: 'invalid_amount' }
   | { success: false; reason: 'insufficient_funds'; needed: number }
-  | { success: true; loan: Loan; paid: number; remaining: number; fullyRepaid: boolean };
+  | { success: true; loan: Loan; paid: number; remaining: number; fullyRepaid: boolean; onTime: boolean };
 
 export async function repayLoan(userId: string, amount: number | 'all'): Promise<RepayResult> {
   const loan = await getActiveLoan(userId);
@@ -356,7 +314,14 @@ export async function repayLoan(userId: string, amount: number | 'all'): Promise
   // path a losing bet takes.
   await contributeToJackpot(payAmount);
 
-  return { success: true, loan, paid: payAmount, remaining: loan.balance, fullyRepaid };
+  return {
+    success: true,
+    loan,
+    paid: payAmount,
+    remaining: loan.balance,
+    fullyRepaid,
+    onTime: fullyRepaid && loan.repaidAt <= loan.dueAt,
+  };
 }
 
 // ── Admin ────────────────────────────────────────────────────────────────────
@@ -440,10 +405,7 @@ export async function getAllDefaultedLoans(): Promise<Loan[]> {
 /**
  * Clears a defaulted loan so the borrower can access loans again. Marked
  * 'forgiven', not 'repaid' — it does NOT restart the repaid-loan streak
- * future tier/capacity growth requires, since it wasn't actually paid back.
- * Unlike garnishment recovery, forgiveness is also excluded from the
- * Starter-tier ding (see checkEligibility) — a genuine clean-slate pardon,
- * stronger than the bank simply getting its money back the hard way.
+ * future capacity growth requires, since it wasn't actually paid back.
  * Balance is zeroed and interest/garnishment stop.
  */
 export async function forgiveLoan(userId: string, loanId: string): Promise<{ success: boolean; reason?: string; loan?: Loan }> {
