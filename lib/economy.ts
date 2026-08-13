@@ -297,6 +297,38 @@ export interface TransactionMeta {
 
 const MAX_TRANSACTIONS_PER_USER = 200;
 
+// ── Garnishment hook ─────────────────────────────────────────────────────────
+// Lets another module (e.g. lib/loans.ts) intercept a share of every future
+// coin credit and divert it elsewhere (e.g. toward a defaulted loan balance)
+// before it lands in the wallet. Implemented as a registration hook rather
+// than a direct import here to avoid a circular dependency, since the
+// registering module already imports from this file. Only one handler is
+// supported at a time — a later call replaces an earlier one.
+
+export type GarnishmentHandler = (
+  userId: string,
+  amount: number,
+  meta: TransactionMeta
+) => Promise<{ garnished: number; remaining: number }>;
+
+let garnishmentHandler: GarnishmentHandler | null = null;
+
+export function registerGarnishmentHandler(handler: GarnishmentHandler): void {
+  garnishmentHandler = handler;
+}
+
+/** Runs a positive coin credit past the registered garnishment handler (if any) and returns the amount that should actually land in the wallet. */
+async function applyGarnishment(userId: string, amount: number, meta: TransactionMeta): Promise<number> {
+  if (!garnishmentHandler || amount <= 0) return amount;
+  try {
+    const { remaining } = await garnishmentHandler(userId, amount, meta);
+    return remaining;
+  } catch (_) {
+    // Garnishment is best-effort — never let a hook failure block the underlying credit.
+    return amount;
+  }
+}
+
 async function logTransaction(
   userId: string,
   entry: { currency: 'coins' | 'groqCoins'; amount: number; balanceAfter: number } & TransactionMeta
@@ -329,11 +361,12 @@ export async function getTransactions(userId: string, limit = 20): Promise<Trans
 }
 
 export async function addCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<Wallet> {
+  const creditAmount = await applyGarnishment(userId, amount, meta);
   const wallet = await getWallet(userId);
-  wallet.coins += amount;
-  if (amount > 0) wallet.lifetimeCoinsEarned += amount;
+  wallet.coins += creditAmount;
+  if (creditAmount > 0) wallet.lifetimeCoinsEarned += creditAmount;
   const saved = await saveWallet(userId, wallet);
-  await logTransaction(userId, { currency: 'coins', amount, balanceAfter: saved.coins, type: meta.type || 'admin_credit', ...meta });
+  await logTransaction(userId, { currency: 'coins', amount: creditAmount, balanceAfter: saved.coins, type: meta.type || 'admin_credit', ...meta });
   return saved;
 }
 
@@ -621,10 +654,15 @@ export async function awardAttendanceBonus(
   }
 
   const pool = await getJackpotPool();
-  const { payout, capped } = settleWin(totalReward, pool);
+  const { payout: grossPayout, capped } = settleWin(totalReward, pool);
 
-  if (payout > 0) await deductFromJackpot(payout);
-  await recordHouseActivity(0, payout);
+  // The bank still pays out the full amount (and any garnished share flows
+  // back in separately via the garnishment handler's own repayment path) —
+  // only what actually lands in the wallet is reduced.
+  if (grossPayout > 0) await deductFromJackpot(grossPayout);
+  await recordHouseActivity(0, grossPayout);
+
+  const payout = await applyGarnishment(userId, grossPayout, { type: 'attendance', note: `streak: ${streak}` });
 
   // Streak/attendance credit still updates even if the bank is completely
   // dry right now (payout === 0) — attendance itself was still valid, and
@@ -660,7 +698,8 @@ export async function doWork(userId: string): Promise<
     return { success: false, remainingMs: readyAt - now };
   }
 
-  const reward = Math.floor(Math.random() * (settings.workMax - settings.workMin + 1)) + settings.workMin;
+  const grossReward = Math.floor(Math.random() * (settings.workMax - settings.workMin + 1)) + settings.workMin;
+  const reward = await applyGarnishment(userId, grossReward, { type: 'work' });
   wallet.coins += reward;
   wallet.lifetimeCoinsEarned += reward;
   wallet.lastWorkTs = now;
