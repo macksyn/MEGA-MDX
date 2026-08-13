@@ -505,17 +505,13 @@ async function handleAutoAttendance(message: any, sock: any): Promise<boolean> {
       void syncIdentity(cleanJid(senderId), sock, validation.extractedData.name || message.pushName);
       if (bonusResult.success) {
         reward = bonusResult.reward;
-        // Level 1 members: attendance is still recorded (see awardAttendanceBonus),
-        // but no bonus line is shown — nothing to inform them about here.
-        if (!bonusResult.levelGated) {
-          bonusMessage = `\n💰 Coins earned: ${reward.toLocaleString()}` +
-            (streakBonus > 0 ? ` (incl. ${streakBonus.toLocaleString()} streak bonus, x${attendanceSettings.streakBonusMultiplier})` : '') +
-            (imageBonus > 0 ? ` (incl. ${imageBonus.toLocaleString()} image bonus)` : '');
-          if (bonusResult.capped) {
-            bonusMessage += reward > 0
-              ? `\n⚠️ _Bank reserve is low right now, so this was capped down from the full ${totalReward.toLocaleString()} earned. Check *.reserve* for details._`
-              : `\n⚠️ _Bank reserve is currently at its protected floor, so no coins could be paid out this time. Your streak still counts! Check *.reserve* for details._`;
-          }
+        bonusMessage = `\n💰 Coins earned: ${reward.toLocaleString()}` +
+          (streakBonus > 0 ? ` (incl. ${streakBonus.toLocaleString()} streak bonus, x${attendanceSettings.streakBonusMultiplier})` : '') +
+          (imageBonus > 0 ? ` (incl. ${imageBonus.toLocaleString()} image bonus)` : '');
+        if (bonusResult.capped) {
+          bonusMessage += reward > 0
+            ? `\n⚠️ _Bank reserve is low right now, so this was capped down from the full ${totalReward.toLocaleString()} earned. Check *.reserve* for details._`
+            : `\n⚠️ _Bank reserve is currently at its protected floor, so no coins could be paid out this time. Your streak still counts! Check *.reserve* for details._`;
         }
       }
     } catch (error) {

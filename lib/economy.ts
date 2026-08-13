@@ -49,13 +49,13 @@ interface EconomySettings {
 }
 
 const DEFAULT_SETTINGS: EconomySettings = {
-  coinsPerGroqCoin: Number(process.env.ECONOMY_COINS_PER_GROQCOIN) || 1,
+  coinsPerGroqCoin: Number(process.env.ECONOMY_COINS_PER_GROQCOIN) || 100,
   groqCoinWithdrawThreshold: Number(process.env.ECONOMY_GROQCOIN_WITHDRAW_THRESHOLD) || 50,
   workMin: Number(process.env.ECONOMY_WORK_MIN) || 50,
   workMax: Number(process.env.ECONOMY_WORK_MAX) || 300,
   workCooldownMs: Number(process.env.ECONOMY_WORK_COOLDOWN_MS) || 60 * 60 * 1000, // 1hr
   top3Rewards: [300, 200, 100],
-  exchangeFeePercent: Number(process.env.ECONOMY_EXCHANGE_FEE_PERCENT) || 5,
+  exchangeFeePercent: Number(process.env.ECONOMY_EXCHANGE_FEE_PERCENT) || 15,
   exchangeAllowedAmounts: [10, 20, 50, 100],
   fineAmount: Number(process.env.ECONOMY_FINE_AMOUNT) || 20,
   economyGroupId: process.env.ECONOMY_GROUP_ID || null,
@@ -116,10 +116,6 @@ export interface Wallet {
   lastDailyDate: string | null;   // 'YYYY-MM-DD' in TZ
   lastWorkTs: number;
   lifetimeCoinsEarned: number;
-  peakCoins: number;       // highest wallet.coins has ever been — maintained centrally in
-                            // saveWallet() below, not by individual credit sites, so it
-                            // stays correct regardless of which function moved the balance
-                            // (addCoins, attendance bonus, work, etc.)
   lifetimeGroqCoinsEarned: number;
   exchangeCount: number;
   createdAt: number;
@@ -145,7 +141,6 @@ const EMPTY_WALLET: Wallet = {
   lastDailyDate: null,
   lastWorkTs: 0,
   lifetimeCoinsEarned: 0,
-  peakCoins: 0,
   lifetimeGroqCoinsEarned: 0,
   exchangeCount: 0,
   createdAt: Date.now(),
@@ -162,43 +157,12 @@ const EMPTY_WALLET: Wallet = {
 
 export async function getWallet(userId: string): Promise<Wallet> {
   const w = await wallets.get(userId);
-  const wallet = w ? { ...EMPTY_WALLET, ...w } : { ...EMPTY_WALLET };
-  // Self-healing backfill: wallets saved before peakCoins existed (or that
-  // haven't had a coin mutation since) could otherwise show a peak lower
-  // than their actual current balance.
-  if (wallet.peakCoins < wallet.coins) wallet.peakCoins = wallet.coins;
-  return wallet;
+  return w ? { ...EMPTY_WALLET, ...w } : { ...EMPTY_WALLET };
 }
 
 async function saveWallet(userId: string, wallet: Wallet): Promise<Wallet> {
-  // Centralized peak-balance tracking: every function that mutates wallet.coins
-  // (addCoins, awardAttendanceBonus, doWork, and anything added later) routes
-  // through here, so this is the one place that needs to know about it rather
-  // than patching every individual credit site.
-  if (wallet.coins > wallet.peakCoins) wallet.peakCoins = wallet.coins;
   await wallets.set(userId, wallet);
   return wallet;
-}
-
-/**
- * Atomic read-modify-write for a wallet. Holds pluginStore's per-key lock for
- * the ENTIRE get→mutate→save cycle (not just the save), so two concurrent
- * callers touching the same wallet — a transfer racing an identity sync, two
- * transfers landing back to back, a purchase racing a payout — can't both read
- * the same starting balance and silently stomp on each other. Applies the same
- * defaulting (EMPTY_WALLET merge) and peak-tracking that getWallet()/
- * saveWallet() do, so it's a drop-in atomic replacement for that pair anywhere
- * a function currently does `const w = await getWallet(id); mutate w; await
- * saveWallet(id, w);`.
- */
-async function mutateWallet(userId: string, mutator: (wallet: Wallet) => void | Promise<void>): Promise<Wallet> {
-  return wallets.mutate(userId, async (raw: Partial<Wallet> | null) => {
-    const wallet: Wallet = raw ? { ...EMPTY_WALLET, ...raw } : { ...EMPTY_WALLET };
-    if (wallet.peakCoins < wallet.coins) wallet.peakCoins = wallet.coins; // same self-heal as getWallet()
-    await mutator(wallet);
-    if (wallet.coins > wallet.peakCoins) wallet.peakCoins = wallet.coins; // same peak-tracking as saveWallet()
-    return wallet;
-  });
 }
 
 // ── Identity recognition (name + phone) ──────────────────────────────────────
@@ -310,7 +274,6 @@ export type TransactionType =
   | 'exchange_out' | 'exchange_in'
   | 'convert'
   | 'slots' | 'coinflip' | 'dice'
-  | 'loan_disbursement' | 'loan_repayment'
   | 'admin_credit' | 'admin_debit' | 'admin_reset'
   | 'withdrawal_hold' | 'withdrawal_refund'
   | 'other';
@@ -365,98 +328,46 @@ export async function getTransactions(userId: string, limit = 20): Promise<Trans
   return existing.slice(0, Math.max(1, Math.min(limit, MAX_TRANSACTIONS_PER_USER)));
 }
 
-// ── Loan garnishment hook ──────────────────────────────────────────────────
-// lib/loans.ts already imports this module (getWallet/addCoins/deductCoins),
-// so economy.ts can't import loans.ts back without a circular dependency.
-// Instead, loans.ts registers itself here at module load — a plugin-style
-// hook, not a direct import. If a user has a defaulted loan, a slice of
-// every future earning gets diverted to pay it down before it ever lands in
-// their wallet. Explicitly does NOT apply to peer-to-peer transfers (see the
-// exclusion in loans.ts) — a friend's gift shouldn't get clawed toward a
-// stranger's debt just because it happened to pass through addCoins.
-//
-// IMPORTANT: this only takes effect once lib/loans.ts has actually been
-// imported somewhere (which happens automatically once plugins/eco_loan.ts
-// loads at bot startup, same as every other plugin). If loan enforcement
-// ever seems to not be firing, that's the first thing to check.
-export type GarnishmentHandler = (
-  userId: string,
-  amount: number,
-  meta: TransactionMeta
-) => Promise<{ garnished: number; remaining: number }>;
-
-let garnishmentHandler: GarnishmentHandler | null = null;
-
-export function registerGarnishmentHandler(fn: GarnishmentHandler): void {
-  garnishmentHandler = fn;
-}
-
-async function applyGarnishment(userId: string, amount: number, meta: TransactionMeta): Promise<{ credited: number; garnished: number }> {
-  if (amount <= 0 || !garnishmentHandler) return { credited: amount, garnished: 0 };
-  try {
-    const { garnished, remaining } = await garnishmentHandler(userId, amount, meta);
-    return { credited: remaining, garnished };
-  } catch (err) {
-    console.error('[economy] garnishment hook failed, crediting in full:', err);
-    return { credited: amount, garnished: 0 };
-  }
-}
-
 export async function addCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<Wallet> {
-  const { credited, garnished } = await applyGarnishment(userId, amount, meta);
-
-  const saved = await mutateWallet(userId, wallet => {
-    wallet.coins += credited;
-    if (credited > 0) wallet.lifetimeCoinsEarned += credited;
-  });
-  await logTransaction(userId, {
-    currency: 'coins', amount: credited, balanceAfter: saved.coins, type: meta.type || 'admin_credit', ...meta,
-    ...(garnished > 0 ? { note: `${meta.note ? meta.note + ' · ' : ''}${garnished} garnished toward defaulted loan` } : {}),
-  });
+  const wallet = await getWallet(userId);
+  wallet.coins += amount;
+  if (amount > 0) wallet.lifetimeCoinsEarned += amount;
+  const saved = await saveWallet(userId, wallet);
+  await logTransaction(userId, { currency: 'coins', amount, balanceAfter: saved.coins, type: meta.type || 'admin_credit', ...meta });
   return saved;
 }
 
 export async function addGroqCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<Wallet> {
-  const saved = await mutateWallet(userId, wallet => {
-    wallet.groqCoins += amount;
-    if (amount > 0) wallet.lifetimeGroqCoinsEarned += amount;
-  });
+  const wallet = await getWallet(userId);
+  wallet.groqCoins += amount;
+  if (amount > 0) wallet.lifetimeGroqCoinsEarned += amount;
+  const saved = await saveWallet(userId, wallet);
   await logTransaction(userId, { currency: 'groqCoins', amount, balanceAfter: saved.groqCoins, type: meta.type || 'admin_credit', ...meta });
   return saved;
 }
 
 export async function deductCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<{ success: boolean; wallet: Wallet }> {
-  // The sufficient-funds check and the decrement happen inside the SAME
-  // locked mutateWallet cycle, so two concurrent deductions for this user
-  // can't both read the same starting balance and both pass the check
-  // (the classic double-spend version of this bug — see the transfer race).
-  let success = false;
-  const saved = await mutateWallet(userId, wallet => {
-    if (wallet.coins < amount) return; // insufficient funds — leave the wallet untouched
-    wallet.coins -= amount;
-    success = true;
-  });
-  if (!success) return { success: false, wallet: saved };
+  const wallet = await getWallet(userId);
+  if (wallet.coins < amount) return { success: false, wallet };
+  wallet.coins -= amount;
+  const saved = await saveWallet(userId, wallet);
   await logTransaction(userId, { currency: 'coins', amount: -amount, balanceAfter: saved.coins, type: meta.type || 'admin_debit', ...meta });
   return { success: true, wallet: saved };
 }
 
 export async function deductGroqCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<{ success: boolean; wallet: Wallet }> {
-  let success = false;
-  const saved = await mutateWallet(userId, wallet => {
-    if (wallet.groqCoins < amount) return;
-    wallet.groqCoins -= amount;
-    success = true;
-  });
-  if (!success) return { success: false, wallet: saved };
+  const wallet = await getWallet(userId);
+  if (wallet.groqCoins < amount) return { success: false, wallet };
+  wallet.groqCoins -= amount;
+  const saved = await saveWallet(userId, wallet);
   await logTransaction(userId, { currency: 'groqCoins', amount: -amount, balanceAfter: saved.groqCoins, type: meta.type || 'admin_debit', ...meta });
   return { success: true, wallet: saved };
 }
 
 export async function addExchange(userId: string, amount = 1): Promise<Wallet> {
-  return mutateWallet(userId, wallet => {
-    wallet.exchangeCount += amount;
-  });
+  const wallet = await getWallet(userId);
+  wallet.exchangeCount += amount;
+  return saveWallet(userId, wallet);
 }
 
 const LEVEL_DEFS = [
@@ -567,7 +478,7 @@ export async function drainFeePool(): Promise<number> {
 
 export async function exchangeWithMember(senderId: string, targetId: string, coinsAmount: number): Promise<
   | { success: false; reason: 'invalid_amount' | 'amount_not_allowed' | 'self_exchange' | 'below_minimum' | 'insufficient_funds' }
-  | { success: true; coinsSpent: number; groqCoinsGained: number; fee: number; debtResolved: boolean; debtResolvedAmount: number | null }
+  | { success: true; coinsSpent: number; groqCoinsGained: number; fee: number; debtResolved: boolean }
 > {
   if (!coinsAmount || coinsAmount <= 0) return { success: false, reason: 'invalid_amount' };
   if (senderId === targetId) return { success: false, reason: 'self_exchange' };
@@ -607,28 +518,15 @@ export async function exchangeWithMember(senderId: string, targetId: string, coi
   // Counts toward the SENDER's exchange-level progress, same as self-conversion did.
   await addExchange(senderId, 1);
 
-  // Reciprocal debt bookkeeping: if the sender currently owes the target a
-  // reciprocal (target sent to sender previously, sender hasn't paid it back
-  // yet), THIS exchange settles that debt — full stop, nothing new is owed
-  // either way. Only when there was no outstanding debt to settle does this
-  // exchange open a fresh one (target now owes sender a reciprocal, for
-  // this exchange's coin amount). This is what makes "Peter sends Paul" ->
-  // "Paul sends Peter back" fully clear the slate, and makes a THIRD send
-  // (Paul -> Peter again, with nothing outstanding) correctly open a
-  // brand-new debt instead of being misreported as "settling" a stale one.
-  const resolvedDebt = await resolveOldestDebt(senderId, targetId);
-  if (!resolvedDebt) {
-    await addDebt(targetId, senderId, coinsToSpend);
-  }
+  // Reciprocal debt bookkeeping: if the sender previously benefited from an
+  // exchange FROM the target (i.e. sender already owed target a reciprocal),
+  // this exchange settles that debt. Either way, the target now owes the
+  // sender a reciprocal exchange going forward — that's the whole "Peter
+  // sends Paul, so now Paul owes Peter" loop.
+  const debtResolved = await resolveOldestDebt(senderId, targetId);
+  await addDebt(targetId, senderId);
 
-  return {
-    success: true,
-    coinsSpent: coinsToSpend,
-    groqCoinsGained: netGroqCoins,
-    fee,
-    debtResolved: !!resolvedDebt,
-    debtResolvedAmount: resolvedDebt ? resolvedDebt.amount : null,
-  };
+  return { success: true, coinsSpent: coinsToSpend, groqCoinsGained: netGroqCoins, fee, debtResolved };
 }
 
 // ── Reciprocal exchange debt ledger ───────────────────────────────────────────
@@ -639,39 +537,33 @@ export async function exchangeWithMember(senderId: string, targetId: string, coi
 interface ExchangeDebt {
   id: string;
   creditorId: string; // the person who is owed a reciprocal exchange
-  amount: number;     // coins amount of the exchange that opened this debt
   timestamp: number;
 }
 
 const MAX_DEBTS_PER_USER = 100;
 
-async function addDebt(debtorId: string, creditorId: string, amount: number): Promise<void> {
+async function addDebt(debtorId: string, creditorId: string): Promise<void> {
   try {
-    await exchangeDebtsTbl.mutate(debtorId, async (raw: ExchangeDebt[] | null) => {
-      const list: ExchangeDebt[] = raw || [];
-      list.push({ id: `debt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, creditorId, amount, timestamp: Date.now() });
-      if (list.length > MAX_DEBTS_PER_USER) list.splice(0, list.length - MAX_DEBTS_PER_USER);
-      return list;
-    });
+    const list: ExchangeDebt[] = (await exchangeDebtsTbl.get(debtorId)) || [];
+    list.push({ id: `debt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, creditorId, timestamp: Date.now() });
+    if (list.length > MAX_DEBTS_PER_USER) list.splice(0, list.length - MAX_DEBTS_PER_USER);
+    await exchangeDebtsTbl.set(debtorId, list);
   } catch (_) {
     // Best-effort — debt tracking should never break the underlying exchange.
   }
 }
 
-/** Resolves (removes) the oldest debt debtorId owes to creditorId, if any. Returns the removed debt (so its amount can be shown), or null if none was found. */
-async function resolveOldestDebt(debtorId: string, creditorId: string): Promise<ExchangeDebt | null> {
-  let resolvedDebt: ExchangeDebt | null = null;
+/** Resolves (removes) the oldest debt debtorId owes to creditorId, if any. Returns whether one was found. */
+async function resolveOldestDebt(debtorId: string, creditorId: string): Promise<boolean> {
   try {
-    await exchangeDebtsTbl.mutate(debtorId, async (raw: ExchangeDebt[] | null) => {
-      const list: ExchangeDebt[] = raw || [];
-      const idx = list.findIndex(d => d.creditorId === creditorId);
-      if (idx === -1) return list;
-      [resolvedDebt] = list.splice(idx, 1);
-      return list;
-    });
-    return resolvedDebt;
+    const list: ExchangeDebt[] = (await exchangeDebtsTbl.get(debtorId)) || [];
+    const idx = list.findIndex(d => d.creditorId === creditorId);
+    if (idx === -1) return false;
+    list.splice(idx, 1);
+    await exchangeDebtsTbl.set(debtorId, list);
+    return true;
   } catch (_) {
-    return null;
+    return false;
   }
 }
 
@@ -681,12 +573,12 @@ export async function getDebtsOwedByUser(userId: string): Promise<ExchangeDebt[]
 }
 
 /** Who still owes THIS user a reciprocal exchange (they sent coins to these people, no payback yet). */
-export async function getDebtsOwedToUser(userId: string): Promise<Array<{ debtorId: string; amount: number; timestamp: number }>> {
+export async function getDebtsOwedToUser(userId: string): Promise<Array<{ debtorId: string; timestamp: number }>> {
   const all = (await exchangeDebtsTbl.getAll()) || {};
-  const results: Array<{ debtorId: string; amount: number; timestamp: number }> = [];
+  const results: Array<{ debtorId: string; timestamp: number }> = [];
   for (const [debtorId, list] of Object.entries(all as Record<string, ExchangeDebt[]>)) {
     for (const d of list) {
-      if (d.creditorId === userId) results.push({ debtorId, amount: d.amount, timestamp: d.timestamp });
+      if (d.creditorId === userId) results.push({ debtorId, timestamp: d.timestamp });
     }
   }
   return results.sort((a, b) => a.timestamp - b.timestamp);
@@ -717,7 +609,7 @@ export async function awardAttendanceBonus(
   streak: number
 ): Promise<
   | { success: false; reason: 'already_awarded_today' }
-  | { success: true; reward: number; garnished: number; capped: boolean; levelGated: boolean }
+  | { success: true; reward: number; capped: boolean }
 > {
   const wallet = await getWallet(userId);
   const today = todayStr();
@@ -728,54 +620,36 @@ export async function awardAttendanceBonus(
     return { success: false, reason: 'already_awarded_today' };
   }
 
-  // Attendance coin bonuses are restricted to level 2+ (economy exchangeCount
-  // level, see getLevelInfo/LEVEL_DEFS). Level 1 members still get their
-  // attendance recorded — streak and lastDailyDate update as normal — they
-  // just don't get paid out. No message/flag is surfaced to the user about
-  // this; attendance.ts simply omits the bonus line when levelGated is true.
-  const { levelNumber } = getLevelInfo(wallet.exchangeCount);
-  if (levelNumber < 2) {
-    wallet.dailyStreak = streak;
-    wallet.lastDailyDate = today;
-    await saveWallet(userId, wallet);
-    return { success: true, reward: 0, garnished: 0, capped: false, levelGated: true };
-  }
-
   const pool = await getJackpotPool();
   const { payout, capped } = settleWin(totalReward, pool);
 
   if (payout > 0) await deductFromJackpot(payout);
   await recordHouseActivity(0, payout);
 
-  // Bypasses addCoins (streak/lastDailyDate need to update in this same
-  // wallet write), so garnishment is applied explicitly here too — same
-  // hook addCoins uses, just invoked directly.
-  const { credited, garnished } = await applyGarnishment(userId, payout, { type: 'attendance' });
-
   // Streak/attendance credit still updates even if the bank is completely
   // dry right now (payout === 0) — attendance itself was still valid, and
   // blocking that would unfairly penalize the member for the bank's state.
-  wallet.coins += credited;
-  if (credited > 0) wallet.lifetimeCoinsEarned += credited;
+  wallet.coins += payout;
+  if (payout > 0) wallet.lifetimeCoinsEarned += payout;
   wallet.dailyStreak = streak;
   wallet.lastDailyDate = today;
   const saved = await saveWallet(userId, wallet);
   await logTransaction(userId, {
     currency: 'coins',
-    amount: credited,
+    amount: payout,
     balanceAfter: saved.coins,
     type: 'attendance',
-    note: `streak: ${streak}${capped ? ' (capped — bank reserve low)' : ''}${garnished > 0 ? ` · ${garnished} garnished toward defaulted loan` : ''}`,
+    note: `streak: ${streak}${capped ? ' (capped — bank reserve low)' : ''}`,
   });
 
-  return { success: true, reward: credited, garnished, capped, levelGated: false };
+  return { success: true, reward: payout, capped };
 }
 
 // ── Work command (cooldown-based random payout) ──────────────────────────────
 
 export async function doWork(userId: string): Promise<
   | { success: false; remainingMs: number }
-  | { success: true; reward: number; garnished: number }
+  | { success: true; reward: number }
 > {
   const settings = await getSettings();
   const wallet = await getWallet(userId);
@@ -786,19 +660,14 @@ export async function doWork(userId: string): Promise<
     return { success: false, remainingMs: readyAt - now };
   }
 
-  const rawReward = Math.floor(Math.random() * (settings.workMax - settings.workMin + 1)) + settings.workMin;
-  const { credited, garnished } = await applyGarnishment(userId, rawReward, { type: 'work' });
-
-  wallet.coins += credited;
-  wallet.lifetimeCoinsEarned += credited;
+  const reward = Math.floor(Math.random() * (settings.workMax - settings.workMin + 1)) + settings.workMin;
+  wallet.coins += reward;
+  wallet.lifetimeCoinsEarned += reward;
   wallet.lastWorkTs = now;
   const saved = await saveWallet(userId, wallet);
-  await logTransaction(userId, {
-    currency: 'coins', amount: credited, balanceAfter: saved.coins, type: 'work',
-    ...(garnished > 0 ? { note: `${garnished} garnished toward defaulted loan` } : {}),
-  });
+  await logTransaction(userId, { currency: 'coins', amount: reward, balanceAfter: saved.coins, type: 'work' });
 
-  return { success: true, reward: credited, garnished };
+  return { success: true, reward };
 }
 
 // ── Top-3-on-the-monthly-leaderboard payout ──────────────────────────────────
