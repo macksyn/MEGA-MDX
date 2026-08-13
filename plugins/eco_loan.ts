@@ -24,7 +24,7 @@ import {
   checkEligibility, applyForLoan, repayLoan, getLoanHistory, getActiveLoan,
   getLoanBookStats, getAllActiveLoans, getAllDefaultedLoans, forgiveLoan,
   getLoansDueForReminder, markReminderSent,
-  LOAN_TIERS, DAILY_INTEREST_RATE, MIN_LOAN_AMOUNT, GRACE_PERIOD_MS, GARNISHMENT_RATE,
+  LOAN_TIERS, INTEREST_RATE, DEFAULT_INTEREST_RATE, MIN_LOAN_AMOUNT, GRACE_PERIOD_MS, GARNISHMENT_RATE,
 } from '../lib/loans.js';
 import { promptMenu } from '../lib/menuSession.js';
 import { cleanJid, isOwnerOnly } from '../lib/isOwner.js';
@@ -100,7 +100,7 @@ async function sendLoanDetails(sock, message, chatId, channelInfo, loan) {
       `┏━━━ 💳 *ACTIVE LOAN* ━━━┓\n\n` +
       `Tier: *${loan.tier}*\n` +
       `Borrowed: ${formatNumber(loan.principal)} coins\n` +
-      `Owed now: *${formatNumber(loan.balance)} coins* _(5% daily after the 1-day grace period)_\n\n` +
+      `Owed now: *${formatNumber(loan.balance)} coins* _(20% standard interest; defaulted loans add 5% daily after grace)_\n\n` +
       `Repaid so far  ${bar(paidPct)} ${paidPct.toFixed(0)}%\n\n` +
       `${dueLabel(loan)}\n\n` +
       `┗━━━━━━━━━━━━━━━━━━┛\n` +
@@ -143,7 +143,7 @@ async function sendTiersInfo(sock, message, chatId, channelInfo) {
     text:
       `💳 *HOW LOAN TIERS WORK* 💳\n\n` +
       lines.join('\n\n') +
-      `\n\n_Level 2 is the minimum to qualify. Loans expire after 7 days with a 1-day grace period. After grace, the outstanding balance compounds at ${(DAILY_INTEREST_RATE * 100).toFixed(0)}% daily until fully repaid. Each loan fully repaid by its due date adds +15% capacity (capped at 2x); late repayments and defaults do not increase your limit._`,
+      `\n\n_Level 2 is the minimum to qualify. Loans expire after 7 days with a 1-day grace period. Standard interest is ${(INTEREST_RATE * 100).toFixed(0)}%; after grace, defaulters are charged an additional ${(DEFAULT_INTEREST_RATE * 100).toFixed(0)}% daily until fully repaid. Each loan fully repaid by its due date adds +15% capacity (capped at 2x); late repayments and defaults do not increase your limit._`,
     ...channelInfo
   }, { quoted: message });
 }
@@ -174,7 +174,7 @@ async function doApply(sock, message, chatId, channelInfo, userId, amount) {
         `✅ *LOAN APPROVED* ✅\n\n` +
         `${formatNumber(l.principal)} coins deposited into your wallet.\n\n` +
         `Tier: ${l.tier}\n` +
-        `Interest: ${(DAILY_INTEREST_RATE * 100).toFixed(0)}% daily after grace\n` +
+        `Interest: ${(INTEREST_RATE * 100).toFixed(0)}% standard; defaulters add ${(DEFAULT_INTEREST_RATE * 100).toFixed(0)}% daily after grace\n` +
         `Due: 7 days from now, followed by 1 day grace\n\n` +
         `Check anytime with !loan · repay with !loan repay <amount>`,
       ...channelInfo
@@ -240,7 +240,7 @@ async function runApplyAmountMenu(sock, message, chatId, userId, channelInfo, el
 
   const result = await promptMenu(sock, message, chatId, userId, {
     title: `💳 APPLY · ${eligibility.tier.name} tier`,
-    subtitle: `7-day term · 1-day grace · ${(DAILY_INTEREST_RATE * 100).toFixed(0)}%/day after grace`,
+    subtitle: `7-day term · 1-day grace · ${(INTEREST_RATE * 100).toFixed(0)}% standard · +${(DEFAULT_INTEREST_RATE * 100).toFixed(0)}%/day if defaulted`,
     text: 'How much would you like to borrow?',
     options,
   });
@@ -514,7 +514,7 @@ async function sendReminderDM(sock: any, loan: any, kind: 'due_soon' | 'grace') 
   const text = kind === 'due_soon'
     ? `⏰ *LOAN REMINDER* ⏰\n\n` +
       `Your loan balance of *${formatNumber(loan.balance)} coins* is due within 24 hours.\n\n` +
-       `Pay it off with !loan repay <amount> or !loan repay all. You have a ${formatDuration(GRACE_PERIOD_MS)} grace window after day 7 with no extra interest; after grace, the balance compounds at ${(DAILY_INTEREST_RATE * 100).toFixed(0)}% daily until fully repaid.`
+       `Pay it off with !loan repay <amount> or !loan repay all. The ${formatDuration(GRACE_PERIOD_MS)} grace window after day 7 has no extra charge; after grace, a default adds ${(DEFAULT_INTEREST_RATE * 100).toFixed(0)}% daily until fully repaid.`
     : `🔴 *LOAN OVERDUE — GRACE PERIOD* 🔴\n\n` +
       `Your loan balance of *${formatNumber(loan.balance)} coins* is now overdue. You have a ${formatDuration(GRACE_PERIOD_MS)} grace window left before it defaults.\n\n` +
       `Clear it now: !loan repay all`;

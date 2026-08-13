@@ -38,10 +38,11 @@
  * count as an on-time repayment because the loan was not actually repaid.
  *
  * ── Interest ──────────────────────────────────────────────────────────────
- * There is no interest during the 7-day term or the 1-day grace period.
- * After grace expires, the outstanding balance compounds at 5% per day until
- * the loan is fully repaid. Accrual is lazy, so it is applied whenever the
- * loan is read or an earning is garnished.
+ * The standard loan interest is 20%, applied at the 7-day due point. The
+ * 1-day grace period does not add another standard-interest charge. Once
+ * grace expires, a defaulted balance also compounds at an additional 5% per
+ * day until fully repaid. Accrual is lazy, so it is applied whenever the loan
+ * is read or an earning is garnished.
  */
 import { createStore } from './pluginStore.js';
 import { getWallet, getLevelInfo, addCoins, deductCoins, registerGarnishmentHandler, type TransactionMeta } from './economy.js';
@@ -52,9 +53,8 @@ const loansTbl = root.table('loans'); // userId -> Loan[] (full history, most re
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
-export const DAILY_INTEREST_RATE = 0.05; // 5% daily after the grace period
-// Kept as an alias for callers that already import INTEREST_RATE.
-export const INTEREST_RATE = DAILY_INTEREST_RATE;
+export const INTEREST_RATE = 0.20; // standard loan interest at the 7-day due point
+export const DEFAULT_INTEREST_RATE = 0.05; // additional daily interest after grace
 export const GRACE_PERIOD_MS = 1 * DAY_MS; // grace window past due before default
 export const DUE_SOON_WINDOW_MS = DAY_MS; // reminder fires when a loan is within this window of dueAt
 export const GARNISHMENT_RATE = 0.50; // share of each future earning diverted to a defaulted balance
@@ -136,22 +136,31 @@ function accrue(loan: Loan): Loan {
 
   const cutoff = loan.dueAt + GRACE_PERIOD_MS;
   const now = Date.now();
-  const dailyAccrualStart = Math.max(loan.lastAccrualAt, cutoff);
-  const daysElapsed = now > cutoff
-    ? Math.floor((now - dailyAccrualStart) / DAY_MS)
-    : 0;
 
-  // Normalize older loans to the current policy. Their existing balance is
-  // preserved; only future post-grace accrual uses the 5% daily rate.
-  loan.interestRate = DAILY_INTEREST_RATE;
+  const standardEffectiveNow = Math.min(now, cutoff);
+  const standardPeriods = Math.max(
+    0,
+    Math.floor((standardEffectiveNow - loan.lastAccrualAt) / WEEK_MS)
+  );
 
-  if (daysElapsed > 0 && loan.balance > 0) {
-    loan.balance = Math.round(loan.balance * Math.pow(1 + DAILY_INTEREST_RATE, daysElapsed));
-    loan.lastAccrualAt = dailyAccrualStart + daysElapsed * DAY_MS;
+  // Normalize older loans to the current standard policy. Their existing
+  // balance is preserved; future accrual follows the rules above.
+  loan.interestRate = INTEREST_RATE;
+
+  if (standardPeriods > 0 && loan.balance > 0) {
+    loan.balance = Math.round(loan.balance * Math.pow(1 + INTEREST_RATE, standardPeriods));
+    loan.lastAccrualAt += standardPeriods * WEEK_MS;
   }
 
   if (now > cutoff && loan.balance > 0) {
     loan.status = 'defaulted';
+
+    const defaultAccrualStart = Math.max(loan.lastAccrualAt, cutoff);
+    const defaultDaysElapsed = Math.floor((now - defaultAccrualStart) / DAY_MS);
+    if (defaultDaysElapsed > 0) {
+      loan.balance = Math.round(loan.balance * Math.pow(1 + DEFAULT_INTEREST_RATE, defaultDaysElapsed));
+      loan.lastAccrualAt = defaultAccrualStart + defaultDaysElapsed * DAY_MS;
+    }
   }
 
   return loan;
@@ -166,7 +175,7 @@ export async function getLoanHistory(userId: string): Promise<Loan[]> {
     if (l.status !== 'active' && l.status !== 'defaulted') return l;
     const before = `${l.balance}:${l.status}:${l.lastAccrualAt}:${l.interestRate}`;
     const accrued = accrue({ ...l });
-    if (`${accrued.balance}:${accrued.status}:${accrued.lastAccrualAt}` !== before) mutated = true;
+    if (`${accrued.balance}:${accrued.status}:${accrued.lastAccrualAt}:${accrued.interestRate}` !== before) mutated = true;
     return accrued;
   });
 
