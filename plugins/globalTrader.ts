@@ -81,7 +81,7 @@ async function runMainMenu(sock: any, message: any, chatId: string, userId: stri
 
   const result = await promptMenu(sock, message, chatId, userId, {
     title: '🌍 GLOBAL TRADER',
-    subtitle: `${rank.emoji} Rank: ${rank.label}  ·  💰 ${formatNumber(wallet.coins)} coins${events ? `\n${events}` : ''}`,
+    subtitle: `${rank.emoji} Rank: ${rank.label}  ·  💰 ${formatNumber(wallet.groqCoins)} coins${events ? `\n${events}` : ''}`,
     text: 'What would you like to do?',
     options: [
       { label: 'Source Goods', value: 'source', description: 'Buy from a supplier country' },
