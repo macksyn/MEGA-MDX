@@ -34,6 +34,8 @@ import {
   getEquipment,
   buyEquipment,
 } from '../lib/globalTraderEconomy.js';
+// Import the event helpers for price deltas
+import { getActiveEvents, getPriceMultiplier } from '../lib/globalTraderEvents.js';
 
 export const command = 'global';
 export const aliases = ['trader', 'gt', 'trade', 'port', 'portking', 'pk'];
@@ -53,7 +55,6 @@ function progressBar(value: number, max: number, size = 10): string {
   return '▰'.repeat(filled) + '▱'.repeat(size - filled);
 }
 
-// Updated to accept a currency label
 function deltaLine(amount: number, currency = 'coins'): string {
   if (amount > 0) return `▲ *+${formatNumber(amount)}* ${currency}`;
   if (amount < 0) return `▼ *-${formatNumber(Math.abs(amount))}* ${currency}`;
@@ -90,7 +91,7 @@ async function runMainMenu(sock: any, message: any, chatId: string, userId: stri
       { label: 'License & Rank', value: 'license', description: 'Check expiry, renew, view rank' },
       { label: 'Upgrades', value: 'upgrades', description: 'Clearing Agent & Warehouse tiers' },
       { label: 'Wallet', value: 'wallet' },
-      { label: 'Market Conditions', value: 'conditions', description: events ? '⚡ Active events affecting trade' : 'All quiet right now' },
+      { label: '📰 Market News', value: 'news', description: events ? '⚡ Latest market conditions' : 'Check what’s moving today' },
     ],
     cancelLabel: 'Exit',
   });
@@ -105,7 +106,7 @@ async function runMainMenu(sock: any, message: any, chatId: string, userId: stri
     case 'license':    outcome = await runLicenseMenu(sock, message, chatId, userId); break;
     case 'upgrades':   outcome = await runUpgradesMenu(sock, message, chatId, userId); break;
     case 'wallet':     await sendWalletCard(sock, chatId, userId); outcome = 'back'; break;
-    case 'conditions': await sendMarketConditions(sock, chatId); outcome = 'back'; break;
+    case 'news':       await sendMarketNews(sock, chatId); outcome = 'back'; break;
   }
 
   if (outcome === 'back') return runMainMenu(sock, message, chatId, userId);
@@ -117,15 +118,18 @@ async function runSourceMenu(sock: any, message: any, chatId: string, userId: st
   const rank = await getPlayerRank(userId);
   const unlocked = COUNTRIES.filter(c => rank.unlockedCountries.includes(c.key));
 
-  const options = await Promise.all(unlocked.map(async c => {
-    const stock = await getStockLevel(c.key);
-    const good = GOODS[c.goodKey];
+  const options = unlocked.map(c => {
+    const goods = c.goodKeys.map((k: string) => GOODS[k]);
+    const prices = goods.map((g: any) => g.baseCost);
+    const priceRange = Math.min(...prices) === Math.max(...prices)
+      ? `${formatNumber(Math.min(...prices))} Groq Coins/unit`
+      : `${formatNumber(Math.min(...prices))}–${formatNumber(Math.max(...prices))} Groq Coins/unit`;
     return {
       label: `${c.emoji} ${c.label}`,
       value: c.key,
-      description: `${good.label} (${formatNumber(good.baseCost)} Groq Coins/unit) · ${stock.remaining}/${stock.cap} left today\n     ${good.traitLine}`,
+      description: `${goods.length} products · ${priceRange}\n     ${goods.map((g: any) => g.label).join(', ')}`,
     };
-  }));
+  });
 
   const locked = COUNTRIES.length - unlocked.length;
   const result = await promptMenu(sock, message, chatId, userId, {
@@ -140,12 +144,57 @@ async function runSourceMenu(sock: any, message: any, chatId: string, userId: st
   if (result.timedOut || !result.value) return;
 
   const country = COUNTRIES.find(c => c.key === result.value);
-  const outcome = await runFreightMenu(sock, message, chatId, userId, country);
+  const outcome = await runProductMenu(sock, message, chatId, userId, country);
   if (outcome === 'back') return runSourceMenu(sock, message, chatId, userId);
   return outcome;
 }
 
-async function runFreightMenu(sock: any, message: any, chatId: string, userId: string, country: any) {
+// ── Product Menu with dynamic market indicators ────────────────────
+
+async function runProductMenu(sock: any, message: any, chatId: string, userId: string, country: any) {
+  // Fetch active events once
+  const activeEvents = await getActiveEvents();
+  const eventsMap = new Map<string, number>(); // goodKey -> total price multiplier from events
+  for (const e of activeEvents) {
+    if (e.effects.priceMultiplier && e.effects.affectedGoods) {
+      for (const gk of e.effects.affectedGoods) {
+        eventsMap.set(gk, (eventsMap.get(gk) || 1) * e.effects.priceMultiplier);
+      }
+    }
+  }
+
+  const options = await Promise.all(country.goodKeys.map(async (k: string) => {
+    const good = GOODS[k];
+    const stock = await getStockLevel(country.key, k);
+    const priceMult = eventsMap.get(k) || 1;
+    let indicator = '';
+    if (priceMult > 1.02) indicator = `📈 +${Math.round((priceMult-1)*100)}%`;
+    else if (priceMult < 0.98) indicator = `📉 ${Math.round((priceMult-1)*100)}%`;
+    const desc = `${formatNumber(good.baseCost)} Groq Coins/unit · ${stock.remaining}/${stock.cap} left today${indicator ? `  ${indicator}` : ''}`;
+    return {
+      label: good.label,
+      value: good.key,
+      description: desc,
+    };
+  }));
+
+  const result = await promptMenu(sock, message, chatId, userId, {
+    title: `${country.emoji} ${country.label} · Choose Product`,
+    text: 'What do you want to source?',
+    options,
+    cancelLabel: 'Back',
+  });
+
+  if (result.cancelled) return 'back';
+  if (result.timedOut || !result.value) return;
+
+  const good = GOODS[result.value];
+  const outcome = await runFreightMenu(sock, message, chatId, userId, country, good);
+  if (outcome === 'back') return runProductMenu(sock, message, chatId, userId, country);
+  return outcome;
+}
+
+async function runFreightMenu(sock: any, message: any, chatId: string, userId: string, country: any, good: any) {
   const rank = await getPlayerRank(userId);
 
   const options = FREIGHT_TIERS
@@ -158,6 +207,7 @@ async function runFreightMenu(sock: any, message: any, chatId: string, userId: s
 
   const result = await promptMenu(sock, message, chatId, userId, {
     title: `🚢 ${country.emoji} ${country.label} · Choose Carrier`,
+    subtitle: `Sourcing: ${good.label}`,
     text: 'Select a shipping company:',
     options,
     cancelLabel: 'Back',
@@ -166,13 +216,13 @@ async function runFreightMenu(sock: any, message: any, chatId: string, userId: s
   if (result.cancelled) return 'back';
   if (result.timedOut || !result.value) return;
 
-  const outcome = await runQuantityMenu(sock, message, chatId, userId, country, result.value);
-  if (outcome === 'back') return runFreightMenu(sock, message, chatId, userId, country);
+  const outcome = await runQuantityMenu(sock, message, chatId, userId, country, good, result.value);
+  if (outcome === 'back') return runFreightMenu(sock, message, chatId, userId, country, good);
   return outcome;
 }
 
-async function runQuantityMenu(sock: any, message: any, chatId: string, userId: string, country: any, freightKey: string) {
-  const stock = await getStockLevel(country.key);
+async function runQuantityMenu(sock: any, message: any, chatId: string, userId: string, country: any, good: any, freightKey: string) {
+  const stock = await getStockLevel(country.key, good.key);
   const freight = FREIGHT_TIERS.find(f => f.key === freightKey);
 
   const options = QUANTITY_PRESETS
@@ -189,14 +239,14 @@ async function runQuantityMenu(sock: any, message: any, chatId: string, userId: 
 
   if (!options.length) {
     await sock.sendMessage(chatId, {
-      text: `${header()}\n❌ Not enough stock left today for ${country.label}.\n_Try again after tomorrow's reset._`,
+      text: `${header()}\n❌ Not enough stock left today for ${good.label} from ${country.label}.\n_Try again after tomorrow's reset, or pick another product._`,
     });
     return;
   }
 
   const result = await promptMenu(sock, message, chatId, userId, {
-    title: `📦 ${country.label} · Quantity`,
-    subtitle: `Stock left today: ${stock.remaining}/${stock.cap}  ·  1 container = ${country.containerCapacity} units`,
+    title: `📦 ${good.label} · Quantity`,
+    subtitle: `${country.emoji} ${country.label} · Stock left today: ${stock.remaining}/${stock.cap}  ·  1 container = ${country.containerCapacity} units`,
     text: 'How many units?',
     options,
     cancelLabel: 'Back',
@@ -207,7 +257,7 @@ async function runQuantityMenu(sock: any, message: any, chatId: string, userId: 
 
   const qty = parseInt(result.value, 10);
 
-  const purchase = await sourceShipment(userId, country.key, freightKey, qty);
+  const purchase = await sourceShipment(userId, country.key, good.key, freightKey, qty);
   if (!purchase.success) {
     await sock.sendMessage(chatId, { text: `${header()}\n❌ ${purchase.reason || 'Could not source that shipment.'}` });
     return;
@@ -218,7 +268,7 @@ async function runQuantityMenu(sock: any, message: any, chatId: string, userId: 
     text:
       `📝 ORDER PLACED\n${DIVIDER}\n` +
       `${header()}\n` +
-      `#${s.id} — ${country.goodLabel} (${country.label})\n` +
+      `#${s.id} — ${good.label} (${country.label})\n` +
       `Qty: ${qty}  ·  Carrier: ${freight.label}  ·  ${s.containersUsed} container${s.containersUsed > 1 ? 's' : ''}\n` +
       `${DIVIDER}\n` +
       `Goods (GC): ${formatNumber(s.goodsCost)}  +  Freight (GC): ${formatNumber(s.freightCost)}\n` +
@@ -240,12 +290,6 @@ async function runShipmentsMenu(sock: any, message: any, chatId: string, userId:
     return;
   }
 
-  // BUG FIX: this used to intercept BEFORE rendering anything — if any
-  // in-transit shipment had a pending event, the player couldn't see their
-  // tracker at all until they resolved it, and skipping via "0" left it
-  // pending forever, permanently re-blocking the screen on every visit.
-  // Now the tracker always renders; a pending event just shows as a flag
-  // on that shipment's card, and picking that shipment surfaces the event.
   const pendingByShipment = new Map<string, string>();
   for (const s of shipments) {
     if (s.status === 'in_transit') {
@@ -288,7 +332,7 @@ async function runShipmentsMenu(sock: any, message: any, chatId: string, userId:
   let outcome: any;
   if (pendingByShipment.has(chosen.id)) {
     const handled = await runEventMenu(sock, message, chatId, userId, chosen, pendingByShipment.get(chosen.id)!);
-    outcome = 'back'; // whether resolved or skipped, return to the tracker — never eject to main menu
+    outcome = 'back';
     void handled;
   } else {
     const progress = await getShipmentProgress(chosen);
@@ -568,8 +612,6 @@ async function runLicenseMenu(sock: any, message: any, chatId: string, userId: s
 }
 
 // ── Upgrades: Clearing Agent & Warehouse ────────────────────────────────
-// This entire section was missing from the last build — restoring it here,
-// same numbered-menu + back-nav pattern as everywhere else.
 
 async function runUpgradesMenu(sock: any, message: any, chatId: string, userId: string) {
   const equip = await getEquipment(userId);
@@ -677,10 +719,14 @@ async function sendWalletCard(sock: any, chatId: string, userId: string) {
   });
 }
 
-async function sendMarketConditions(sock: any, chatId: string) {
+// ── Market News ──────────────────────────────────────────────────────
+
+async function sendMarketNews(sock: any, chatId: string) {
   const detail = await getEventsDetailBlock();
+  const intro = '📰 *NIGERIAN MARKET REPORT*\n' + DIVIDER + '\n';
+  const body = detail || '_No market conditions in effect right now — business as usual._';
   return sock.sendMessage(chatId, {
-    text: `${header('📊 Market Conditions')}\n${detail}`,
+    text: intro + body,
   });
 }
 
