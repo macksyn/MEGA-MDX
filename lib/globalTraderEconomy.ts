@@ -29,6 +29,14 @@ const licensesTbl = store.table('licenses');
 const stockTbl = store.table('stock');
 const marketTbl = store.table('market');
 const statsTbl = store.table('stats');
+async function getStats(userId: string) {
+  const stats = await statsTbl.get(userId) || { 
+    lifetimeNetProfit: 0, 
+    lifetimeTradingVolume: 0, 
+    completedShipments: 0 
+  };
+  return stats;
+}
 const equipmentTbl = store.table('equipment'); // userId -> { clearingAgent: tierKey, warehouse: tierKey }
 
 // ── Goods Registry ─────────────────────────────────────────────────────
