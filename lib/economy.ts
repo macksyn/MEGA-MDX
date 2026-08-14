@@ -30,6 +30,8 @@ const processed   = root.table('processed');
 const feePool     = root.table('feePool'); // accumulated fees from peer-to-peer exchanges
 const transactionsTbl = root.table('transactions'); // per-user ledger, keyed by userId -> array
 const exchangeDebtsTbl = root.table('exchangeDebts'); // per-user pending reciprocal !exchange debts, keyed by debtorId -> array
+// ---- NEW: exchange history for rolling requirement ----
+const exchangeHistoryTbl = root.table('exchangeHistory'); // userId -> number[] (timestamps)
 
 const TZ = config.timeZone || 'Africa/Lagos';
 
@@ -49,13 +51,13 @@ interface EconomySettings {
 }
 
 const DEFAULT_SETTINGS: EconomySettings = {
-  coinsPerGroqCoin: Number(process.env.ECONOMY_COINS_PER_GROQCOIN) || 1,
+  coinsPerGroqCoin: Number(process.env.ECONOMY_COINS_PER_GROQCOIN) || 100,
   groqCoinWithdrawThreshold: Number(process.env.ECONOMY_GROQCOIN_WITHDRAW_THRESHOLD) || 50,
   workMin: Number(process.env.ECONOMY_WORK_MIN) || 50,
   workMax: Number(process.env.ECONOMY_WORK_MAX) || 300,
   workCooldownMs: Number(process.env.ECONOMY_WORK_COOLDOWN_MS) || 60 * 60 * 1000, // 1hr
   top3Rewards: [300, 200, 100],
-  exchangeFeePercent: Number(process.env.ECONOMY_EXCHANGE_FEE_PERCENT) || 10,
+  exchangeFeePercent: Number(process.env.ECONOMY_EXCHANGE_FEE_PERCENT) || 15,
   exchangeAllowedAmounts: [10, 20, 50, 100],
   fineAmount: Number(process.env.ECONOMY_FINE_AMOUNT) || 20,
   economyGroupId: process.env.ECONOMY_GROUP_ID || null,
@@ -397,11 +399,44 @@ export async function deductGroqCoins(userId: string, amount: number, meta: Tran
   return { success: true, wallet: saved };
 }
 
-export async function addExchange(userId: string, amount = 1): Promise<Wallet> {
-  const wallet = await getWallet(userId);
-  wallet.exchangeCount += amount;
-  return saveWallet(userId, wallet);
+// ── Exchange History (rolling 7‑day requirement) ──────────────────────────
+
+const EXCHANGE_HISTORY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // keep 30 days
+const ROLLING_WINDOW_DAYS = 7;
+const MIN_ROLLING_EXCHANGES_FOR_LEVEL_2 = 100;
+
+/**
+ * Get the raw array of exchange timestamps for a user.
+ */
+export async function getExchangeHistory(userId: string): Promise<number[]> {
+  return (await exchangeHistoryTbl.get(userId)) || [];
 }
+
+/**
+ * Record a new exchange timestamp and prune old entries (>30 days).
+ */
+export async function recordExchange(userId: string): Promise<void> {
+  const history = await getExchangeHistory(userId);
+  history.push(Date.now());
+  // Prune entries older than 30 days to keep storage small
+  const cutoff = Date.now() - EXCHANGE_HISTORY_MAX_AGE_MS;
+  const filtered = history.filter(ts => ts > cutoff);
+  await exchangeHistoryTbl.set(userId, filtered);
+}
+
+/**
+ * Get the number of exchanges performed in the last `days` days.
+ */
+export async function getRollingExchangeCount(
+  userId: string,
+  days: number = ROLLING_WINDOW_DAYS
+): Promise<number> {
+  const history = await getExchangeHistory(userId);
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  return history.filter(ts => ts > cutoff).length;
+}
+
+// ── Level definitions ──────────────────────────────────────────────────────
 
 const LEVEL_DEFS = [
   { name: 'Novice', nextName: 'Active', threshold: 0 },
@@ -417,7 +452,17 @@ function createProgressBar(percent: number, size = 10): string {
   return `${'█'.repeat(safeFilled)}${'░'.repeat(size - safeFilled)}`;
 }
 
-export function getLevelInfo(exchangeCount: number): {
+/**
+ * Compute level info with rolling requirement:
+ * - If lifetime level >= 2 but rollingCount < MIN_ROLLING_EXCHANGES_FOR_LEVEL_2,
+ *   effective level is forced to 1 (Novice).
+ * - The `isActive` flag indicates whether the user meets the rolling requirement
+ *   (useful for displaying warnings).
+ */
+export function getLevelInfo(
+  exchangeCount: number,
+  rollingCount: number = 0
+): {
   levelNumber: number;
   levelName: string;
   nextLevelName: string | null;
@@ -425,16 +470,31 @@ export function getLevelInfo(exchangeCount: number): {
   current: number;
   next: number;
   bar: string;
+  isActive: boolean;
+  rollingRequired: number;
+  rollingCount: number;
+  exchangesNeededToMaintain: number;
 } {
   const safeCount = Math.max(0, Math.floor(exchangeCount || 0));
-  let levelIndex = LEVEL_DEFS.length - 1;
+  const safeRolling = Math.max(0, Math.floor(rollingCount || 0));
 
+  // Find base level from lifetime count
+  let levelIndex = LEVEL_DEFS.length - 1;
   while (levelIndex > 0 && safeCount < LEVEL_DEFS[levelIndex].threshold) {
     levelIndex -= 1;
   }
 
-  const currentLevel = LEVEL_DEFS[levelIndex];
-  const nextLevel = LEVEL_DEFS[levelIndex + 1] || null;
+  const baseLevelNumber = levelIndex + 1;
+
+  // Apply rolling requirement for level 2+
+  const minRolling = MIN_ROLLING_EXCHANGES_FOR_LEVEL_2;
+  let effectiveIndex = levelIndex;
+  if (baseLevelNumber >= 2 && safeRolling < minRolling) {
+    effectiveIndex = 0; // demote to level 1 (Novice)
+  }
+
+  const currentLevel = LEVEL_DEFS[effectiveIndex];
+  const nextLevel = LEVEL_DEFS[effectiveIndex + 1] || null;
   const rangeStart = currentLevel.threshold;
   const rangeEnd = nextLevel ? nextLevel.threshold : rangeStart + 25;
   const totalForLevel = Math.max(1, rangeEnd - rangeStart);
@@ -442,179 +502,22 @@ export function getLevelInfo(exchangeCount: number): {
     ? Math.min(100, Math.max(0, Math.round(((safeCount - rangeStart) / totalForLevel) * 100)))
     : 100;
 
+  // Compute how many more exchanges needed to meet the rolling requirement
+  const exchangesNeededToMaintain = Math.max(0, minRolling - safeRolling);
+
   return {
-    levelNumber: levelIndex + 1,
+    levelNumber: effectiveIndex + 1,
     levelName: currentLevel.name,
     nextLevelName: currentLevel.nextName,
     progressPercent,
     current: safeCount,
     next: nextLevel ? nextLevel.threshold : safeCount,
     bar: createProgressBar(progressPercent),
+    isActive: effectiveIndex >= 1 && safeRolling >= minRolling,
+    rollingRequired: minRolling,
+    rollingCount: safeRolling,
+    exchangesNeededToMaintain,
   };
-}
-
-export async function transferCoins(fromId: string, toId: string, amount: number): Promise<{ success: boolean; reason?: string }> {
-  if (amount <= 0) return { success: false, reason: 'invalid_amount' };
-  if (fromId === toId) return { success: false, reason: 'self_transfer' };
-
-  const from = await deductCoins(fromId, amount, { type: 'transfer_out', counterpartyId: toId });
-  if (!from.success) return { success: false, reason: 'insufficient_funds' };
-
-  await addCoins(toId, amount, { type: 'transfer_in', counterpartyId: fromId });
-  return { success: true };
-}
-
-export async function convertCoinsToGroqCoins(userId: string, coinsAmount: number): Promise<{ success: boolean; reason?: string; groqCoinsGained?: number }> {
-  const settings = await getSettings();
-  if (coinsAmount < settings.coinsPerGroqCoin) {
-    return { success: false, reason: 'below_minimum' };
-  }
-  const groqCoinsGained = Math.floor(coinsAmount / settings.coinsPerGroqCoin);
-  const coinsToSpend = groqCoinsGained * settings.coinsPerGroqCoin;
-
-  const result = await deductCoins(userId, coinsToSpend, { type: 'convert', note: 'coins → Groq Coins' });
-  if (!result.success) return { success: false, reason: 'insufficient_funds' };
-
-  await addGroqCoins(userId, groqCoinsGained, { type: 'convert', note: 'coins → Groq Coins' });
-  await addExchange(userId, 1);
-  return { success: true, groqCoinsGained };
-}
-
-// ── Peer-to-peer exchange (Taka-style "beans" trade) ─────────────────────────
-// Unlike convertCoinsToGroqCoins (self-service conversion, kept above for any
-// other callers), THIS is the mechanic behind the !exchange command: you
-// spend your own coins, but the resulting Groq Coins land in the TARGET
-// member's wallet, minus a fee that's routed to the fee pool rather than
-// disappearing or going to either party. To get your own Groq Coins, someone
-// else has to run !exchange targeting you.
-
-/** Add to the persistent fee pool (Groq Coins collected from !exchange fees). */
-export async function addToFeePool(amount: number): Promise<number> {
-  if (amount <= 0) return getFeePoolBalance();
-  const current = (await feePool.get('groqCoins')) || 0;
-  const updated = current + amount;
-  await feePool.set('groqCoins', updated);
-  return updated;
-}
-
-/** Current fee pool balance, in Groq Coins. */
-export async function getFeePoolBalance(): Promise<number> {
-  return (await feePool.get('groqCoins')) || 0;
-}
-
-/** Owner-only: drain the fee pool (e.g. after spending it on something), returning what was drained. */
-export async function drainFeePool(): Promise<number> {
-  const current = await getFeePoolBalance();
-  await feePool.set('groqCoins', 0);
-  return current;
-}
-
-export async function exchangeWithMember(senderId: string, targetId: string, coinsAmount: number): Promise<
-  | { success: false; reason: 'invalid_amount' | 'amount_not_allowed' | 'self_exchange' | 'below_minimum' | 'insufficient_funds' }
-  | { success: true; coinsSpent: number; groqCoinsGained: number; fee: number; debtResolved: boolean }
-> {
-  if (!coinsAmount || coinsAmount <= 0) return { success: false, reason: 'invalid_amount' };
-  if (senderId === targetId) return { success: false, reason: 'self_exchange' };
-
-  const settings = await getSettings();
-
-  // Amount must be one of the admin-configured whitelist (default
-  // 10/20/50/100) — keeps !exchange predictable rather than arbitrary
-  // amounts. NOTE: this is independent of coinsPerGroqCoin (the conversion
-  // rate) — if coinsPerGroqCoin is set higher than an allowed amount, that
-  // amount will still fail with 'below_minimum' below. Keep the two settings
-  // coherent (e.g. set coinsPerGroqCoin <= the smallest allowed amount) if
-  // you want every whitelisted amount to actually be usable.
-  if (!settings.exchangeAllowedAmounts.includes(coinsAmount)) {
-    return { success: false, reason: 'amount_not_allowed' };
-  }
-
-  if (coinsAmount < settings.coinsPerGroqCoin) {
-    return { success: false, reason: 'below_minimum' };
-  }
-
-  // Only the portion of coinsAmount that converts evenly is actually spent
-  // (same rounding behavior as convertCoinsToGroqCoins).
-  const groqCoinsGross = Math.floor(coinsAmount / settings.coinsPerGroqCoin);
-  const coinsToSpend = groqCoinsGross * settings.coinsPerGroqCoin;
-
-  const spend = await deductCoins(senderId, coinsToSpend, { type: 'exchange_out', counterpartyId: targetId });
-  if (!spend.success) return { success: false, reason: 'insufficient_funds' };
-
-  const feePercent = settings.exchangeFeePercent;
-  const fee = Math.floor(groqCoinsGross * feePercent / 100);
-  const netGroqCoins = groqCoinsGross - fee;
-
-  if (netGroqCoins > 0) await addGroqCoins(targetId, netGroqCoins, { type: 'exchange_in', counterpartyId: senderId });
-  if (fee > 0) await addToFeePool(fee);
-
-  // Counts toward the SENDER's exchange-level progress, same as self-conversion did.
-  await addExchange(senderId, 1);
-
-  // Reciprocal debt bookkeeping: if the sender previously benefited from an
-  // exchange FROM the target (i.e. sender already owed target a reciprocal),
-  // this exchange settles that debt. Either way, the target now owes the
-  // sender a reciprocal exchange going forward — that's the whole "Peter
-  // sends Paul, so now Paul owes Peter" loop.
-  const debtResolved = await resolveOldestDebt(senderId, targetId);
-  await addDebt(targetId, senderId);
-
-  return { success: true, coinsSpent: coinsToSpend, groqCoinsGained: netGroqCoins, fee, debtResolved };
-}
-
-// ── Reciprocal exchange debt ledger ───────────────────────────────────────────
-// Tracks, per debtor, who they still "owe" a reciprocal !exchange to. Purely
-// informational (nothing is auto-charged) — powers the "who owes me" /
-// "who do I owe" views and the post-exchange nudge message.
-
-interface ExchangeDebt {
-  id: string;
-  creditorId: string; // the person who is owed a reciprocal exchange
-  timestamp: number;
-}
-
-const MAX_DEBTS_PER_USER = 100;
-
-async function addDebt(debtorId: string, creditorId: string): Promise<void> {
-  try {
-    const list: ExchangeDebt[] = (await exchangeDebtsTbl.get(debtorId)) || [];
-    list.push({ id: `debt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, creditorId, timestamp: Date.now() });
-    if (list.length > MAX_DEBTS_PER_USER) list.splice(0, list.length - MAX_DEBTS_PER_USER);
-    await exchangeDebtsTbl.set(debtorId, list);
-  } catch (_) {
-    // Best-effort — debt tracking should never break the underlying exchange.
-  }
-}
-
-/** Resolves (removes) the oldest debt debtorId owes to creditorId, if any. Returns whether one was found. */
-async function resolveOldestDebt(debtorId: string, creditorId: string): Promise<boolean> {
-  try {
-    const list: ExchangeDebt[] = (await exchangeDebtsTbl.get(debtorId)) || [];
-    const idx = list.findIndex(d => d.creditorId === creditorId);
-    if (idx === -1) return false;
-    list.splice(idx, 1);
-    await exchangeDebtsTbl.set(debtorId, list);
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-/** Reciprocal exchanges this user still owes to others (they received, haven't paid back yet). */
-export async function getDebtsOwedByUser(userId: string): Promise<ExchangeDebt[]> {
-  return (await exchangeDebtsTbl.get(userId)) || [];
-}
-
-/** Who still owes THIS user a reciprocal exchange (they sent coins to these people, no payback yet). */
-export async function getDebtsOwedToUser(userId: string): Promise<Array<{ debtorId: string; timestamp: number }>> {
-  const all = (await exchangeDebtsTbl.getAll()) || {};
-  const results: Array<{ debtorId: string; timestamp: number }> = [];
-  for (const [debtorId, list] of Object.entries(all as Record<string, ExchangeDebt[]>)) {
-    for (const d of list) {
-      if (d.creditorId === userId) results.push({ debtorId, timestamp: d.timestamp });
-    }
-  }
-  return results.sort((a, b) => a.timestamp - b.timestamp);
 }
 
 // ── Attendance-triggered daily bonus ──────────────────────────────────────────
@@ -653,17 +556,16 @@ export async function awardAttendanceBonus(
     return { success: false, reason: 'already_awarded_today' };
   }
 
-  // Attendance coin bonuses are restricted to level 2+ (economy exchangeCount
-  // level, see getLevelInfo/LEVEL_DEFS). Level 1 members still get their
-  // attendance recorded — streak and lastDailyDate update as normal — they
-  // just don't get paid out. No message/flag is surfaced to the user about
-  // this; attendance.ts simply omits the bonus line when levelGated is true.
-  const { levelNumber } = getLevelInfo(wallet.exchangeCount);
+  // Fetch rolling exchange count for the last 7 days
+  const rollingCount = await getRollingExchangeCount(userId, 7);
+  const { levelNumber } = getLevelInfo(wallet.exchangeCount, rollingCount);
+
   if (levelNumber < 2) {
+    // Level too low (either lifetime <25 or rolling <100) – no coin reward
     wallet.dailyStreak = streak;
     wallet.lastDailyDate = today;
     await saveWallet(userId, wallet);
-    return { success: true, reward: 0, garnished: 0, capped: false, levelGated: true };
+    return { success: true, reward: 0, capped: false, levelGated: true };
   }
 
   const pool = await getJackpotPool();
@@ -973,4 +875,152 @@ export async function equipEquipment(userId: string, type: 'boat' | 'net' | 'bai
   patch[`equipment.${type}`] = tier;
   await wallets.patch(userId, patch);
   return { success: true };
+}
+
+// ── Peer-to-peer exchange (Taka-style "beans" trade) ─────────────────────────
+// Unlike convertCoinsToGroqCoins (self-service conversion, kept above for any
+// other callers), THIS is the mechanic behind the !exchange command: you
+// spend your own coins, but the resulting Groq Coins land in the TARGET
+// member's wallet, minus a fee that's routed to the fee pool rather than
+// disappearing or going to either party. To get your own Groq Coins, someone
+// else has to run !exchange targeting you.
+
+/** Add to the persistent fee pool (Groq Coins collected from !exchange fees). */
+export async function addToFeePool(amount: number): Promise<number> {
+  if (amount <= 0) return getFeePoolBalance();
+  const current = (await feePool.get('groqCoins')) || 0;
+  const updated = current + amount;
+  await feePool.set('groqCoins', updated);
+  return updated;
+}
+
+/** Current fee pool balance, in Groq Coins. */
+export async function getFeePoolBalance(): Promise<number> {
+  return (await feePool.get('groqCoins')) || 0;
+}
+
+/** Owner-only: drain the fee pool (e.g. after spending it on something), returning what was drained. */
+export async function drainFeePool(): Promise<number> {
+  const current = await getFeePoolBalance();
+  await feePool.set('groqCoins', 0);
+  return current;
+}
+
+export async function exchangeWithMember(senderId: string, targetId: string, coinsAmount: number): Promise<
+  | { success: false; reason: 'invalid_amount' | 'amount_not_allowed' | 'self_exchange' | 'below_minimum' | 'insufficient_funds' }
+  | { success: true; coinsSpent: number; groqCoinsGained: number; fee: number; debtResolved: boolean }
+> {
+  if (!coinsAmount || coinsAmount <= 0) return { success: false, reason: 'invalid_amount' };
+  if (senderId === targetId) return { success: false, reason: 'self_exchange' };
+
+  const settings = await getSettings();
+
+  // Amount must be one of the admin-configured whitelist (default
+  // 10/20/50/100) — keeps !exchange predictable rather than arbitrary
+  // amounts. NOTE: this is independent of coinsPerGroqCoin (the conversion
+  // rate) — if coinsPerGroqCoin is set higher than an allowed amount, that
+  // amount will still fail with 'below_minimum' below. Keep the two settings
+  // coherent (e.g. set coinsPerGroqCoin <= the smallest allowed amount) if
+  // you want every whitelisted amount to actually be usable.
+  if (!settings.exchangeAllowedAmounts.includes(coinsAmount)) {
+    return { success: false, reason: 'amount_not_allowed' };
+  }
+
+  if (coinsAmount < settings.coinsPerGroqCoin) {
+    return { success: false, reason: 'below_minimum' };
+  }
+
+  // Only the portion of coinsAmount that converts evenly is actually spent
+  // (same rounding behavior as convertCoinsToGroqCoins).
+  const groqCoinsGross = Math.floor(coinsAmount / settings.coinsPerGroqCoin);
+  const coinsToSpend = groqCoinsGross * settings.coinsPerGroqCoin;
+
+  const spend = await deductCoins(senderId, coinsToSpend, { type: 'exchange_out', counterpartyId: targetId });
+  if (!spend.success) return { success: false, reason: 'insufficient_funds' };
+
+  const feePercent = settings.exchangeFeePercent;
+  const fee = Math.floor(groqCoinsGross * feePercent / 100);
+  const netGroqCoins = groqCoinsGross - fee;
+
+  if (netGroqCoins > 0) await addGroqCoins(targetId, netGroqCoins, { type: 'exchange_in', counterpartyId: senderId });
+  if (fee > 0) await addToFeePool(fee);
+
+  // Counts toward the SENDER's exchange-level progress, same as self-conversion did.
+  await addExchange(senderId, 1);
+
+  // Reciprocal debt bookkeeping: if the sender previously benefited from an
+  // exchange FROM the target (i.e. sender already owed target a reciprocal),
+  // this exchange settles that debt. Either way, the target now owes the
+  // sender a reciprocal exchange going forward — that's the whole "Peter
+  // sends Paul, so now Paul owes Peter" loop.
+  const debtResolved = await resolveOldestDebt(senderId, targetId);
+  await addDebt(targetId, senderId);
+
+  return { success: true, coinsSpent: coinsToSpend, groqCoinsGained: netGroqCoins, fee, debtResolved };
+}
+
+// ── Reciprocal exchange debt ledger ───────────────────────────────────────────
+// Tracks, per debtor, who they still "owe" a reciprocal !exchange to. Purely
+// informational (nothing is auto-charged) — powers the "who owes me" /
+// "who do I owe" views and the post-exchange nudge message.
+
+interface ExchangeDebt {
+  id: string;
+  creditorId: string; // the person who is owed a reciprocal exchange
+  timestamp: number;
+}
+
+const MAX_DEBTS_PER_USER = 100;
+
+async function addDebt(debtorId: string, creditorId: string): Promise<void> {
+  try {
+    const list: ExchangeDebt[] = (await exchangeDebtsTbl.get(debtorId)) || [];
+    list.push({ id: `debt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, creditorId, timestamp: Date.now() });
+    if (list.length > MAX_DEBTS_PER_USER) list.splice(0, list.length - MAX_DEBTS_PER_USER);
+    await exchangeDebtsTbl.set(debtorId, list);
+  } catch (_) {
+    // Best-effort — debt tracking should never break the underlying exchange.
+  }
+}
+
+/** Resolves (removes) the oldest debt debtorId owes to creditorId, if any. Returns whether one was found. */
+async function resolveOldestDebt(debtorId: string, creditorId: string): Promise<boolean> {
+  try {
+    const list: ExchangeDebt[] = (await exchangeDebtsTbl.get(debtorId)) || [];
+    const idx = list.findIndex(d => d.creditorId === creditorId);
+    if (idx === -1) return false;
+    list.splice(idx, 1);
+    await exchangeDebtsTbl.set(debtorId, list);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/** Reciprocal exchanges this user still owes to others (they received, haven't paid back yet). */
+export async function getDebtsOwedByUser(userId: string): Promise<ExchangeDebt[]> {
+  return (await exchangeDebtsTbl.get(userId)) || [];
+}
+
+/** Who still owes THIS user a reciprocal exchange (they sent coins to these people, no payback yet). */
+export async function getDebtsOwedToUser(userId: string): Promise<Array<{ debtorId: string; timestamp: number }>> {
+  const all = (await exchangeDebtsTbl.getAll()) || {};
+  const results: Array<{ debtorId: string; timestamp: number }> = [];
+  for (const [debtorId, list] of Object.entries(all as Record<string, ExchangeDebt[]>)) {
+    for (const d of list) {
+      if (d.creditorId === userId) results.push({ debtorId, timestamp: d.timestamp });
+    }
+  }
+  return results.sort((a, b) => a.timestamp - b.timestamp);
+}
+
+// ── Exchange count updater (also records history) ────────────────────────────
+
+export async function addExchange(userId: string, amount = 1): Promise<Wallet> {
+  const wallet = await getWallet(userId);
+  wallet.exchangeCount += amount;
+  await saveWallet(userId, wallet);
+  // Record timestamp for rolling requirement
+  await recordExchange(userId);
+  return wallet;
 }
