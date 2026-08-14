@@ -20,6 +20,7 @@ import {
   getCourierRiskDelta,
   getClearanceDelayMs,
   getEventsStatusBlock,
+  getEventsDetailBlock,
 } from './globalTraderEvents.js';
 
 const store = createStore('globaltrader');
@@ -154,6 +155,7 @@ export interface CountryDef {
   emoji: string;
   goodKey: string;
   baseFreightFee: number;
+  containerCapacity: number; // units a single freight payment covers — order more, pay for more containers
   distanceHrs: number;
   risk: RiskTier;
   dutyRatePercent: number;
@@ -162,18 +164,18 @@ export interface CountryDef {
 }
 
 export const COUNTRIES: CountryDef[] = [
-  { key: 'benin',   label: 'Cotonou',     emoji: '🇧🇯', goodKey: 'rice',          baseFreightFee: 800,  distanceHrs: 6,  risk: 'high',   dutyRatePercent: 10, dailyStockCap: 200, licenseRenewCost: 1500 },
-  { key: 'india',   label: 'India',        emoji: '🇮🇳', goodKey: 'pharmaceuticals', baseFreightFee: 3000, distanceHrs: 30, risk: 'medium', dutyRatePercent: 12, dailyStockCap: 180, licenseRenewCost: 2500 },
-  { key: 'thailand', label: 'Thailand',   emoji: '🇹🇭', goodKey: 'rubber',        baseFreightFee: 3000, distanceHrs: 30, risk: 'medium', dutyRatePercent: 12, dailyStockCap: 180, licenseRenewCost: 2500 },
-  { key: 'turkey',   label: 'Turkey',      emoji: '🇹🇷', goodKey: 'textiles',      baseFreightFee: 2500, distanceHrs: 24, risk: 'low',    dutyRatePercent: 12, dailyStockCap: 130, licenseRenewCost: 4500 },
-  { key: 'china',    label: 'China',       emoji: '🇨🇳', goodKey: 'electronics',   baseFreightFee: 4000, distanceHrs: 48, risk: 'medium', dutyRatePercent: 14, dailyStockCap: 200, licenseRenewCost: 5000 },
-  { key: 'brazil',   label: 'Brazil',      emoji: '🇧🇷', goodKey: 'coffee_leather', baseFreightFee: 4500, distanceHrs: 48, risk: 'medium', dutyRatePercent: 14, dailyStockCap: 130, licenseRenewCost: 5500 },
-  { key: 'spain',    label: 'Spain',       emoji: '🇪🇸', goodKey: 'olive_wine',    baseFreightFee: 2500, distanceHrs: 24, risk: 'low',    dutyRatePercent: 14, dailyStockCap: 110, licenseRenewCost: 7000 },
-  { key: 'saudi',    label: 'Saudi Arabia', emoji: '🇸🇦', goodKey: 'dates_textiles', baseFreightFee: 2200, distanceHrs: 18, risk: 'low',    dutyRatePercent: 14, dailyStockCap: 110, licenseRenewCost: 7500 },
-  { key: 'france',   label: 'France',      emoji: '🇫🇷', goodKey: 'perfume_cosmetics', baseFreightFee: 5000, distanceHrs: 40, risk: 'low',   dutyRatePercent: 18, dailyStockCap: 70,  licenseRenewCost: 14000 },
-  { key: 'uae',      label: 'UAE',         emoji: '🇦🇪', goodKey: 'gold_perfume',   baseFreightFee: 1500, distanceHrs: 12, risk: 'low',    dutyRatePercent: 18, dailyStockCap: 60,  licenseRenewCost: 16000 },
-  { key: 'germany',  label: 'Germany',     emoji: '🇩🇪', goodKey: 'machinery',     baseFreightFee: 6000, distanceHrs: 48, risk: 'veryLow', dutyRatePercent: 20, dailyStockCap: 60, licenseRenewCost: 20000 },
-  { key: 'usa',      label: 'USA',         emoji: '🇺🇸', goodKey: 'luxury_goods',  baseFreightFee: 6000, distanceHrs: 48, risk: 'low',    dutyRatePercent: 20, dailyStockCap: 60,  licenseRenewCost: 20000 },
+  { key: 'benin',   label: 'Cotonou',     emoji: '🇧🇯', goodKey: 'rice',          baseFreightFee: 800,  containerCapacity: 50, distanceHrs: 6,  risk: 'high',   dutyRatePercent: 10, dailyStockCap: 200, licenseRenewCost: 1500 },
+  { key: 'india',   label: 'India',        emoji: '🇮🇳', goodKey: 'pharmaceuticals', baseFreightFee: 3000, containerCapacity: 45, distanceHrs: 30, risk: 'medium', dutyRatePercent: 12, dailyStockCap: 180, licenseRenewCost: 2500 },
+  { key: 'thailand', label: 'Thailand',   emoji: '🇹🇭', goodKey: 'rubber',        baseFreightFee: 3000, containerCapacity: 45, distanceHrs: 30, risk: 'medium', dutyRatePercent: 12, dailyStockCap: 180, licenseRenewCost: 2500 },
+  { key: 'turkey',   label: 'Turkey',      emoji: '🇹🇷', goodKey: 'textiles',      baseFreightFee: 2500, containerCapacity: 35, distanceHrs: 24, risk: 'low',    dutyRatePercent: 12, dailyStockCap: 130, licenseRenewCost: 4500 },
+  { key: 'china',    label: 'China',       emoji: '🇨🇳', goodKey: 'electronics',   baseFreightFee: 4000, containerCapacity: 50, distanceHrs: 48, risk: 'medium', dutyRatePercent: 14, dailyStockCap: 200, licenseRenewCost: 5000 },
+  { key: 'brazil',   label: 'Brazil',      emoji: '🇧🇷', goodKey: 'coffee_leather', baseFreightFee: 4500, containerCapacity: 35, distanceHrs: 48, risk: 'medium', dutyRatePercent: 14, dailyStockCap: 130, licenseRenewCost: 5500 },
+  { key: 'spain',    label: 'Spain',       emoji: '🇪🇸', goodKey: 'olive_wine',    baseFreightFee: 2500, containerCapacity: 30, distanceHrs: 24, risk: 'low',    dutyRatePercent: 14, dailyStockCap: 110, licenseRenewCost: 7000 },
+  { key: 'saudi',    label: 'Saudi Arabia', emoji: '🇸🇦', goodKey: 'dates_textiles', baseFreightFee: 2200, containerCapacity: 30, distanceHrs: 18, risk: 'low',    dutyRatePercent: 14, dailyStockCap: 110, licenseRenewCost: 7500 },
+  { key: 'france',   label: 'France',      emoji: '🇫🇷', goodKey: 'perfume_cosmetics', baseFreightFee: 5000, containerCapacity: 20, distanceHrs: 40, risk: 'low',   dutyRatePercent: 18, dailyStockCap: 70,  licenseRenewCost: 14000 },
+  { key: 'uae',      label: 'UAE',         emoji: '🇦🇪', goodKey: 'gold_perfume',   baseFreightFee: 1500, containerCapacity: 15, distanceHrs: 12, risk: 'low',    dutyRatePercent: 18, dailyStockCap: 60,  licenseRenewCost: 16000 },
+  { key: 'germany',  label: 'Germany',     emoji: '🇩🇪', goodKey: 'machinery',     baseFreightFee: 6000, containerCapacity: 15, distanceHrs: 48, risk: 'veryLow', dutyRatePercent: 20, dailyStockCap: 60, licenseRenewCost: 20000 },
+  { key: 'usa',      label: 'USA',         emoji: '🇺🇸', goodKey: 'luxury_goods',  baseFreightFee: 6000, containerCapacity: 15, distanceHrs: 48, risk: 'low',    dutyRatePercent: 20, dailyStockCap: 60,  licenseRenewCost: 20000 },
 ];
 
 const RISK_BRIBE_SUCCESS: Record<RiskTier, number> = {
@@ -858,8 +860,14 @@ export async function sourceShipment(userId: string, countryKey: string, freight
   const goodsCostMult = await getGoodsCostMultiplier();
   const freightCostMult = await getFreightCostMultiplier();
 
+  // Freight pays for container capacity, not a flat toll — order more than
+  // one container's worth of units and you need (and pay for) another one.
+  // Without this, a 5-unit order and a 200-unit order cost the same freight,
+  // which isn't how shipping actually works.
+  const containersNeeded = Math.ceil(qty / country.containerCapacity);
+
   const goodsCost = Math.round(good.baseCost * qty * goodsCostMult);
-  const freightCost = Math.round(country.baseFreightFee * freight.costMult * freightCostMult);
+  const freightCost = Math.round(country.baseFreightFee * freight.costMult * freightCostMult * containersNeeded);
   const totalCost = goodsCost + freightCost;
 
   const deducted = await deductCoins(userId, totalCost, { type: 'admin_debit', note: `sourced ${qty}x ${good.label} from ${country.label}` });
@@ -886,6 +894,7 @@ export async function sourceShipment(userId: string, countryKey: string, freight
     qty,
     goodsCost,
     freightCost,
+    containersUsed: containersNeeded,
     totalCost,
     createdAt: Date.now(),
     travelTimeMs,
@@ -1051,6 +1060,35 @@ function getDemandWobble(goodKey: string, hubKey: string, volatility: number): n
   return 1 + swing;
 }
 
+/**
+ * How hard a hub's market has been hit by selling today, as a multiplier
+ * on price (1 = full price, floor = fully dumped).
+ *
+ * Curve: floor + (1-floor) * e^(-rate * units^power), fitted directly
+ * against the target depletion table for a volatile (demandStability = 0)
+ * good:
+ *   20 units  → ~98%     100 units → ~83%
+ *   50 units  → ~92%     200 units → ~67%     300 units → ~55%
+ * i.e. dumping a market meaningfully collapses the price well before
+ * anyone reaches "sell everything in one hub" territory — a handful of
+ * players discovering the same good/hub combo runs into diminishing
+ * returns fast instead of draining it at near-full price.
+ *
+ * demandStability (0..1, per good) softens the curve for staple goods and
+ * sharpens it for volatile ones: stability 1 halves the effective rate,
+ * stability 0 applies the raw curve above at full strength.
+ */
+const DEPLETION_FLOOR = 0.28;
+const DEPLETION_RATE = 0.00125;
+const DEPLETION_POWER = 1.17;
+
+function getDepletionFactor(unitsSold: number, demandStability: number): number {
+  if (unitsSold <= 0) return 1;
+  const effectiveRate = DEPLETION_RATE * (1 - demandStability * 0.5);
+  const decay = Math.exp(-effectiveRate * Math.pow(unitsSold, DEPLETION_POWER));
+  return DEPLETION_FLOOR + (1 - DEPLETION_FLOOR) * decay;
+}
+
 export async function getMarketPrice(goodKey: string, hubKey: string): Promise<number> {
   const good = GOODS[goodKey];
   const hub = HUBS.find(h => h.key === hubKey);
@@ -1061,7 +1099,7 @@ export async function getMarketPrice(goodKey: string, hubKey: string): Promise<n
   const base = good.baseCost * (MARKET_MARKUP + good.profitMarginBonus) * wobble * eventMultiplier;
 
   const soldToday = await getUnitsSoldToday(goodKey, hubKey);
-  const depletionFactor = Math.max(0.6, 1 - (soldToday * 0.002) * (1 - good.demandStability * 0.5));
+  const depletionFactor = getDepletionFactor(soldToday, good.demandStability);
 
   return Math.round(base * hub.priceMultiplier * depletionFactor);
 }
@@ -1207,4 +1245,4 @@ export async function sellGoods(userId: string, shipmentId: string, hubKey: stri
 
 // Re-exported for the UI layer — same status-line role as the events module
 // plays internally; lets the menu show what's happening in Nigeria right now.
-export { getEventsStatusBlock };
+export { getEventsStatusBlock, getEventsDetailBlock };

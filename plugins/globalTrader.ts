@@ -28,6 +28,7 @@ import {
   getEventDescription,
   EVENT_TYPES,
   getEventsStatusBlock,
+  getEventsDetailBlock,
   CLEARING_AGENT_DEFS,
   WAREHOUSE_DEFS,
   getEquipment,
@@ -88,6 +89,7 @@ async function runMainMenu(sock: any, message: any, chatId: string, userId: stri
       { label: 'License & Rank', value: 'license', description: 'Check expiry, renew, view rank' },
       { label: 'Upgrades', value: 'upgrades', description: 'Clearing Agent & Warehouse tiers' },
       { label: 'Wallet', value: 'wallet' },
+      { label: 'Market Conditions', value: 'conditions', description: events ? '⚡ Active events affecting trade' : 'All quiet right now' },
     ],
     cancelLabel: 'Exit',
   });
@@ -96,12 +98,13 @@ async function runMainMenu(sock: any, message: any, chatId: string, userId: stri
 
   let outcome: any;
   switch (result.value) {
-    case 'source':    outcome = await runSourceMenu(sock, message, chatId, userId); break;
-    case 'shipments': outcome = await runShipmentsMenu(sock, message, chatId, userId); break;
-    case 'sell':      outcome = await runSellMenu(sock, message, chatId, userId); break;
-    case 'license':   outcome = await runLicenseMenu(sock, message, chatId, userId); break;
-    case 'upgrades':  outcome = await runUpgradesMenu(sock, message, chatId, userId); break;
-    case 'wallet':    await sendWalletCard(sock, chatId, userId); outcome = 'back'; break;
+    case 'source':     outcome = await runSourceMenu(sock, message, chatId, userId); break;
+    case 'shipments':  outcome = await runShipmentsMenu(sock, message, chatId, userId); break;
+    case 'sell':       outcome = await runSellMenu(sock, message, chatId, userId); break;
+    case 'license':    outcome = await runLicenseMenu(sock, message, chatId, userId); break;
+    case 'upgrades':   outcome = await runUpgradesMenu(sock, message, chatId, userId); break;
+    case 'wallet':     await sendWalletCard(sock, chatId, userId); outcome = 'back'; break;
+    case 'conditions': await sendMarketConditions(sock, chatId); outcome = 'back'; break;
   }
 
   if (outcome === 'back') return runMainMenu(sock, message, chatId, userId);
@@ -169,9 +172,19 @@ async function runFreightMenu(sock: any, message: any, chatId: string, userId: s
 
 async function runQuantityMenu(sock: any, message: any, chatId: string, userId: string, country: any, freightKey: string) {
   const stock = await getStockLevel(country.key);
+  const freight = FREIGHT_TIERS.find(f => f.key === freightKey);
+
   const options = QUANTITY_PRESETS
     .filter(q => q <= stock.remaining)
-    .map(q => ({ label: `${q} units`, value: String(q) }));
+    .map(q => {
+      const containers = Math.ceil(q / country.containerCapacity);
+      const freightCost = Math.round(country.baseFreightFee * freight.costMult * containers);
+      return {
+        label: `${q} units`,
+        value: String(q),
+        description: `${containers} container${containers > 1 ? 's' : ''} · ${formatNumber(freightCost)} freight`,
+      };
+    });
 
   if (!options.length) {
     await sock.sendMessage(chatId, {
@@ -182,7 +195,7 @@ async function runQuantityMenu(sock: any, message: any, chatId: string, userId: 
 
   const result = await promptMenu(sock, message, chatId, userId, {
     title: `📦 ${country.label} · Quantity`,
-    subtitle: `Stock left today: ${stock.remaining}/${stock.cap}`,
+    subtitle: `Stock left today: ${stock.remaining}/${stock.cap}  ·  1 container = ${country.containerCapacity} units`,
     text: 'How many units?',
     options,
     cancelLabel: 'Back',
@@ -192,7 +205,6 @@ async function runQuantityMenu(sock: any, message: any, chatId: string, userId: 
   if (result.timedOut || !result.value) return;
 
   const qty = parseInt(result.value, 10);
-  const freight = FREIGHT_TIERS.find(f => f.key === freightKey);
 
   const purchase = await sourceShipment(userId, country.key, freightKey, qty);
   if (!purchase.success) {
@@ -206,8 +218,9 @@ async function runQuantityMenu(sock: any, message: any, chatId: string, userId: 
       `📝 ORDER PLACED\n${DIVIDER}\n` +
       `${header()}\n` +
       `#${s.id} — ${country.goodLabel} (${country.label})\n` +
-      `Qty: ${qty}  ·  Carrier: ${freight.label}\n` +
+      `Qty: ${qty}  ·  Carrier: ${freight.label}  ·  ${s.containersUsed} container${s.containersUsed > 1 ? 's' : ''}\n` +
       `${DIVIDER}\n` +
+      `Goods: ${formatNumber(s.goodsCost)}  +  Freight: ${formatNumber(s.freightCost)}\n` +
       `${deltaLine(-s.totalCost)}\n` +
       `ETA: ${s.etaLabel}\n\n` +
       `_Track it anytime from the main menu → My Shipments_`,
@@ -653,6 +666,13 @@ async function sendWalletCard(sock: any, chatId: string, userId: string) {
   const wallet = await getWallet(userId);
   return sock.sendMessage(chatId, {
     text: `${header()}\n💰 Coins: *${formatNumber(wallet.coins)}*\n💎 Groq Coins: *${formatNumber(wallet.groqCoins)}*`,
+  });
+}
+
+async function sendMarketConditions(sock: any, chatId: string) {
+  const detail = await getEventsDetailBlock();
+  return sock.sendMessage(chatId, {
+    text: `${header('📊 Market Conditions')}\n${detail}`,
   });
 }
 
