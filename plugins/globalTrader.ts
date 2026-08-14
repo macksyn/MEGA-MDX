@@ -35,7 +35,7 @@ import {
   buyEquipment,
 } from '../lib/globalTraderEconomy.js';
 // Import the event helpers for price deltas
-import { getActiveEvents, getPriceMultiplier } from '../lib/globalTraderEvents.js';
+import { getActiveEvents } from '../lib/globalTraderEvents.js';
 
 export const command = 'global';
 export const aliases = ['trader', 'gt', 'trade', 'port', 'portking', 'pk'];
@@ -152,6 +152,12 @@ async function runSourceMenu(sock: any, message: any, chatId: string, userId: st
 // ── Product Menu with dynamic market indicators ────────────────────
 
 async function runProductMenu(sock: any, message: any, chatId: string, userId: string, country: any) {
+  // ---- SAFETY GUARD ----
+  if (!country || !country.goodKeys || !Array.isArray(country.goodKeys)) {
+    await sock.sendMessage(chatId, { text: `${header()}\n❌ Invalid country data. Please try again.` });
+    return 'back';
+  }
+
   // Fetch active events once
   const activeEvents = await getActiveEvents();
   const eventsMap = new Map<string, number>(); // goodKey -> total price multiplier from events
@@ -165,6 +171,10 @@ async function runProductMenu(sock: any, message: any, chatId: string, userId: s
 
   const options = await Promise.all(country.goodKeys.map(async (k: string) => {
     const good = GOODS[k];
+    if (!good) {
+      // Skip if the good definition is missing (shouldn't happen)
+      return null;
+    }
     const stock = await getStockLevel(country.key, k);
     const priceMult = eventsMap.get(k) || 1;
     let indicator = '';
@@ -178,10 +188,18 @@ async function runProductMenu(sock: any, message: any, chatId: string, userId: s
     };
   }));
 
+  // Filter out any null entries (shouldn't happen)
+  const filteredOptions = options.filter(o => o !== null);
+
+  if (!filteredOptions.length) {
+    await sock.sendMessage(chatId, { text: `${header()}\n❌ No valid products available from ${country.label}.` });
+    return 'back';
+  }
+
   const result = await promptMenu(sock, message, chatId, userId, {
     title: `${country.emoji} ${country.label} · Choose Product`,
     text: 'What do you want to source?',
-    options,
+    options: filteredOptions,
     cancelLabel: 'Back',
   });
 
@@ -189,6 +207,11 @@ async function runProductMenu(sock: any, message: any, chatId: string, userId: s
   if (result.timedOut || !result.value) return;
 
   const good = GOODS[result.value];
+  if (!good) {
+    await sock.sendMessage(chatId, { text: `${header()}\n❌ Product data missing.` });
+    return 'back';
+  }
+
   const outcome = await runFreightMenu(sock, message, chatId, userId, country, good);
   if (outcome === 'back') return runProductMenu(sock, message, chatId, userId, country);
   return outcome;
