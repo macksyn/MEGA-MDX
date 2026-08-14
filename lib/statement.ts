@@ -15,23 +15,29 @@
 import { getTransactions, getWallet, formatNumber } from './economy.js';
 
 // Used in the header/summary text, where emoji render fine (proportional font).
+
+// Table labels — deliberately short (max 5 chars) and fixed-width. The
+// original full-word labels (e.g. "Withdrawal refund" at 18 chars) were
+// the main reason rows wrapped on a phone-width WhatsApp code block, since
+// the whole row has to fit on one line for the column padding to mean
+// anything once it wraps.
 const TYPE_LABELS_PLAIN: Record<string, string> = {
-  attendance:        'Attendance',
+  attendance:        'Attn',
   work:              'Work',
-  top3:              'Top-3 payout',
+  top3:              'Top3',
   transfer_out:      'Sent',
-  transfer_in:       'Received',
-  exchange_out:      'Exchange sent',
-  exchange_in:       'Exchange recv',
-  convert:           'Converted',
+  transfer_in:       'Recv',
+  exchange_out:      'ExOut',
+  exchange_in:       'ExIn',
+  convert:           'Conv',
   slots:             'Slots',
-  coinflip:          'Coinflip',
+  coinflip:          'CFlip',
   dice:              'Dice',
-  admin_credit:      'Admin credit',
-  admin_debit:       'Admin debit',
-  admin_reset:       'Wallet reset',
-  withdrawal_hold:   'Withdrawal hold',
-  withdrawal_refund: 'Withdrawal refund',
+  admin_credit:      'AdmCr',
+  admin_debit:       'AdmDb',
+  admin_reset:       'Reset',
+  withdrawal_hold:   'WdHld',
+  withdrawal_refund: 'WdRef',
   other:             'Other',
 };
 
@@ -52,10 +58,10 @@ function formatWhen(ts: number): string {
   if (hrs < 24) return `${hrs}h`;
   const days = Math.floor(hrs / 24);
   if (days < 14) return `${days}d`;
-  const sameYear = new Date(ts).getFullYear() === new Date().getFullYear();
-  return new Date(ts).toLocaleDateString('en-GB', sameYear
-    ? { day: '2-digit', month: 'short' }
-    : { day: '2-digit', month: 'short', year: 'numeric' });
+  // No year — this is a rolling 30-entry ledger, a year-old entry surviving
+  // in it is effectively impossible, and dropping it keeps this column a
+  // consistent 5 chars ("12Aug") instead of ballooning for older rows.
+  return new Date(ts).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' }).replace(' ', '');
 }
 
 function trendArrow(net: number): string {
@@ -122,22 +128,29 @@ export async function sendStatement(
       type: TYPE_LABELS_PLAIN[tx.type] || TYPE_LABELS_PLAIN.other,
       amount: `${sign}${formatNumber(Math.abs(tx.amount))}${suf}`,
       balance: `${formatNumber(tx.balanceAfter)}${suf}`,
-      note: tx.note ? String(tx.note).slice(0, 28) : '',
+      note: tx.note ? String(tx.note).slice(0, 24) : '',
     };
   });
 
-  const H = { when: 'WHEN', type: 'TYPE', amount: 'AMOUNT', balance: 'BALANCE' };
+  // Short headers on purpose — a header longer than its column's own content
+  // (e.g. "BALANCE" next to a one-digit balance) needlessly widens the row.
+  const H = { when: 'WHEN', type: 'TYPE', amount: 'AMT', balance: 'BAL' };
   const whenW = Math.max(H.when.length, ...rows.map(r => r.when.length));
   const typeW = Math.max(H.type.length, ...rows.map(r => r.type.length));
   const amountW = Math.max(H.amount.length, ...rows.map(r => r.amount.length));
   const balanceW = Math.max(H.balance.length, ...rows.map(r => r.balance.length));
 
-  const headerRow = `${H.when.padEnd(whenW)}  ${H.type.padEnd(typeW)}  ${H.amount.padStart(amountW)}  ${H.balance.padStart(balanceW)}`;
+  // Single-space gaps between columns (was double) — every extra space here
+  // is a chunk of the phone-width budget that isn't going toward actual data.
+  const headerRow = `${H.when.padEnd(whenW)} ${H.type.padEnd(typeW)} ${H.amount.padStart(amountW)} ${H.balance.padStart(balanceW)}`;
   const sepRow = '─'.repeat(headerRow.length);
-  const bodyRows = rows.map(r => {
-    let line = `${r.when.padEnd(whenW)}  ${r.type.padEnd(typeW)}  ${r.amount.padStart(amountW)}  ${r.balance.padStart(balanceW)}`;
-    if (r.note) line += `  · ${r.note}`;
-    return line;
+  const bodyRows: string[] = [];
+  rows.forEach(r => {
+    bodyRows.push(`${r.when.padEnd(whenW)} ${r.type.padEnd(typeW)} ${r.amount.padStart(amountW)} ${r.balance.padStart(balanceW)}`);
+    // Notes go on their own line rather than trailing the row — appending
+    // one there would make that single row's width unbounded and it'd wrap
+    // on its own, breaking the alignment right at that entry.
+    if (r.note) bodyRows.push(`  ↳ ${r.note}`);
   });
 
   const table = ['```', headerRow, sepRow, ...bodyRows, '```'].join('\n');
