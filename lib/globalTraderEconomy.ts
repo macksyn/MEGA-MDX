@@ -7,10 +7,19 @@
  * - Tier‑based licenses (one license covers all countries in a rank tier)
  * - In‑transit events (delay, pirates, temperature) with player choices
  * - Shared jackpot pool with slotMachine.ts
+ * 
+ * CURRENCY RULES:
+ *   - All costs (sourcing, freight, duty, bribe, events, courier, holding, equipment, licenses) are paid in Groq Coins.
+ *   - All sales income is received in normal coins.
+ *   - Jackpot contributions are removed from all costs; only the 2% trading commission on sales contributes.
  */
 
 import { createStore } from './pluginStore.js';
-import { deductCoins, addCoins, todayStr, formatNumber } from './economy.js';
+import { 
+  deductCoins, addCoins, 
+  deductGroqCoins, addGroqCoins,   // added
+  todayStr, formatNumber 
+} from './economy.js';
 import { getJackpotPool, contributeToJackpot, deductFromJackpot, settleWin } from './slotMachine.js';
 import {
   getPriceMultiplier,
@@ -434,6 +443,9 @@ export async function getEquipment(userId: string) {
   };
 }
 
+// ── Equipment purchase ───────────────────────────────────────────────
+// Now costs are in Groq Coins, no jackpot contribution.
+
 export async function buyEquipment(userId: string, type: 'clearingAgent' | 'warehouse', tier: string) {
   const defs = type === 'clearingAgent' ? CLEARING_AGENT_DEFS : WAREHOUSE_DEFS;
   const def = defs.find(d => d.tier === tier);
@@ -443,9 +455,9 @@ export async function buyEquipment(userId: string, type: 'clearingAgent' | 'ware
   const currentTier = type === 'clearingAgent' ? current.tiers.clearingAgent : current.tiers.warehouse;
   if (currentTier === tier) return { success: false, reason: 'Already equipped.' };
 
-  const paid = await deductCoins(userId, def.cost, { type: 'admin_debit', note: `bought ${type}: ${tier}` });
-  if (!paid.success) return { success: false, reason: 'Not enough coins.' };
-  await contributeToJackpot(def.cost);
+  // Pay in Groq Coins
+  const paid = await deductGroqCoins(userId, def.cost, { type: 'admin_debit', note: `bought ${type}: ${tier}` });
+  if (!paid.success) return { success: false, reason: 'Not enough Groq Coins.' };
 
   const stored = (await equipmentTbl.get(userId)) || { ...DEFAULT_EQUIPMENT };
   stored[type] = tier;
@@ -574,6 +586,8 @@ export async function getLicenseStatus(userId: string) {
   });
 }
 
+// ── License purchase / renew (now in Groq Coins, no jackpot) ──────
+
 export async function buyLicense(
   userId: string,
   tierKey: LicenseTierKey
@@ -593,10 +607,10 @@ export async function buyLicense(
   }
 
   const cost = tier.cost;
-  const result = await deductCoins(userId, cost, { type: 'admin_debit', note: `buy license: ${tierKey}` });
+  // Pay in Groq Coins
+  const result = await deductGroqCoins(userId, cost, { type: 'admin_debit', note: `buy license: ${tierKey}` });
   if (!result.success) return { success: false, reason: 'insufficient_funds' };
 
-  await contributeToJackpot(cost);
   await setLicenseRecord(userId, tierKey, Date.now() + tier.durationMs);
   return { success: true, cost };
 }
@@ -610,10 +624,10 @@ export async function renewLicense(
   if (!tier) return { success: false, reason: 'Invalid license tier.' };
 
   const cost = forced ? Math.round(tier.cost * FORCED_RENEWAL_MULT) : tier.cost;
-  const result = await deductCoins(userId, cost, { type: 'admin_debit', note: `${forced ? 'forced ' : ''}renew license: ${tierKey}` });
+  // Pay in Groq Coins
+  const result = await deductGroqCoins(userId, cost, { type: 'admin_debit', note: `${forced ? 'forced ' : ''}renew license: ${tierKey}` });
   if (!result.success) return { success: false, reason: 'insufficient_funds' };
 
-  await contributeToJackpot(cost);
   await setLicenseRecord(userId, tierKey, Date.now() + tier.durationMs);
   return { success: true, cost };
 }
@@ -670,7 +684,7 @@ export const EVENT_CONFIG: Record<EventType, EventDef> = {
     type: 'delay',
     costFraction: 0.08,
     minCost: 800,
-    buildDescription: (cost) => `⚠️ Your cargo ship is delayed. Pay ${formatNumber(cost)} to reroute?`,
+    buildDescription: (cost) => `⚠️ Your cargo ship is delayed. Pay ${formatNumber(cost)} Groq Coins to reroute?`,
     // BUG FIX: this used to multiply travelTimeMs directly, which retroactively
     // changed what "50% done" meant for time that had already elapsed, making
     // the progress bar jump forward or snap backward. Now it only shifts the
@@ -690,7 +704,7 @@ export const EVENT_CONFIG: Record<EventType, EventDef> = {
     type: 'pirates',
     costFraction: 0.12,
     minCost: 1200,
-    buildDescription: (cost) => `⚠️ Pirates detected. Hire escort for ${formatNumber(cost)}?`,
+    buildDescription: (cost) => `⚠️ Pirates detected. Hire escort for ${formatNumber(cost)} Groq Coins?`,
     successEffect: () => {},
     failEffect: (s) => { s.quality *= 0.6; },
   },
@@ -698,7 +712,7 @@ export const EVENT_CONFIG: Record<EventType, EventDef> = {
     type: 'temperature',
     costFraction: 0.06,
     minCost: 600,
-    buildDescription: (cost) => `⚠️ Cargo temperature rising. Buy cooling for ${formatNumber(cost)}?`,
+    buildDescription: (cost) => `⚠️ Cargo temperature rising. Buy cooling for ${formatNumber(cost)} Groq Coins?`,
     successEffect: () => {},
     failEffect: (s) => { s.quality *= 0.75; },
   },
@@ -777,13 +791,13 @@ export async function resolveEvent(
   const cost = getEventCost(shipment, eventType);
   let outcome: string;
   if (choice === 'pay') {
-    const deducted = await deductCoins(userId, cost, { type: 'admin_debit', note: `event payment: ${eventType}` });
+    // Pay in Groq Coins – no jackpot contribution
+    const deducted = await deductGroqCoins(userId, cost, { type: 'admin_debit', note: `event payment: ${eventType}` });
     if (!deducted.success) {
-      return { success: false, reason: 'Not enough coins to pay.' };
+      return { success: false, reason: 'Not enough Groq Coins to pay.' };
     }
-    await contributeToJackpot(cost);
     config.successEffect(shipment);
-    outcome = `✅ Paid ${formatNumber(cost)} – event resolved successfully.`;
+    outcome = `✅ Paid ${formatNumber(cost)} Groq Coins – event resolved successfully.`;
   } else {
     config.failEffect(shipment);
     outcome = `❌ Declined – you suffered the consequences.`;
@@ -912,16 +926,18 @@ export async function sourceShipment(userId: string, countryKey: string, freight
   const freightCost = Math.round(country.baseFreightFee * freight.costMult * freightCostMult * containersNeeded);
   const totalCost = goodsCost + freightCost;
 
-  const deducted = await deductCoins(userId, totalCost, { type: 'admin_debit', note: `sourced ${qty}x ${good.label} from ${country.label}` });
-  if (!deducted.success) return { success: false, reason: 'Not enough coins for that order.' };
+  // ---- COST PAID IN GROQ COINS ----
+  const deducted = await deductGroqCoins(userId, totalCost, { type: 'admin_debit', note: `sourced ${qty}x ${good.label} from ${country.label}` });
+  if (!deducted.success) return { success: false, reason: 'Not enough Groq Coins for that order.' };
 
   const stockOk = await decrementStock(countryKey, qty);
   if (!stockOk) {
-    await addCoins(userId, totalCost, { type: 'admin_credit', note: 'refund: stock unavailable' });
+    // Refund in Groq Coins
+    await addGroqCoins(userId, totalCost, { type: 'admin_credit', note: 'refund: stock unavailable' });
     return { success: false, reason: 'That stock just sold out — try again or pick another country.' };
   }
 
-  await contributeToJackpot(totalCost);
+  // No jackpot contribution from cost deductions
 
   const travelTimeMs = Math.round((country.distanceHrs * 3600000) / freight.speedMult);
   const shipment: Shipment = {
@@ -988,9 +1004,9 @@ export async function clearShipment(userId: string, shipmentId: string, opts: { 
   const duty = Math.round(shipment.goodsCost * (effectiveDutyRate / 100));
 
   if (valid) {
-    const paid = await deductCoins(userId, duty, { type: 'admin_debit', note: `customs duty: ${shipmentId}` });
-    if (!paid.success) return { outcome: 'error', reason: 'Not enough coins for duty.' };
-    await contributeToJackpot(duty);
+    // ---- DUTY PAID IN GROQ COINS ----
+    const paid = await deductGroqCoins(userId, duty, { type: 'admin_debit', note: `customs duty: ${shipmentId}` });
+    if (!paid.success) return { outcome: 'error', reason: 'Not enough Groq Coins for duty.' };
 
     shipment.status = 'cleared_unsold';
     shipment.dutyPaid = duty;
@@ -1007,9 +1023,9 @@ export async function clearShipment(userId: string, shipmentId: string, opts: { 
 
   const bribeCost = Math.round(duty * (BRIBE_COST_PERCENT / 100));
   const totalUpfront = duty + bribeCost;
-  const paid = await deductCoins(userId, totalUpfront, { type: 'admin_debit', note: `duty + bribe: ${shipmentId}` });
-  if (!paid.success) return { outcome: 'error', reason: 'Not enough coins for duty + bribe.' };
-  await contributeToJackpot(totalUpfront);
+  // ---- DUTY + BRIBE PAID IN GROQ COINS ----
+  const paid = await deductGroqCoins(userId, totalUpfront, { type: 'admin_debit', note: `duty + bribe: ${shipmentId}` });
+  if (!paid.success) return { outcome: 'error', reason: 'Not enough Groq Coins for duty + bribe.' };
 
   const { agent } = await getEquipment(userId);
   const baseChance = RISK_BRIBE_SUCCESS[country.risk];
@@ -1022,7 +1038,7 @@ export async function clearShipment(userId: string, shipmentId: string, opts: { 
     shipment.bribePaid = bribeCost;
     shipment.quality = 0.9;
     shipment.clearedAt = Date.now();
-    shipment.originalQty = shipment.qty; // CRITICAL: Store original qty to prevent repeated spoilage on retry attempts
+    shipment.originalQty = shipment.qty;
     await saveShipments(userId, all);
     return { outcome: 'cleared', dutyPaid: duty, bribePaid: bribeCost };
   }
@@ -1034,8 +1050,8 @@ async function seizeShipment(userId: string, all: Shipment[], idx: number, shipm
   const { agent } = await getEquipment(userId);
   const effectiveFineMult = Math.max(1.0, FINE_MULT - agent.fineMultReduction);
   const fine = Math.round(shipment.totalCost * effectiveFineMult);
-  const finePaid = await deductCoins(userId, fine, { type: 'admin_debit', note: `customs seizure fine: ${shipment.id}` });
-  if (finePaid.success) await contributeToJackpot(fine);
+  // ---- FINE PAID IN GROQ COINS ----
+  const finePaid = await deductGroqCoins(userId, fine, { type: 'admin_debit', note: `customs seizure fine: ${shipment.id}` });
 
   let tierKey: LicenseTierKey | null = null;
   for (const [key, tier] of Object.entries(LICENSE_TIERS)) {
@@ -1050,7 +1066,7 @@ async function seizeShipment(userId: string, all: Shipment[], idx: number, shipm
   if (tierKey) {
     const renewal = await renewLicense(userId, tierKey, true);
     renewalSucceeded = renewal.success;
-    renewalCost = renewal.success ? (renewal.cost || 0) : 0; // BUG FIX: this used to report `fine` here, not the actual renewal cost
+    renewalCost = renewal.success ? (renewal.cost || 0) : 0;
   }
 
   shipment.status = 'seized';
@@ -1223,9 +1239,9 @@ export async function sellGoods(userId: string, shipmentId: string, hubKey: stri
   let courierNote = '';
   if (hub.courierRequired) {
     courierFee = hub.courierFeePerUnit * shipment.qty;
-    const feeResult = await deductCoins(userId, courierFee, { type: 'admin_debit', note: `courier to ${hub.label}` });
-    if (!feeResult.success) return { success: false, reason: 'Not enough coins for the courier fee.' };
-    await contributeToJackpot(courierFee);
+    // ---- COURIER FEE PAID IN GROQ COINS ----
+    const feeResult = await deductGroqCoins(userId, courierFee, { type: 'admin_debit', note: `courier to ${hub.label}` });
+    if (!feeResult.success) return { success: false, reason: 'Not enough Groq Coins for the courier fee.' };
 
     const eventRiskDelta = await getCourierRiskDelta(hubKey);
     const risk = resolveCourierRisk(good.theftRisk, eventRiskDelta);
@@ -1252,27 +1268,26 @@ export async function sellGoods(userId: string, shipmentId: string, hubKey: stri
   const netProceeds = gross - tradingCommission;
 
   const { payout, capped } = settleWin(netProceeds, await getJackpotPool());
+  // ---- SALE PROCEEDS PAID IN NORMAL COINS ----
   await addCoins(userId, payout, { type: 'admin_credit', note: `sold ${deliveredQty}x ${good.label} @ ${hub.label}` });
   await deductFromJackpot(payout);
-  await contributeToJackpot(tradingCommission); // House edge to jackpot
+  // ---- TRADING COMMISSION GOES TO JACKPOT (still in normal coins) ----
+  await contributeToJackpot(tradingCommission);
   await addUnitsSoldToday(good.key, hubKey, deliveredQty);
 
-  // Warehouse holding fee — restored. Sitting on cleared goods past your
-  // free window costs real money per day, same tension as the deferred-sale
-  // choice everywhere else in this economy.
+  // ---- HOLDING FEE PAID IN GROQ COINS ----
   let holdingFee = 0;
   if (shipment.clearedAt) {
     const daysHeld = (Date.now() - shipment.clearedAt) / 86400000;
     const billableDays = Math.max(0, Math.ceil(daysHeld - warehouse.freeHoldingDays));
     if (billableDays > 0) {
       holdingFee = billableDays * warehouse.holdingFeePerUnitPerDay * shipment.qty;
-      const feeResult = await deductCoins(userId, holdingFee, { type: 'admin_debit', note: `warehouse holding fee: ${shipmentId}` });
+      const feeResult = await deductGroqCoins(userId, holdingFee, { type: 'admin_debit', note: `warehouse holding fee: ${shipmentId}` });
       holdingFee = feeResult.success ? holdingFee : 0;
-      if (feeResult.success) await contributeToJackpot(holdingFee);
     }
   }
 
-  // Cost basis includes trading commission (it reduces effective payout to player)
+  // Cost basis now includes all costs paid in Groq Coins (1:1 with normal coins)
   const costBasis = shipment.totalCost + (shipment.dutyPaid || 0) + (shipment.bribePaid || 0) + courierFee + holdingFee + tradingCommission;
   const profit = payout - costBasis;
   const marginPct = costBasis > 0 ? Math.round((profit / costBasis) * 100) : 0;
