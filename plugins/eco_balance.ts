@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { getWallet, formatNumber, withEconomyGuard, getLevelInfo } from '../lib/economy.js';
+import { getWallet, formatNumber, withEconomyGuard, getLevelInfo, getRollingExchangeCount } from '../lib/economy.js';
 import { cleanJid } from '../lib/isOwner.js';
 import { extractTargetJid } from '../lib/resolveTarget.js';
 import { resolveParticipant } from '../lib/contactUtil.js';
@@ -26,16 +26,34 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const targetId = cleanJid(resolvedJid);
   const wallet = await getWallet(targetId);
 
+  // Fetch rolling exchange count for the last 7 days
+  const rollingCount = await getRollingExchangeCount(targetId, 7);
+  const levelInfo = getLevelInfo(wallet.exchangeCount, rollingCount);
+
   const isSelf = targetId === cleanJid(senderId);
   const label = isSelf ? 'YOUR BALANCE' : `@${phoneNumber}'S BALANCE`;
-  const levelInfo = getLevelInfo(wallet.exchangeCount);
+
+  // Build level status line
+  let levelStatus = `🏅 Level ${levelInfo.levelNumber}: *${levelInfo.levelName}*`;
+  // If they are demoted due to low rolling count, show warning
+  if (levelInfo.levelNumber === 1 && wallet.exchangeCount >= 25 && rollingCount < levelInfo.rollingRequired) {
+    levelStatus += ` ⚠️ _(demoted – need ${levelInfo.exchangesNeededToMaintain} more exchanges in 7 days to restore)_`;
+  } else if (levelInfo.levelNumber >= 2) {
+    // Show maintenance status for level 2+
+    if (rollingCount < levelInfo.rollingRequired) {
+      levelStatus += ` ⚠️ _(${levelInfo.exchangesNeededToMaintain} exchanges needed in 7 days to maintain)_`;
+    } else {
+      levelStatus += ` ✅ _(maintained)_`;
+    }
+  }
 
   const text =
     `💰 *${label}*\n\n` +
     `🪙 Coins: *${formatNumber(wallet.coins)}*\n` +
     `💲 Groq Coins: *${formatNumber(wallet.groqCoins)}*\n` +
-    `🏅 Level ${levelInfo.levelNumber}: *${levelInfo.levelName}*\n` +
-    `🔄 Exchanges: *${formatNumber(wallet.exchangeCount)}*\n` +
+    `${levelStatus}\n` +
+    `🔄 Exchanges (lifetime): *${formatNumber(wallet.exchangeCount)}*\n` +
+    `🔄 Exchanges (last 7d): *${formatNumber(rollingCount)}* / ${levelInfo.rollingRequired}\n` +
     `📈 ${levelInfo.bar} ${levelInfo.progressPercent}%\n\n` +
     `➡️ _Next: *${levelInfo.nextLevelName || 'Max'}* at ${formatNumber(levelInfo.next)} exchanges_ `;
 
