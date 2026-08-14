@@ -56,9 +56,9 @@ export const RANDOM_EVENTS: NigeriaEventDef[] = [
   },
   {
     key: 'election_season', label: 'Election Season', headline: 'Election Season Tightens the Roads', emoji: '🗳️',
-    description: 'Checkpoints are up and wallets are closed for anything that isn\'t essential. Buyers are holding off on luxury spending until the votes are counted.',
+    description: 'Checkpoints are up and wallets are closed for anything that isn\u2019t essential. Buyers are holding off on luxury spending until the votes are counted.',
     weight: 2, durationHrsRange: [48, 120],
-    effects: { dutyRateDeltaPct: 4, courierRiskDelta: 0.08, priceMultiplier: 0.9, affectedGoods: ['perfume_cosmetics', 'gold_jewelry', 'diamond_jewelry', 'luxury_goods'] },
+    effects: { dutyRateDeltaPct: 4, courierRiskDelta: 0.08, priceMultiplier: 0.9, affectedGoods: ['perfume_cosmetics', 'gold_perfume', 'luxury_goods'] },
   },
   {
     key: 'dollar_scarcity', label: 'Dollar Scarcity', headline: 'Naira Under Pressure', emoji: '💵',
@@ -108,7 +108,7 @@ function getSeasonalEvents(): NigeriaEventDef[] {
       key: 'christmas_rush', label: 'Christmas Rush', headline: 'Detty December Is Here', emoji: '🎄',
       description: 'Detty December is in full swing. Lagos and Port Harcourt are buying big and paying whatever it takes.',
       weight: 0, durationHrsRange: [0, 0],
-      effects: { priceMultiplier: 1.35, affectedGoods: ['perfume_cosmetics', 'gold_jewelry', 'diamond_jewelry', 'luxury_goods', 'electronics', 'iphones', 'tecno_infinix_phones'], affectedHubs: ['lagos', 'ph'] },
+      effects: { priceMultiplier: 1.35, affectedGoods: ['perfume_cosmetics', 'gold_perfume', 'luxury_goods', 'electronics'], affectedHubs: ['lagos', 'ph'] },
     });
   }
 
@@ -234,93 +234,14 @@ export async function getEventsStatusBlock(): Promise<string> {
 // circular. Keep in sync by hand if goodKeys/hubKeys change.
 
 const GOOD_LABELS: Record<string, string> = {
-  // Base goods
-  electronics: 'Electronics',
-  pharmaceuticals: 'Pharmaceuticals',
-  rubber: 'Rubber & Auto Parts',
-  textiles: 'Textiles',
-  food: 'Food & Perishables',
-  coffee_leather: 'Coffee & Leather',
-  olive_wine: 'Olive Oil & Wine',
-  dates_textiles: 'Dates & Textiles',
-  perfume_cosmetics: 'Perfume & Cosmetics',
-  gold_jewelry: 'Gold Jewelry',
-  diamond_jewelry: 'Diamond Jewelry',
-  machinery: 'Machinery',
-  luxury_goods: 'Luxury Goods',
-  rice: 'Rice',
-  
-  // Benin
-  used_clothing: 'Used Clothing (Okrika)',
-  frozen_poultry: 'Frozen Poultry',
-  
-  // India
-  ayurvedic_cosmetics: 'Ayurvedic & Herbal Cosmetics',
-  textile_machinery: 'Textile Machinery',
-  keke_napep: 'Tricycles (Keke Napep)',
-  
-  // Thailand
-  frozen_seafood: 'Frozen Seafood',
-  thai_cosmetics: 'Thai Cosmetics & Skincare',
-  
-  // Turkey
-  turkish_furniture: 'Furniture',
-  ceramic_tiles_turkey: 'Ceramic Tiles',
-  
-  // China
-  tecno_infinix_phones: 'Tecno & Infinix Phones',
-  chinese_motorcycles: 'Motorcycles (Okada Bikes)',
-  generators: 'Generators',
-  solar_systems: 'Solar Panels & Inverters',
-  
-  // Brazil
-  soybeans_meat: 'Soybeans & Frozen Meat',
-  brazil_sugar: 'Raw Sugar',
-  
-  // Spain
-  spanish_tiles: 'Ceramic Tiles & Marble',
-  jamon_ham: 'Iberian Ham & Cheese',
-  
-  // Saudi Arabia
-  petrochemical_plastics: 'Petrochemicals & Plastics',
-  arabian_oud: 'Arabian Oud & Perfume Oils',
-  silver_jewelry: 'Silver Jewelry',
-  designer_perfumes: 'Designer Perfumes',
-  
-  // France
-  wine_champagne: 'Wine & Champagne',
-  designer_fashion_france: 'Designer Fashion',
-  
-  // UAE
-  used_cars_uae: 'Used Luxury Cars',
-  designer_watches: 'Designer Watches',
-  samsung_phones: 'Samsung Phones',
-  iphones: 'iPhones',
-  
-  // Germany
-  german_auto_parts: 'BMW & Mercedes Auto Parts',
-  industrial_equipment: 'Industrial Equipment',
-  german_luxury_cars: 'BMW & Mercedes Tokunbo',
-  
-  // USA
-  used_cars_usa: 'Used Cars (Tokunbo)',
-  toyota_camry_corolla: 'Toyota Camry & Corolla',
-  lexus_suvs: 'Lexus SUVs',
-  apple_electronics: 'Apple Electronics',
-  
-  // Italy
-  ferrari_lamborghini: 'Ferrari & Lamborghini',
-  italian_leather_fashion: 'Italian Leather & Designer Fashion',
-  vespa_scooters: 'Vespa Scooters',
+  electronics: 'Electronics', pharmaceuticals: 'Pharmaceuticals', rubber: 'Rubber & Auto Parts',
+  textiles: 'Textiles', food: 'Food & Perishables', coffee_leather: 'Coffee & Leather',
+  olive_wine: 'Olive Oil & Wine', dates_textiles: 'Dates & Textiles', perfume_cosmetics: 'Perfume & Cosmetics',
+  gold_perfume: 'Gold & Perfume', machinery: 'Machinery', luxury_goods: 'Luxury Goods', rice: 'Rice',
 };
 
 const HUB_LABELS: Record<string, string> = {
-  lagos: 'Lagos',
-  onitsha: 'Onitsha',
-  aba: 'Aba',
-  kano: 'Kano',
-  sokoto: 'Sokoto',
-  ph: 'Port Harcourt',
+  lagos: 'Lagos', onitsha: 'Onitsha', aba: 'Aba', kano: 'Kano', sokoto: 'Sokoto', ph: 'Port Harcourt',
 };
 
 interface ImpactLine {
