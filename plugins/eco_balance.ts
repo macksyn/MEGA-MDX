@@ -45,9 +45,11 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     ...channelInfo
   }, { quoted: message });
 
-  // Follow-up statement-of-account view. Fully transparent by design —
-  // anyone can already check anyone's balance with !balance @user, so this
-  // just extends that same openness to the full ledger, no owner/sudo gate.
+  // Follow-up statement-of-account view. Strictly self-only — even
+  // owner/sudo don't get the option when looking at someone else's
+  // balance. Only the account owner ever sees this menu.
+  if (!isSelf) return;
+
   const selfId = cleanJid(senderId);
 
   const result = await promptMenu(sock, message, chatId, selfId, {
