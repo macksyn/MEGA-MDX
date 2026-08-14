@@ -472,7 +472,7 @@ async function runSellMenu(sock: any, message: any, chatId: string, userId: stri
       `${sale.qty} × ${formatNumber(sale.unitPrice)} = ${formatNumber(sale.gross)}\n` +
       `${deltaLine(sale.gross)}\n\n` +
       `Cost basis: ${formatNumber(sale.costBasis)}` +
-      `${sale.holdingFee ? `\n_includes ${formatNumber(sale.holdingFee)} warehouse holding fee_` : ''}\n` +
+      `${sale.holdingFee ? `\n_warehouse storage: -${formatNumber(sale.holdingFee)}_` : ''}\n` +
       `Profit: ${deltaLine(sale.profit)} (${sale.marginPct > 0 ? '+' : ''}${sale.marginPct}%)` +
       lossNote,
   });
@@ -509,8 +509,15 @@ async function runLicenseMenu(sock: any, message: any, chatId: string, userId: s
   if (result.timedOut) return;
 
   if (result.value === 'rank') {
+    let nextInfo = '';
+    if (rank.nextThreshold !== null) {
+      nextInfo = `\n\nNext rank: *${rank.nextThreshold ? formatNumber(rank.nextThreshold) : 'unlocked'}* net profit`;
+      if (rank.nextVolumeThreshold && rank.nextMinNetProfitForVolume) {
+        nextInfo += `\n_or ${formatNumber(rank.nextVolumeThreshold)} volume + ${formatNumber(rank.nextMinNetProfitForVolume)} net profit_`;
+      }
+    }
     await sock.sendMessage(chatId, {
-      text: `${header()}\n${rank.emoji} Rank: *${rank.label}*\nLifetime profit: ${formatNumber(rank.lifetimeProfit)}\nNext rank at: ${formatNumber(rank.nextThreshold)}`,
+      text: `${header()}\n${rank.emoji} Rank: *${rank.label}*\nNet profit: ${formatNumber(rank.lifetimeNetProfit)}\nTrading volume: ${formatNumber(rank.lifetimeTradingVolume)}${nextInfo}`,
     });
     return runLicenseMenu(sock, message, chatId, userId);
   }

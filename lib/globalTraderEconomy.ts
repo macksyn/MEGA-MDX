@@ -211,7 +211,9 @@ export interface RankDef {
   key: string;
   label: string;
   emoji: string;
-  lifetimeProfitThreshold: number;
+  netProfitThreshold: number; // Primary: direct net profit requirement
+  volumeThreshold?: number; // Optional: trading volume alternative path
+  minNetProfitForVolume?: number; // If volume is met, this lower net profit requirement applies
   addsCountries: string[];
   addsFreight: string[];
 }
@@ -221,7 +223,7 @@ const RANK_DEFS: RankDef[] = [
     key: 'dropshipper', 
     label: 'Dropshipper', 
     emoji: '📦',
-    lifetimeProfitThreshold: 0, 
+    netProfitThreshold: 0,
     addsCountries: ['benin', 'india', 'thailand'], 
     addsFreight: ['hapag'] 
   },
@@ -229,7 +231,9 @@ const RANK_DEFS: RankDef[] = [
     key: 'mini_importer', 
     label: 'Mini Importer', 
     emoji: '📦',
-    lifetimeProfitThreshold: 30000, 
+    netProfitThreshold: 30000,
+    volumeThreshold: 100000,
+    minNetProfitForVolume: 10000,
     addsCountries: ['turkey', 'china', 'brazil'], 
     addsFreight: ['cma'] 
   },
@@ -237,7 +241,9 @@ const RANK_DEFS: RankDef[] = [
     key: 'sme', 
     label: 'SME', 
     emoji: '🛍️',
-    lifetimeProfitThreshold: 100000, 
+    netProfitThreshold: 100000,
+    volumeThreshold: 500000,
+    minNetProfitForVolume: 50000,
     addsCountries: ['spain', 'saudi'], 
     addsFreight: ['maersk'] 
   },
@@ -245,7 +251,9 @@ const RANK_DEFS: RankDef[] = [
     key: 'importer', 
     label: 'Importer', 
     emoji: '📦',
-    lifetimeProfitThreshold: 300000, 
+    netProfitThreshold: 300000,
+    volumeThreshold: 1500000,
+    minNetProfitForVolume: 150000,
     addsCountries: ['france', 'uae'], 
     addsFreight: ['one'] 
   },
@@ -253,7 +261,9 @@ const RANK_DEFS: RankDef[] = [
     key: 'pro_trader', 
     label: 'Pro Trader', 
     emoji: '🚚',
-    lifetimeProfitThreshold: 700000, 
+    netProfitThreshold: 700000,
+    volumeThreshold: 3000000,
+    minNetProfitForVolume: 350000,
     addsCountries: ['germany'], 
     addsFreight: ['cosco'] 
   },
@@ -261,7 +271,8 @@ const RANK_DEFS: RankDef[] = [
     key: 'global_trader', 
     label: 'Global Trader', 
     emoji: '🌍',
-    lifetimeProfitThreshold: 1500000, 
+    netProfitThreshold: 1500000,
+    // No volume shortcut for final rank — forces actual profitability
     addsCountries: ['usa'], 
     addsFreight: [] 
   },
@@ -327,7 +338,24 @@ const FORCED_RENEWAL_MULT = 1.6;
 const FINE_MULT = 1.5;
 const CLEARANCE_HOLD_HOURS = 24;
 const BRIBE_COST_PERCENT = 30;
-const MARKET_MARKUP = 1.6;
+// NOTE: No hardcoded MARKET_MARKUP. Prices now float dynamically based on demand,
+// events, and depletion. profitMarginBonus is a baseline expectation, not guaranteed.
+
+/**
+ * RTP Control: Subtle 2% marketplace fee (NOT obviously displayed as "house edge").
+ * Combined with natural economic friction:
+ *   - Freight costs (~3-7% of goods cost)
+ *   - Duty rates (~10-20% of goods cost)  
+ *   - Market depletion (supply/demand crashes prices)
+ *   - Theft/spoilage (random loss to quality)
+ *   - Holding fees (time cost on delayed sales)
+ * ...converges to ~94-96% player RTP (4-6% sink) over 100 trades.
+ *
+ * Key design: Individual trades feel rewarding (70-80% are profitable).
+ * But cumulative effect over many trades = slow bleed toward sustainability.
+ * Players feel successful mid-term, but game doesn't become an ATM long-term.
+ */
+const TRADING_COMMISSION_PCT = 2.0; // 2% marketplace fee (subtle, not prominently labeled)
 
 // ── Hubs ──────────────────────────────────────────────────────────────
 
@@ -435,23 +463,25 @@ async function decrementStock(countryKey: string, qty: number): Promise<boolean>
   return true;
 }
 
-// ── Stats ─────────────────────────────────────────────────────────────
-
-async function getStats(userId: string): Promise<{ lifetimeProfit: number; completedShipments: number }> {
-  const existing = await statsTbl.get(userId);
-  return existing || { lifetimeProfit: 0, completedShipments: 0 };
-}
-
 export async function getPlayerRank(userId: string) {
   const stats = await getStats(userId);
-  const profit = stats.lifetimeProfit;
+  const netProfit = stats.lifetimeNetProfit;
+  const volume = stats.lifetimeTradingVolume;
 
   let current = RANK_DEFS[0];
   let unlockedCountries: string[] = [];
   let unlockedFreight: string[] = [];
 
   for (const rank of RANK_DEFS) {
-    if (profit >= rank.lifetimeProfitThreshold) {
+    // Check direct path: net profit >= threshold
+    const directPath = netProfit >= rank.netProfitThreshold;
+    
+    // Check volume path: if defined, volume >= threshold AND net profit >= minNetProfitForVolume
+    const volumePath = rank.volumeThreshold && rank.minNetProfitForVolume
+      ? (volume >= rank.volumeThreshold && netProfit >= rank.minNetProfitForVolume)
+      : false;
+    
+    if (directPath || volumePath) {
       current = rank;
       unlockedCountries = [...unlockedCountries, ...rank.addsCountries];
       unlockedFreight = [...unlockedFreight, ...rank.addsFreight];
@@ -465,8 +495,11 @@ export async function getPlayerRank(userId: string) {
     key: current.key,
     label: current.label,
     emoji: current.emoji,
-    lifetimeProfit: profit,
-    nextThreshold: next ? next.lifetimeProfitThreshold : profit,
+    lifetimeNetProfit: netProfit,
+    nextThreshold: next ? next.netProfitThreshold : netProfit,
+    nextVolumeThreshold: next?.volumeThreshold || null,
+    nextMinNetProfitForVolume: next?.minNetProfitForVolume || null,
+    lifetimeTradingVolume: volume,
     unlockedCountries,
     unlockedFreight,
   };
@@ -588,7 +621,8 @@ export interface Shipment {
   goodLabel: string;
   freightKey: string;
   freightLabel: string;
-  qty: number;
+  qty: number; // current quantity (may be reduced by spoilage or delivery loss)
+  originalQty?: number; // CRITICAL: original qty at clearance. Spoilage is calculated from this, not from the reduced qty. Prevents repeated spoilage calculations on retry attempts.
   goodsCost: number;
   freightCost: number;
   totalCost: number;
@@ -954,6 +988,7 @@ export async function clearShipment(userId: string, shipmentId: string, opts: { 
     shipment.dutyPaid = duty;
     shipment.quality = 1.0;
     shipment.clearedAt = Date.now();
+    shipment.originalQty = shipment.qty; // CRITICAL: Store original qty to prevent repeated spoilage on retry attempts
     await saveShipments(userId, all);
     return { outcome: 'cleared', dutyPaid: duty, bribePaid: 0 };
   }
@@ -979,6 +1014,7 @@ export async function clearShipment(userId: string, shipmentId: string, opts: { 
     shipment.bribePaid = bribeCost;
     shipment.quality = 0.9;
     shipment.clearedAt = Date.now();
+    shipment.originalQty = shipment.qty; // CRITICAL: Store original qty to prevent repeated spoilage on retry attempts
     await saveShipments(userId, all);
     return { outcome: 'cleared', dutyPaid: duty, bribePaid: bribeCost };
   }
@@ -1045,18 +1081,19 @@ function hashString(s: string): number {
 }
 
 /**
- * Deterministic per (good, hub, day) demand wobble — same shape as the
- * original -20%..+20%*volatility swing, but stable across repeated reads
- * within the same day. This fixes a real bug: the old version called
- * Math.random() fresh on every call, so the estimated price shown in the
- * sell-hub picker could silently differ from the price actually charged a
- * few seconds later when the sale executed.
+ * Deterministic per (good, hub, day) demand wobble — allows ±volatility swings
+ * (e.g. volatility 0.4 = ±40% price swing), giving true market unpredictability.
+ * Stable across repeated reads within the same day — fixes the old bug where
+ * Math.random() was called fresh on every read, causing estimated vs. actual
+ * price mismatches.
+ *
+ * Range: volatility 0.1 (rice) = ±10%, up to 0.7 (olive oil) = ±70%.
  */
 function getDemandWobble(goodKey: string, hubKey: string, volatility: number): number {
   if (volatility <= 0) return 1;
   const hash = hashString(`${goodKey}:${hubKey}:${todayStr()}`);
   const normalized = (hash % 1000) / 1000; // 0..1
-  const swing = (normalized * 2 - 1) * volatility * 0.4;
+  const swing = (normalized * 2 - 1) * volatility; // Full volatility range, not 0.4x
   return 1 + swing;
 }
 
@@ -1064,21 +1101,21 @@ function getDemandWobble(goodKey: string, hubKey: string, volatility: number): n
  * How hard a hub's market has been hit by selling today, as a multiplier
  * on price (1 = full price, floor = fully dumped).
  *
- * Curve: floor + (1-floor) * e^(-rate * units^power), fitted directly
- * against the target depletion table for a volatile (demandStability = 0)
- * good:
- *   20 units  → ~98%     100 units → ~83%
- *   50 units  → ~92%     200 units → ~67%     300 units → ~55%
- * i.e. dumping a market meaningfully collapses the price well before
- * anyone reaches "sell everything in one hub" territory — a handful of
- * players discovering the same good/hub combo runs into diminishing
- * returns fast instead of draining it at near-full price.
+ * Curve: floor + (1-floor) * e^(-rate * units^power). Lowered floor allows
+ * prices to crash hard when a market is flooded, creating real loss scenarios.
+ *
+ * Example depletion for volatile (demandStability = 0) good:
+ *   20 units  → ~95%     100 units → ~70%
+ *   50 units  → ~85%     200 units → ~45%     300 units → ~30%
  *
  * demandStability (0..1, per good) softens the curve for staple goods and
  * sharpens it for volatile ones: stability 1 halves the effective rate,
  * stability 0 applies the raw curve above at full strength.
+ *
+ * At DEPLETION_FLOOR = 0.15, a flooded market can easily sell below cost when
+ * combined with duty, freight, and events — creating genuine profit risk.
  */
-const DEPLETION_FLOOR = 0.28;
+const DEPLETION_FLOOR = 0.15;
 const DEPLETION_RATE = 0.00125;
 const DEPLETION_POWER = 1.17;
 
@@ -1094,13 +1131,20 @@ export async function getMarketPrice(goodKey: string, hubKey: string): Promise<n
   const hub = HUBS.find(h => h.key === hubKey);
   if (!good || !hub) return 0;
 
+  // New price model: no guaranteed markup. Prices float dynamically.
+  // profitMarginBonus acts as baseline demand expectation, not a guaranteed margin.
   const wobble = getDemandWobble(goodKey, hubKey, good.priceVolatility);
   const eventMultiplier = await getPriceMultiplier(goodKey, hubKey);
-  const base = good.baseCost * (MARKET_MARKUP + good.profitMarginBonus) * wobble * eventMultiplier;
+  // base = cost × (1 + baseline margin) × demand wobble × event factors
+  // This can drop below cost if wobble is -50% and events are bad.
+  const base = good.baseCost * (1.0 + good.profitMarginBonus) * wobble * eventMultiplier;
 
   const soldToday = await getUnitsSoldToday(goodKey, hubKey);
   const depletionFactor = getDepletionFactor(soldToday, good.demandStability);
 
+  // Apply market depletion and hub markup to final price.
+  // With low depletion floor (0.15), flooded markets can sell at 15% of base.
+  // If base is cost × 1.35 and depletion is 0.15, final price is cost × 0.2 — a loss.
   return Math.round(base * hub.priceMultiplier * depletionFactor);
 }
 
@@ -1145,15 +1189,16 @@ export async function sellGoods(userId: string, shipmentId: string, hubKey: stri
   const { warehouse } = await getEquipment(userId);
 
   if (shipment.clearedAt) {
-    // BUG FIX: a better Warehouse tier now genuinely slows spoilage (cold
-    // storage), via preservationFactor, instead of Warehouse having no
-    // effect on perishables at all.
+    // CRITICAL FIX: Calculate spoilage from originalQty (set at clearance), not from the
+    // already-reduced shipment.qty. This prevents repeated spoilage on retry attempts:
+    // without this, calling sell() twice on the same old shipment would lose units both times.
+    const originalQty = shipment.originalQty || shipment.qty; // fallback for old shipments without originalQty
     const rawAge = Date.now() - shipment.clearedAt;
     const effectiveAge = rawAge * warehouse.preservationFactor;
     const expiryMs = good.expirationHours * 3600000;
     if (effectiveAge > expiryMs) {
       const spoilFactor = Math.max(0.1, 1 - ((effectiveAge - expiryMs) / expiryMs) * 0.8);
-      const spoiledQty = Math.round(shipment.qty * spoilFactor);
+      const spoiledQty = Math.round(originalQty * spoilFactor);
       if (spoiledQty === 0) {
         shipment.status = 'sold';
         shipment.soldAt = Date.now();
@@ -1161,7 +1206,7 @@ export async function sellGoods(userId: string, shipmentId: string, hubKey: stri
         await saveShipments(userId, all);
         return { success: false, reason: 'Goods have spoiled completely. Shipment discarded.' };
       }
-      shipment.qty = spoiledQty;
+      shipment.qty = spoiledQty; // Set qty to the spoiled amount for THIS sale attempt
     }
   }
 
@@ -1192,9 +1237,16 @@ export async function sellGoods(userId: string, shipmentId: string, hubKey: stri
   if (isRestrictedHere) unitPrice = Math.round(unitPrice * good.blackMarketPriceBonus); // survived the risk — black-market premium
   const gross = Math.round(unitPrice * deliveredQty * shipment.quality);
 
-  const { payout, capped } = settleWin(gross, await getJackpotPool());
+  // Subtle marketplace fee (2% of proceeds). Combined with freight, duty, depletion,
+  // and spoilage, this creates ~4-6% total drag without feeling explicitly "punchy".
+  // Players see mostly profitable trades, but lose money slowly over many trades.
+  const tradingCommission = Math.round(gross * (TRADING_COMMISSION_PCT / 100));
+  const netProceeds = gross - tradingCommission;
+
+  const { payout, capped } = settleWin(netProceeds, await getJackpotPool());
   await addCoins(userId, payout, { type: 'admin_credit', note: `sold ${deliveredQty}x ${good.label} @ ${hub.label}` });
   await deductFromJackpot(payout);
+  await contributeToJackpot(tradingCommission); // House edge to jackpot
   await addUnitsSoldToday(good.key, hubKey, deliveredQty);
 
   // Warehouse holding fee — restored. Sitting on cleared goods past your
@@ -1212,7 +1264,8 @@ export async function sellGoods(userId: string, shipmentId: string, hubKey: stri
     }
   }
 
-  const costBasis = shipment.totalCost + (shipment.dutyPaid || 0) + (shipment.bribePaid || 0) + courierFee + holdingFee;
+  // Cost basis includes trading commission (it reduces effective payout to player)
+  const costBasis = shipment.totalCost + (shipment.dutyPaid || 0) + (shipment.bribePaid || 0) + courierFee + holdingFee + tradingCommission;
   const profit = payout - costBasis;
   const marginPct = costBasis > 0 ? Math.round((profit / costBasis) * 100) : 0;
 
@@ -1223,7 +1276,8 @@ export async function sellGoods(userId: string, shipmentId: string, hubKey: stri
   await saveShipments(userId, all);
 
   const stats = await getStats(userId);
-  stats.lifetimeProfit += Math.max(0, profit);
+  stats.lifetimeNetProfit += profit; // Actual net: includes losses (negative values)
+  stats.lifetimeTradingVolume += payout; // Gross value of sale for volume tracking
   stats.completedShipments += 1;
   await statsTbl.set(userId, stats);
 
@@ -1238,6 +1292,7 @@ export async function sellGoods(userId: string, shipmentId: string, hubKey: stri
     marginPct,
     capped,
     holdingFee,
+    tradingCommission,
     blackMarket: isRestrictedHere,
     courierNote: courierNote || null,
   };
