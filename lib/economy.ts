@@ -520,6 +520,20 @@ export function getLevelInfo(
   };
 }
 
+// ── Transfer Coins ──────────────────────────────────────────
+//
+
+export async function transferCoins(fromId: string, toId: string, amount: number): Promise<{ success: boolean; reason?: string }> {
+  if (amount <= 0) return { success: false, reason: 'invalid_amount' };
+  if (fromId === toId) return { success: false, reason: 'self_transfer' };
+
+  const from = await deductCoins(fromId, amount, { type: 'transfer_out', counterpartyId: toId });
+  if (!from.success) return { success: false, reason: 'insufficient_funds' };
+
+  await addCoins(toId, amount, { type: 'transfer_in', counterpartyId: fromId });
+  return { success: true };
+}
+
 // ── Attendance-triggered daily bonus ──────────────────────────────────────────
 // No more manual "!daily" claim — this is called once by attendance.ts right
 // after it approves a submission for the day.
