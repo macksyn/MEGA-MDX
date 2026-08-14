@@ -3,6 +3,8 @@ import { getWallet, formatNumber, withEconomyGuard, getLevelInfo } from '../lib/
 import { cleanJid } from '../lib/isOwner.js';
 import { extractTargetJid } from '../lib/resolveTarget.js';
 import { resolveParticipant } from '../lib/contactUtil.js';
+import { promptMenu } from '../lib/menuSession.js';
+import { sendStatement } from '../lib/statement.js';
 
 export const command = 'balance';
 export const aliases = ['bal', 'wallet'];
@@ -42,6 +44,23 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     mentions: isSelf ? [] : [resolvedJid],
     ...channelInfo
   }, { quoted: message });
+
+  // Follow-up statement-of-account view. Fully transparent by design —
+  // anyone can already check anyone's balance with !balance @user, so this
+  // just extends that same openness to the full ledger, no owner/sudo gate.
+  const selfId = cleanJid(senderId);
+
+  const result = await promptMenu(sock, message, chatId, selfId, {
+    title: '💰 BALANCE',
+    text: 'Want more detail?',
+    options: [
+      { label: 'View statement of account', value: 'statement', description: 'Full transaction history' },
+    ],
+  });
+
+  if (result.cancelled || result.timedOut || result.value !== 'statement') return;
+
+  await sendStatement(sock, message, chatId, targetId, isSelf, 10, channelInfo);
 }
 
 export const handler = withEconomyGuard(_handler);
