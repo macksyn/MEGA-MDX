@@ -50,15 +50,15 @@ export interface NigeriaEventDef {
 export const RANDOM_EVENTS: NigeriaEventDef[] = [
   {
     key: 'fuel_scarcity', label: 'Fuel Scarcity', headline: 'Fuel Scarcity Hits the Roads', emoji: '⛽',
-    description: 'Petrol queues are snaking round the block nationwide. Truckers are rationing trips, and moving goods inland just got a lot harder.',
+    description: 'Petrol queues are snaking round the block nationwide. Truckers are rationing trips, and moving goods inland just got a lot harder — but bikes and Keke are still moving.',
     weight: 3, durationHrsRange: [24, 72],
-    effects: { courierRiskDelta: 0.15, affectedHubs: ['onitsha', 'aba', 'kano', 'sokoto', 'ph'] },
+    effects: { courierRiskDelta: 0.15, priceMultiplier: 1.25, affectedGoods: ['motorcycle_bajaj', 'keke_napep'], affectedHubs: ['onitsha', 'aba', 'kano', 'sokoto', 'abuja', 'ph'] },
   },
   {
     key: 'election_season', label: 'Election Season', headline: 'Election Season Tightens the Roads', emoji: '🗳️',
     description: 'Checkpoints are up and wallets are closed for anything that isn\u2019t essential. Buyers are holding off on luxury spending until the votes are counted.',
     weight: 2, durationHrsRange: [48, 120],
-    effects: { dutyRateDeltaPct: 4, courierRiskDelta: 0.08, priceMultiplier: 0.9, affectedGoods: ['perfume_cosmetics', 'gold_perfume', 'luxury_goods'] },
+    effects: { dutyRateDeltaPct: 4, courierRiskDelta: 0.08, priceMultiplier: 0.9, affectedGoods: ['perfume_cosmetics', 'gold_bars', 'diamond_jewelry', 'ferrari', 'lamborghini'] },
   },
   {
     key: 'dollar_scarcity', label: 'Dollar Scarcity', headline: 'Naira Under Pressure', emoji: '💵',
@@ -108,7 +108,7 @@ function getSeasonalEvents(): NigeriaEventDef[] {
       key: 'christmas_rush', label: 'Christmas Rush', headline: 'Detty December Is Here', emoji: '🎄',
       description: 'Detty December is in full swing. Lagos and Port Harcourt are buying big and paying whatever it takes.',
       weight: 0, durationHrsRange: [0, 0],
-      effects: { priceMultiplier: 1.35, affectedGoods: ['perfume_cosmetics', 'gold_perfume', 'luxury_goods', 'electronics'], affectedHubs: ['lagos', 'ph'] },
+      effects: { priceMultiplier: 1.35, affectedGoods: ['perfume_cosmetics', 'gold_bars', 'diamond_jewelry', 'iphone', 'samsung_galaxy', 'electronics'], affectedHubs: ['lagos', 'abuja', 'ph'] },
     });
   }
 
@@ -237,11 +237,19 @@ const GOOD_LABELS: Record<string, string> = {
   electronics: 'Electronics', pharmaceuticals: 'Pharmaceuticals', rubber: 'Rubber & Auto Parts',
   textiles: 'Textiles', food: 'Food & Perishables', coffee_leather: 'Coffee & Leather',
   olive_wine: 'Olive Oil & Wine', dates_textiles: 'Dates & Textiles', perfume_cosmetics: 'Perfume & Cosmetics',
-  gold_perfume: 'Gold & Perfume', machinery: 'Machinery', luxury_goods: 'Luxury Goods', rice: 'Rice',
+  machinery: 'Machinery', rice: 'Rice',
+  iphone: 'iPhone', samsung_galaxy: 'Samsung Galaxy', tecno_camon: 'Tecno Camon', infinix_note: 'Infinix Note',
+  gold_bars: 'Gold Bars', diamond_jewelry: 'Diamond Jewelry', silver_jewelry: 'Silver Jewelry',
+  designer_shoes: 'Designer Shoes', designer_bags: 'Designer Bags', macbook: 'MacBook',
+  toyota_corolla: 'Toyota Corolla', toyota_camry: 'Toyota Camry', lexus_rx: 'Lexus RX',
+  ferrari: 'Ferrari', lamborghini: 'Lamborghini',
+  tokunbo_corolla: 'Corolla (Tokunbo)', tokunbo_camry: 'Camry (Tokunbo)',
+  motorcycle_bajaj: 'Bajaj Motorcycle', keke_napep: 'Keke Napep',
+  okirika_grade_a: 'Okirika Bales (Grade A)', okirika_grade_b: 'Okirika Bales (Grade B)',
 };
 
 const HUB_LABELS: Record<string, string> = {
-  lagos: 'Lagos', onitsha: 'Onitsha', aba: 'Aba', kano: 'Kano', sokoto: 'Sokoto', ph: 'Port Harcourt',
+  lagos: 'Lagos', abuja: 'Abuja', onitsha: 'Onitsha', aba: 'Aba', kano: 'Kano', sokoto: 'Sokoto', ph: 'Port Harcourt',
 };
 
 interface ImpactLine {
@@ -311,9 +319,22 @@ function buildImpactLines(event: NigeriaEventDef): ImpactLine[] {
  * Meant for a dedicated "Market Conditions" view, not the compact inline
  * subtitle (use getEventsStatusBlock for that).
  */
+const QUIET_DAY_DISPATCHES: string[] = [
+  '🕊️ _Ports are clear, roads are open, and prices are holding steady nationwide. A good day to move without surprises._',
+  '📉 _No major disruptions on the wire today — traders are quietly restocking while things are calm._',
+  '🛳️ _Customs is moving at normal pace and the naira is steady. Nothing forcing anyone\u2019s hand right now._',
+  '☀️ _A quiet stretch across the corridors. Analysts call it the calm before the next swing — worth stocking up while it lasts._',
+];
+
+function pickQuietDayDispatch(): string {
+  // Stable for the hour so the wire doesn't visibly flicker between checks
+  const hourSlot = Math.floor(Date.now() / 3600000);
+  return QUIET_DAY_DISPATCHES[hourSlot % QUIET_DAY_DISPATCHES.length];
+}
+
 export async function getEventsDetailBlock(): Promise<string> {
   const events = await getActiveEvents();
-  if (!events.length) return '_No market conditions in effect right now — business as usual._';
+  if (!events.length) return pickQuietDayDispatch();
 
   const sections = events.map(e => {
     const lines = buildImpactLines(e);
