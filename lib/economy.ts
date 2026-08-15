@@ -438,29 +438,48 @@ export async function deductGroqCoins(userId: string, amount: number, meta: Tran
 
 const EXCHANGE_HISTORY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // keep 30 days
 const ROLLING_WINDOW_DAYS = 7;
+// This is a Groq-Coin VOLUME threshold, not a transaction count: a Level 2+
+// member keeps their level as long as they've moved at least this many GC
+// (summed across all their exchanges) within the trailing window. Because
+// the window is rolling, this also naturally gives a grace period — a
+// member's most recent qualifying exchange keeps them active for up to
+// ROLLING_WINDOW_DAYS after it, and they only fall out once that activity
+// ages out of the window with nothing to replace it.
 const MIN_ROLLING_EXCHANGES_FOR_LEVEL_2 = 100;
 
-/**
- * Get the raw array of exchange timestamps for a user.
- */
-export async function getExchangeHistory(userId: string): Promise<number[]> {
-  return (await exchangeHistoryTbl.get(userId)) || [];
+interface ExchangeHistoryEntry {
+  ts: number;
+  amount: number; // Groq Coins moved in this exchange
 }
 
 /**
- * Record a new exchange timestamp and prune old entries (>30 days).
+ * Get the raw exchange history (timestamp + GC amount) for a user.
+ * Tolerates old-format entries (plain timestamp numbers, from before amount
+ * tracking was added) by treating them as amount=1 so historical data isn't
+ * discarded, just weighted the old (count-based) way until it ages out.
  */
-export async function recordExchange(userId: string): Promise<void> {
+export async function getExchangeHistory(userId: string): Promise<ExchangeHistoryEntry[]> {
+  const raw = (await exchangeHistoryTbl.get(userId)) || [];
+  return raw.map((entry: number | ExchangeHistoryEntry) =>
+    typeof entry === 'number' ? { ts: entry, amount: 1 } : entry
+  );
+}
+
+/**
+ * Record a new exchange (timestamp + GC amount moved) and prune old entries
+ * (>30 days).
+ */
+export async function recordExchange(userId: string, amount: number = 1): Promise<void> {
   const history = await getExchangeHistory(userId);
-  history.push(Date.now());
+  history.push({ ts: Date.now(), amount });
   // Prune entries older than 30 days to keep storage small
   const cutoff = Date.now() - EXCHANGE_HISTORY_MAX_AGE_MS;
-  const filtered = history.filter(ts => ts > cutoff);
+  const filtered = history.filter(e => e.ts > cutoff);
   await exchangeHistoryTbl.set(userId, filtered);
 }
 
 /**
- * Get the number of exchanges performed in the last `days` days.
+ * Get the total Groq Coin volume exchanged in the last `days` days.
  */
 export async function getRollingExchangeCount(
   userId: string,
@@ -468,7 +487,7 @@ export async function getRollingExchangeCount(
 ): Promise<number> {
   const history = await getExchangeHistory(userId);
   const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-  return history.filter(ts => ts > cutoff).length;
+  return history.filter(e => e.ts > cutoff).reduce((sum, e) => sum + e.amount, 0);
 }
 
 // ── Level definitions ──────────────────────────────────────────────────────
@@ -489,8 +508,12 @@ function createProgressBar(percent: number, size = 10): string {
 
 /**
  * Compute level info with rolling requirement:
- * - If lifetime level >= 2 but rollingCount < MIN_ROLLING_EXCHANGES_FOR_LEVEL_2,
- *   effective level is forced to 1 (Novice).
+ * - If lifetime level >= 2 but rollingCount (Groq Coins exchanged in the
+ *   trailing ROLLING_WINDOW_DAYS, NOT a transaction count) is below
+ *   MIN_ROLLING_EXCHANGES_FOR_LEVEL_2, effective level is forced to 1 (Novice).
+ *   Because the window is rolling, a member naturally stays at their real
+ *   level for up to ROLLING_WINDOW_DAYS after their last qualifying activity
+ *   before demotion kicks in — no separate grace-period state needed.
  * - The `isActive` flag indicates whether the user meets the rolling requirement
  *   (useful for displaying warnings).
  */
@@ -1085,8 +1108,9 @@ export async function exchangeWithMember(senderId: string, targetId: string, coi
     return { success: false, reason: 'exchange_failed' };
   }
 
-  // Counts toward the SENDER's exchange-level progress, same as self-conversion did.
-  await addExchange(senderId, 1);
+  // Counts toward the SENDER's exchange-level progress (lifetime: +1 transaction;
+  // rolling 7-day requirement: +netGroqCoins actually moved).
+  await addExchange(senderId, 1, netGroqCoins);
 
   // Reciprocal debt bookkeeping: if the sender previously benefited from an
   // exchange FROM the target (i.e. sender already owed target a reciprocal),
@@ -1156,11 +1180,14 @@ export async function getDebtsOwedToUser(userId: string): Promise<Array<{ debtor
 
 // ── Exchange count updater (also records history) ────────────────────────────
 
-export async function addExchange(userId: string, amount = 1): Promise<Wallet> {
+export async function addExchange(userId: string, countIncrement = 1, groqCoinsVolume: number = countIncrement): Promise<Wallet> {
   const saved = await mutateWallet(userId, (w) => {
-    w.exchangeCount += amount;
+    // Lifetime tier (Novice/Active/Pro/...) is a count of exchange
+    // transactions, independent of how much GC each one moved.
+    w.exchangeCount += countIncrement;
   });
-  // Record timestamp for rolling requirement
-  await recordExchange(userId);
+  // Rolling 7-day requirement is GC VOLUME, not transaction count — record
+  // the actual amount moved in this exchange.
+  await recordExchange(userId, groqCoinsVolume);
   return saved;
 }
