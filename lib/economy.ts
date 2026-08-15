@@ -167,6 +167,33 @@ async function saveWallet(userId: string, wallet: Wallet): Promise<Wallet> {
   return wallet;
 }
 
+/**
+ * Atomically read-modify-write a wallet via the store's own locked
+ * mutate() (same lock patch() uses, keyed by physical table + key).
+ *
+ * IMPORTANT: raw getWallet()+saveWallet() — i.e. wallets.get()+wallets.set()
+ * — are each individually a round trip to the adapter with NO lock between
+ * them. wallets.patch() (used by syncIdentity) IS lock-protected, but that
+ * lock only serializes patch()/mutate() calls against each other — it does
+ * NOT block a concurrent, unlocked get()+set() pair from interleaving in
+ * between a patch()'s own locked read and write. That's exactly how a
+ * transfer's debit could vanish: syncIdentity reads a wallet, deductCoins
+ * (built on raw get()+set()) reads the same wallet, deducts, and writes —
+ * then syncIdentity finishes merging onto its now-stale snapshot and writes
+ * it back, silently reverting the deduction. Anything that mutates a
+ * wallet's fields must go through this (or wallets.patch()) instead of
+ * getWallet()+saveWallet(), so it shares the one lock everything else uses.
+ */
+async function mutateWallet(
+  userId: string,
+  mutator: (wallet: Wallet) => Wallet | void
+): Promise<Wallet> {
+  return wallets.mutate(userId, (current: Wallet | null) => {
+    const wallet = current ? { ...EMPTY_WALLET, ...current } : { ...EMPTY_WALLET };
+    return mutator(wallet) || wallet;
+  });
+}
+
 // ── Identity recognition (name + phone) ──────────────────────────────────────
 // Every economy wallet is keyed by a normalized JID, which on its own is
 // unrecognizable (raw digits, or a @lid identifier that isn't even a real
@@ -236,7 +263,6 @@ function resolveName(userId: string, sock: any, pushNameHint?: string | null): s
 export async function syncIdentity(userId: string, sock: any, pushName?: string | null, rawJid?: string | null): Promise<void> {
   if (!userId || !sock) return;
   try {
-    const wallet = await getWallet(userId);
     // Resolve against the raw JID (domain intact) when we have it — userId
     // has already had its domain stripped by cleanJid() and can never match
     // sock.store.contacts keys or trigger the @lid-unwrap branch otherwise.
@@ -245,15 +271,20 @@ export async function syncIdentity(userId: string, sock: any, pushName?: string 
     const jidForResolution = rawJid || userId;
     const [phone, name] = [await resolvePhone(jidForResolution, sock), resolveName(jidForResolution, sock, pushName)];
 
-    const patch: Partial<Wallet> = {};
-    if (phone && phone !== wallet.phone) patch.phone = phone;
-    if (name && name !== wallet.name) patch.name = name;
-    if (rawJid && rawJid !== wallet.jid) patch.jid = rawJid;
-
-    if (Object.keys(patch).length > 0) {
-      patch.identitySyncedAt = Date.now();
-      await wallets.patch(userId, patch);
-    }
+    // NOTE: previously used wallets.patch() directly. Switched to
+    // mutateWallet() so the "did anything actually change" comparison reads
+    // the wallet under the SAME lock it writes back under — patch() reads
+    // outside a lock-held snapshot boundary relative to mutate()-based
+    // callers is fine (they share the lock), but computing the diff here
+    // via a stale getWallet() and patching separately reopened the exact
+    // stale-read/write race this function is trying to avoid causing.
+    await mutateWallet(userId, (wallet) => {
+      let changed = false;
+      if (phone && phone !== wallet.phone) { wallet.phone = phone; changed = true; }
+      if (name && name !== wallet.name) { wallet.name = name; changed = true; }
+      if (rawJid && rawJid !== wallet.jid) { wallet.jid = rawJid; changed = true; }
+      if (changed) wallet.identitySyncedAt = Date.now();
+    });
   } catch (_) {
     // Best-effort — identity recognition should never break an economy command.
   }
@@ -364,37 +395,41 @@ export async function getTransactions(userId: string, limit = 20): Promise<Trans
 
 export async function addCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<Wallet> {
   const creditAmount = await applyGarnishment(userId, amount, meta);
-  const wallet = await getWallet(userId);
-  wallet.coins += creditAmount;
-  if (creditAmount > 0) wallet.lifetimeCoinsEarned += creditAmount;
-  const saved = await saveWallet(userId, wallet);
+  const saved = await mutateWallet(userId, (wallet) => {
+    wallet.coins += creditAmount;
+    if (creditAmount > 0) wallet.lifetimeCoinsEarned += creditAmount;
+  });
   await logTransaction(userId, { currency: 'coins', amount: creditAmount, balanceAfter: saved.coins, type: meta.type || 'admin_credit', ...meta });
   return saved;
 }
 
 export async function addGroqCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<Wallet> {
-  const wallet = await getWallet(userId);
-  wallet.groqCoins += amount;
-  if (amount > 0) wallet.lifetimeGroqCoinsEarned += amount;
-  const saved = await saveWallet(userId, wallet);
+  const saved = await mutateWallet(userId, (wallet) => {
+    wallet.groqCoins += amount;
+    if (amount > 0) wallet.lifetimeGroqCoinsEarned += amount;
+  });
   await logTransaction(userId, { currency: 'groqCoins', amount, balanceAfter: saved.groqCoins, type: meta.type || 'admin_credit', ...meta });
   return saved;
 }
 
 export async function deductCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<{ success: boolean; wallet: Wallet }> {
-  const wallet = await getWallet(userId);
-  if (wallet.coins < amount) return { success: false, wallet };
-  wallet.coins -= amount;
-  const saved = await saveWallet(userId, wallet);
+  let insufficientFunds = false;
+  const saved = await mutateWallet(userId, (wallet) => {
+    if (wallet.coins < amount) { insufficientFunds = true; return; }
+    wallet.coins -= amount;
+  });
+  if (insufficientFunds) return { success: false, wallet: saved };
   await logTransaction(userId, { currency: 'coins', amount: -amount, balanceAfter: saved.coins, type: meta.type || 'admin_debit', ...meta });
   return { success: true, wallet: saved };
 }
 
 export async function deductGroqCoins(userId: string, amount: number, meta: TransactionMeta = {}): Promise<{ success: boolean; wallet: Wallet }> {
-  const wallet = await getWallet(userId);
-  if (wallet.groqCoins < amount) return { success: false, wallet };
-  wallet.groqCoins -= amount;
-  const saved = await saveWallet(userId, wallet);
+  let insufficientFunds = false;
+  const saved = await mutateWallet(userId, (wallet) => {
+    if (wallet.groqCoins < amount) { insufficientFunds = true; return; }
+    wallet.groqCoins -= amount;
+  });
+  if (insufficientFunds) return { success: false, wallet: saved };
   await logTransaction(userId, { currency: 'groqCoins', amount: -amount, balanceAfter: saved.groqCoins, type: meta.type || 'admin_debit', ...meta });
   return { success: true, wallet: saved };
 }
@@ -530,7 +565,22 @@ export async function transferCoins(fromId: string, toId: string, amount: number
   const from = await deductCoins(fromId, amount, { type: 'transfer_out', counterpartyId: toId });
   if (!from.success) return { success: false, reason: 'insufficient_funds' };
 
-  await addCoins(toId, amount, { type: 'transfer_in', counterpartyId: fromId });
+  try {
+    await addCoins(toId, amount, { type: 'transfer_in', counterpartyId: fromId });
+  } catch (err: any) {
+    // The debit above already committed. If the credit fails (store error,
+    // thrown exception in a garnishment hook, etc.) the coins must not just
+    // vanish — refund the sender rather than silently eating their balance.
+    // Both legs are logged loudly on failure so it's never a silent loss.
+    console.error(`[economy] transfer credit failed after debit committed (from=${fromId} to=${toId} amount=${amount}):`, err?.message || err);
+    try {
+      await addCoins(fromId, amount, { type: 'transfer_in', counterpartyId: fromId, note: 'auto-refund: transfer credit failed' });
+    } catch (refundErr: any) {
+      console.error(`[economy] CRITICAL: transfer refund ALSO failed (from=${fromId} to=${toId} amount=${amount}) — funds may be stuck, needs manual reconciliation:`, refundErr?.message || refundErr);
+    }
+    return { success: false, reason: 'transfer_failed' };
+  }
+
   return { success: true };
 }
 
@@ -561,24 +611,36 @@ export async function awardAttendanceBonus(
   | { success: false; reason: 'already_awarded_today' }
   | { success: true; reward: number; capped: boolean; levelGated: boolean }
 > {
-  const wallet = await getWallet(userId);
   const today = todayStr();
 
-  if (wallet.lastDailyDate === today) {
-    // Already credited today — attendance.ts already blocks a second
-    // submission on the same day, this is just a defensive double-check.
+  // Atomically CLAIM today's slot before doing any reward math. Checking
+  // lastDailyDate via a plain read and only writing it back several awaits
+  // later (as this used to) is a check-then-act race: two concurrent calls
+  // for the same user (a duplicate attendance submission, a retry) can both
+  // read "not yet awarded" before either commits, and both pay out. Doing
+  // the claim as its own mutateWallet() call means only one caller can ever
+  // flip lastDailyDate for a given day — everyone else is correctly told
+  // it's already awarded, even if they all arrive at the exact same instant.
+  let alreadyAwarded = false;
+  let exchangeCountAtClaim = 0;
+  await mutateWallet(userId, (w) => {
+    if (w.lastDailyDate === today) { alreadyAwarded = true; return; }
+    exchangeCountAtClaim = w.exchangeCount;
+    w.lastDailyDate = today;
+    w.dailyStreak = streak;
+  });
+  if (alreadyAwarded) {
     return { success: false, reason: 'already_awarded_today' };
   }
 
   // Fetch rolling exchange count for the last 7 days
   const rollingCount = await getRollingExchangeCount(userId, 7);
-  const { levelNumber } = getLevelInfo(wallet.exchangeCount, rollingCount);
+  const { levelNumber } = getLevelInfo(exchangeCountAtClaim, rollingCount);
 
   if (levelNumber < 2) {
-    // Level too low (either lifetime <25 or rolling <100) – no coin reward
-    wallet.dailyStreak = streak;
-    wallet.lastDailyDate = today;
-    await saveWallet(userId, wallet);
+    // Level too low (either lifetime <25 or rolling <100) – no coin reward.
+    // The claim above already recorded today's streak/date, so nothing
+    // more to write here.
     return { success: true, reward: 0, capped: false, levelGated: true };
   }
 
@@ -596,11 +658,14 @@ export async function awardAttendanceBonus(
   // Streak/attendance credit still updates even if the bank is completely
   // dry right now (payout === 0) — attendance itself was still valid, and
   // blocking that would unfairly penalize the member for the bank's state.
-  wallet.coins += payout;
-  if (payout > 0) wallet.lifetimeCoinsEarned += payout;
-  wallet.dailyStreak = streak;
-  wallet.lastDailyDate = today;
-  const saved = await saveWallet(userId, wallet);
+  // (lastDailyDate/dailyStreak were already committed by the claim above —
+  // if the process crashes between the claim and this credit, the member's
+  // "today" is correctly consumed and won't double-pay on retry; worst case
+  // is a missed credit that support can top up, never a double credit.)
+  const saved = await mutateWallet(userId, (w) => {
+    w.coins += payout;
+    if (payout > 0) w.lifetimeCoinsEarned += payout;
+  });
   await logTransaction(userId, {
     currency: 'coins',
     amount: payout,
@@ -619,20 +684,26 @@ export async function doWork(userId: string): Promise<
   | { success: true; reward: number }
 > {
   const settings = await getSettings();
-  const wallet = await getWallet(userId);
   const now = Date.now();
-  const readyAt = wallet.lastWorkTs + settings.workCooldownMs;
 
-  if (now < readyAt) {
-    return { success: false, remainingMs: readyAt - now };
-  }
+  // Same atomic-claim shape as awardAttendanceBonus: check the cooldown AND
+  // flip lastWorkTs inside one mutateWallet() call so two rapid !work
+  // commands can't both pass the cooldown check before either commits.
+  let onCooldown = false;
+  let remainingMs = 0;
+  await mutateWallet(userId, (w) => {
+    const readyAt = w.lastWorkTs + settings.workCooldownMs;
+    if (now < readyAt) { onCooldown = true; remainingMs = readyAt - now; return; }
+    w.lastWorkTs = now;
+  });
+  if (onCooldown) return { success: false, remainingMs };
 
   const grossReward = Math.floor(Math.random() * (settings.workMax - settings.workMin + 1)) + settings.workMin;
   const reward = await applyGarnishment(userId, grossReward, { type: 'work' });
-  wallet.coins += reward;
-  wallet.lifetimeCoinsEarned += reward;
-  wallet.lastWorkTs = now;
-  const saved = await saveWallet(userId, wallet);
+  const saved = await mutateWallet(userId, (w) => {
+    w.coins += reward;
+    w.lifetimeCoinsEarned += reward;
+  });
   await logTransaction(userId, { currency: 'coins', amount: reward, balanceAfter: saved.coins, type: 'work' });
 
   return { success: true, reward };
@@ -660,7 +731,21 @@ export async function payoutMonthlyTop3(chatId: string, dateStr: string): Promis
   if (!await isGroupEnabled(chatId)) return [];
 
   const processedKey = `monthlyTop3:${dateStr}:${chatId}`;
-  if (await processed.get(processedKey)) return [];
+
+  // Atomically claim this chat+date before paying anyone. The previous
+  // check-then-set (processed.get() up front, processed.set() only after
+  // ALL payouts finished) left the entire payout loop as an open race
+  // window — two overlapping calls (e.g. the scheduler firing again right
+  // as the bot restarts, exactly the scenario this function's docstring
+  // already worried about) would both see "not yet processed" and both pay
+  // out the full top-3 rewards. Claiming via processed.mutate() first means
+  // only one caller can ever win the claim for a given key.
+  let alreadyProcessed = false;
+  await processed.mutate(processedKey, (current: boolean | null) => {
+    if (current) { alreadyProcessed = true; return current; }
+    return true;
+  });
+  if (alreadyProcessed) return [];
 
   const settings = await getSettings();
   const top3 = await getMonthlyLeaderboard(chatId, null, 3);
@@ -679,7 +764,6 @@ export async function payoutMonthlyTop3(chatId: string, dateStr: string): Promis
     results.push({ userId: top3[i].userId, points: top3[i].points, reward, rank: i + 1 });
   }
 
-  await processed.set(processedKey, true);
   return results;
 }
 
@@ -698,7 +782,7 @@ export interface WithdrawalRequest {
 }
 
 export async function requestWithdrawal(userId: string, groqCoinsAmount: number, payoutInfo: string): Promise<
-  | { success: false; reason: 'below_threshold' | 'insufficient_funds' }
+  | { success: false; reason: 'below_threshold' | 'insufficient_funds' | 'request_failed' }
   | { success: true; request: WithdrawalRequest }
 > {
   const settings = await getSettings();
@@ -713,7 +797,8 @@ export async function requestWithdrawal(userId: string, groqCoinsAmount: number,
 
   // Hold the Groq Coins in escrow immediately so they can't be double-spent
   // while the request is pending.
-  await deductGroqCoins(userId, groqCoinsAmount);
+  const escrow = await deductGroqCoins(userId, groqCoinsAmount);
+  if (!escrow.success) return { success: false, reason: 'insufficient_funds' };
 
   const id = `wd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const request: WithdrawalRequest = {
@@ -728,7 +813,21 @@ export async function requestWithdrawal(userId: string, groqCoinsAmount: number,
     note: null,
   };
 
-  await withdrawals.set(id, request);
+  try {
+    await withdrawals.set(id, request);
+  } catch (err: any) {
+    // Groq Coins are already held in escrow — if the request record itself
+    // fails to save, refund the escrow rather than leaving it stuck with no
+    // corresponding request to resolve.
+    console.error(`[economy] withdrawal request save failed after escrow committed (user=${userId} amount=${groqCoinsAmount}):`, err?.message || err);
+    try {
+      await addGroqCoins(userId, groqCoinsAmount, { type: 'withdrawal_refund', note: 'auto-refund: request save failed' });
+    } catch (refundErr: any) {
+      console.error(`[economy] CRITICAL: withdrawal escrow refund ALSO failed (user=${userId} amount=${groqCoinsAmount}) — needs manual reconciliation:`, refundErr?.message || refundErr);
+    }
+    return { success: false, reason: 'request_failed' };
+  }
+
   return { success: true, request };
 }
 
@@ -872,10 +971,23 @@ export async function buyEquipment(userId: string, type: 'boat' | 'net' | 'bait'
   const result = await deductCoins(userId, def.cost, { type: 'admin_debit', note: `bought ${type}: ${tier}` });
   if (!result.success) return { success: false, reason: 'insufficient_funds' };
 
-  // Set equipment
-  const patch: any = {};
-  patch[`equipment.${type}`] = tier;
-  await wallets.patch(userId, patch);
+  // Set equipment — through mutateWallet so this can't race the deduct
+  // above (or anything else touching this wallet).
+  try {
+    await mutateWallet(userId, (wallet) => {
+      wallet.equipment = { ...wallet.equipment, [type]: tier };
+    });
+  } catch (err: any) {
+    // Coins already spent — if setting the equipment field itself throws,
+    // refund rather than have the member pay for gear they never received.
+    console.error(`[economy] equipment purchase failed to apply after debit committed (user=${userId} type=${type} tier=${tier}):`, err?.message || err);
+    try {
+      await addCoins(userId, def.cost, { type: 'admin_credit', note: `auto-refund: ${type} purchase (${tier}) failed to apply` });
+    } catch (refundErr: any) {
+      console.error(`[economy] CRITICAL: equipment purchase refund ALSO failed (user=${userId} type=${type} tier=${tier}) — needs manual reconciliation:`, refundErr?.message || refundErr);
+    }
+    return { success: false, reason: 'purchase_failed' };
+  }
 
   return { success: true };
 }
@@ -885,9 +997,9 @@ export async function equipEquipment(userId: string, type: 'boat' | 'net' | 'bai
   if (!def) return { success: false, reason: 'invalid_tier' };
   // We'll allow equipping any tier (assuming they bought it)
   // In a full system we'd check ownership, but we trust the buy flow.
-  const patch: any = {};
-  patch[`equipment.${type}`] = tier;
-  await wallets.patch(userId, patch);
+  await mutateWallet(userId, (wallet) => {
+    wallet.equipment = { ...wallet.equipment, [type]: tier };
+  });
   return { success: true };
 }
 
@@ -921,7 +1033,7 @@ export async function drainFeePool(): Promise<number> {
 }
 
 export async function exchangeWithMember(senderId: string, targetId: string, coinsAmount: number): Promise<
-  | { success: false; reason: 'invalid_amount' | 'amount_not_allowed' | 'self_exchange' | 'below_minimum' | 'insufficient_funds' }
+  | { success: false; reason: 'invalid_amount' | 'amount_not_allowed' | 'self_exchange' | 'below_minimum' | 'insufficient_funds' | 'exchange_failed' }
   | { success: true; coinsSpent: number; groqCoinsGained: number; fee: number; debtResolved: boolean }
 > {
   if (!coinsAmount || coinsAmount <= 0) return { success: false, reason: 'invalid_amount' };
@@ -956,8 +1068,22 @@ export async function exchangeWithMember(senderId: string, targetId: string, coi
   const fee = Math.floor(groqCoinsGross * feePercent / 100);
   const netGroqCoins = groqCoinsGross - fee;
 
-  if (netGroqCoins > 0) await addGroqCoins(targetId, netGroqCoins, { type: 'exchange_in', counterpartyId: senderId });
-  if (fee > 0) await addToFeePool(fee);
+  try {
+    if (netGroqCoins > 0) await addGroqCoins(targetId, netGroqCoins, { type: 'exchange_in', counterpartyId: senderId });
+    if (fee > 0) await addToFeePool(fee);
+  } catch (err: any) {
+    // Coins were already spent — if crediting the target's Groq Coins (or
+    // the fee pool) throws partway through, refund the sender's coins
+    // rather than letting them vanish. Logged loudly either way so a
+    // partial failure is never silent.
+    console.error(`[economy] exchange credit failed after debit committed (sender=${senderId} target=${targetId} coinsSpent=${coinsToSpend}):`, err?.message || err);
+    try {
+      await addCoins(senderId, coinsToSpend, { type: 'exchange_out', counterpartyId: senderId, note: 'auto-refund: exchange credit failed' });
+    } catch (refundErr: any) {
+      console.error(`[economy] CRITICAL: exchange refund ALSO failed (sender=${senderId} target=${targetId} coinsSpent=${coinsToSpend}) — needs manual reconciliation:`, refundErr?.message || refundErr);
+    }
+    return { success: false, reason: 'exchange_failed' };
+  }
 
   // Counts toward the SENDER's exchange-level progress, same as self-conversion did.
   await addExchange(senderId, 1);
@@ -1031,10 +1157,10 @@ export async function getDebtsOwedToUser(userId: string): Promise<Array<{ debtor
 // ── Exchange count updater (also records history) ────────────────────────────
 
 export async function addExchange(userId: string, amount = 1): Promise<Wallet> {
-  const wallet = await getWallet(userId);
-  wallet.exchangeCount += amount;
-  await saveWallet(userId, wallet);
+  const saved = await mutateWallet(userId, (w) => {
+    w.exchangeCount += amount;
+  });
   // Record timestamp for rolling requirement
   await recordExchange(userId);
-  return wallet;
+  return saved;
 }
