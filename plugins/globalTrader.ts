@@ -33,6 +33,7 @@ import {
   WAREHOUSE_DEFS,
   getEquipment,
   buyEquipment,
+  getGoodsIntelBlock,
 } from '../lib/globalTraderEconomy.js';
 
 export const command = 'global';
@@ -89,7 +90,7 @@ async function runMainMenu(sock: any, message: any, chatId: string, userId: stri
       { label: 'License & Rank', value: 'license', description: 'Check expiry, renew, view rank' },
       { label: 'Upgrades', value: 'upgrades', description: 'Clearing Agent & Warehouse tiers' },
       { label: 'Wallet', value: 'wallet' },
-      { label: 'Market Conditions', value: 'conditions', description: events ? '⚡ Active events affecting trade' : 'All quiet right now' },
+      { label: '🌍 World News', value: 'conditions', description: events ? '⚡ Breaking — check what\'s moving the market' : 'Today\'s dispatches from the ports' },
     ],
     cancelLabel: 'Exit',
   });
@@ -116,20 +117,19 @@ async function runSourceMenu(sock: any, message: any, chatId: string, userId: st
   const rank = await getPlayerRank(userId);
   const unlocked = COUNTRIES.filter(c => rank.unlockedCountries.includes(c.key));
 
-  const options = await Promise.all(unlocked.map(async c => {
-    const stock = await getStockLevel(c.key);
-    const good = GOODS[c.goodKey];
-    return {
-      label: `${c.emoji} ${c.label}`,
-      value: c.key,
-      description: `${good.label} (${formatNumber(good.baseCost)} coins/unit) · ${stock.remaining}/${stock.cap} left today\n     ${good.traitLine}`,
-    };
+  const options = unlocked.map(c => ({
+    label: `${c.emoji} ${c.label}`,
+    value: c.key,
+    description: `${c.goodKeys.length} product line${c.goodKeys.length > 1 ? 's' : ''} available`,
   }));
 
   const locked = COUNTRIES.length - unlocked.length;
   const result = await promptMenu(sock, message, chatId, userId, {
     title: '📦 GLOBAL TRADER · Source',
-    subtitle: locked ? `${locked} more country(s) unlock at higher rank` : undefined,
+    subtitle: [
+      locked ? `${locked} more country(s) unlock at higher rank` : null,
+      '🌍 Check World News before you commit — smart money reads the news first.',
+    ].filter(Boolean).join('\n'),
     text: 'Pick a country to source from:',
     options,
     cancelLabel: 'Back',
@@ -139,12 +139,39 @@ async function runSourceMenu(sock: any, message: any, chatId: string, userId: st
   if (result.timedOut || !result.value) return;
 
   const country = COUNTRIES.find(c => c.key === result.value);
-  const outcome = await runFreightMenu(sock, message, chatId, userId, country);
+  const outcome = await runGoodMenu(sock, message, chatId, userId, country);
   if (outcome === 'back') return runSourceMenu(sock, message, chatId, userId);
   return outcome;
 }
 
-async function runFreightMenu(sock: any, message: any, chatId: string, userId: string, country: any) {
+async function runGoodMenu(sock: any, message: any, chatId: string, userId: string, country: any) {
+  const options = await Promise.all(country.goodKeys.map(async (goodKey: string) => {
+    const good = GOODS[goodKey];
+    const stock = await getStockLevel(country.key, goodKey);
+    return {
+      label: `${good.emoji} ${good.label}`,
+      value: goodKey,
+      description: `${formatNumber(good.baseCost)} coins/unit · ${stock.remaining}/${stock.cap} left today`,
+    };
+  }));
+
+  const result = await promptMenu(sock, message, chatId, userId, {
+    title: `${country.emoji} ${country.label} · Product Lines`,
+    text: 'What are you sourcing?',
+    options,
+    cancelLabel: 'Back',
+  });
+
+  if (result.cancelled) return 'back';
+  if (result.timedOut || !result.value) return;
+
+  const good = GOODS[result.value];
+  const outcome = await runFreightMenu(sock, message, chatId, userId, country, good);
+  if (outcome === 'back') return runGoodMenu(sock, message, chatId, userId, country);
+  return outcome;
+}
+
+async function runFreightMenu(sock: any, message: any, chatId: string, userId: string, country: any, good: any) {
   const rank = await getPlayerRank(userId);
 
   const options = FREIGHT_TIERS
@@ -157,6 +184,7 @@ async function runFreightMenu(sock: any, message: any, chatId: string, userId: s
 
   const result = await promptMenu(sock, message, chatId, userId, {
     title: `🚢 ${country.emoji} ${country.label} · Choose Carrier`,
+    subtitle: `Sourcing: ${good.emoji} ${good.label}`,
     text: 'Select a shipping company:',
     options,
     cancelLabel: 'Back',
@@ -165,13 +193,13 @@ async function runFreightMenu(sock: any, message: any, chatId: string, userId: s
   if (result.cancelled) return 'back';
   if (result.timedOut || !result.value) return;
 
-  const outcome = await runQuantityMenu(sock, message, chatId, userId, country, result.value);
-  if (outcome === 'back') return runFreightMenu(sock, message, chatId, userId, country);
+  const outcome = await runQuantityMenu(sock, message, chatId, userId, country, good, result.value);
+  if (outcome === 'back') return runFreightMenu(sock, message, chatId, userId, country, good);
   return outcome;
 }
 
-async function runQuantityMenu(sock: any, message: any, chatId: string, userId: string, country: any, freightKey: string) {
-  const stock = await getStockLevel(country.key);
+async function runQuantityMenu(sock: any, message: any, chatId: string, userId: string, country: any, good: any, freightKey: string) {
+  const stock = await getStockLevel(country.key, good.key);
   const freight = FREIGHT_TIERS.find(f => f.key === freightKey);
 
   const options = QUANTITY_PRESETS
@@ -188,13 +216,13 @@ async function runQuantityMenu(sock: any, message: any, chatId: string, userId: 
 
   if (!options.length) {
     await sock.sendMessage(chatId, {
-      text: `${header()}\n❌ Not enough stock left today for ${country.label}.\n_Try again after tomorrow's reset._`,
+      text: `${header()}\n❌ Not enough stock left today for ${good.label} out of ${country.label}.\n_Try again after tomorrow's reset._`,
     });
     return;
   }
 
   const result = await promptMenu(sock, message, chatId, userId, {
-    title: `📦 ${country.label} · Quantity`,
+    title: `📦 ${good.emoji} ${good.label} · Quantity`,
     subtitle: `Stock left today: ${stock.remaining}/${stock.cap}  ·  1 container = ${country.containerCapacity} units`,
     text: 'How many units?',
     options,
@@ -206,13 +234,15 @@ async function runQuantityMenu(sock: any, message: any, chatId: string, userId: 
 
   const qty = parseInt(result.value, 10);
 
-  const purchase = await sourceShipment(userId, country.key, freightKey, qty);
+  const purchase = await sourceShipment(userId, country.key, good.key, freightKey, qty);
   if (!purchase.success) {
     await sock.sendMessage(chatId, { text: `${header()}\n❌ ${purchase.reason || 'Could not source that shipment.'}` });
     return;
   }
 
   const s = purchase.shipment;
+  const watchLine = buildCargoWatchLine(good);
+
   await sock.sendMessage(chatId, {
     text:
       `📝 ORDER PLACED\n${DIVIDER}\n` +
@@ -222,9 +252,29 @@ async function runQuantityMenu(sock: any, message: any, chatId: string, userId: 
       `${DIVIDER}\n` +
       `Goods: ${formatNumber(s.goodsCost)}  +  Freight: ${formatNumber(s.freightCost)}\n` +
       `${deltaLine(-s.totalCost)}\n` +
-      `ETA: ${s.etaLabel}\n\n` +
-      `_Track it anytime from the main menu → My Shipments_`,
+      `ETA: ${s.etaLabel}\n` +
+      (watchLine ? `${watchLine}\n` : '') +
+      `\n_Track it anytime from the main menu → My Shipments_`,
   });
+}
+
+/**
+ * Operational heads-up for the cargo the player just committed to —
+ * only fires for goods where it actually changes what they should do
+ * (perishable, or restricted somewhere). Everything else (volatility,
+ * demand swings, customs mood) belongs on World News, not here.
+ */
+function buildCargoWatchLine(good: any): string | null {
+  const notes: string[] = [];
+  if (good.expirationHours <= 168) {
+    const days = Math.round(good.expirationHours / 24);
+    notes.push(days <= 1 ? 'sell within a day of clearance or it spoils' : `sell within ~${days} days of clearance or it spoils`);
+  }
+  if (good.legalFlags?.length) {
+    notes.push('restricted in some hubs — check before you sell there');
+  }
+  if (!notes.length) return null;
+  return `⚠️ _${notes.join(' · ')}_`;
 }
 
 // ── Shipments with Event Handling ──────────────────────────────────
@@ -678,8 +728,9 @@ async function sendWalletCard(sock: any, chatId: string, userId: string) {
 
 async function sendMarketConditions(sock: any, chatId: string) {
   const detail = await getEventsDetailBlock();
+  const intel = getGoodsIntelBlock();
   return sock.sendMessage(chatId, {
-    text: `${header('📊 Market Conditions')}\n${detail}`,
+    text: `${header('🌍 WORLD NEWS')}\n${detail}\n\n${DIVIDER}\n\n${intel}`,
   });
 }
 
