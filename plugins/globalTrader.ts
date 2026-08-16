@@ -34,6 +34,8 @@ import {
   getEquipment,
   buyEquipment,
   getGoodsIntelBlock,
+  getMarketPulseBlock,
+  getScarcityMultiplier,
 } from '../lib/globalTraderEconomy.js';
 
 export const command = 'global';
@@ -201,16 +203,18 @@ async function runFreightMenu(sock: any, message: any, chatId: string, userId: s
 async function runQuantityMenu(sock: any, message: any, chatId: string, userId: string, country: any, good: any, freightKey: string) {
   const stock = await getStockLevel(country.key, good.key);
   const freight = FREIGHT_TIERS.find(f => f.key === freightKey);
+  const scarcityMult = getScarcityMultiplier(stock.remaining, stock.cap);
 
   const options = QUANTITY_PRESETS
     .filter(q => q <= stock.remaining)
     .map(q => {
       const containers = Math.ceil(q / country.containerCapacity);
       const freightCost = Math.round(country.baseFreightFee * freight.costMult * containers);
+      const goodsCost = Math.round(good.baseCost * q * scarcityMult);
       return {
         label: `${q} units`,
         value: String(q),
-        description: `${containers} container${containers > 1 ? 's' : ''} · ${formatNumber(freightCost)} freight`,
+        description: `${formatNumber(goodsCost)} goods + ${formatNumber(freightCost)} freight · ${containers} container${containers > 1 ? 's' : ''}`,
       };
     });
 
@@ -221,9 +225,13 @@ async function runQuantityMenu(sock: any, message: any, chatId: string, userId: 
     return;
   }
 
+  const scarcityNote = scarcityMult > 1.08
+    ? `\n🔥 _Today's allocation is running low — prices have climbed ${Math.round((scarcityMult - 1) * 100)}% above opening._`
+    : '';
+
   const result = await promptMenu(sock, message, chatId, userId, {
     title: `📦 ${good.emoji} ${good.label} · Quantity`,
-    subtitle: `Stock left today: ${stock.remaining}/${stock.cap}  ·  1 container = ${country.containerCapacity} units`,
+    subtitle: `Stock left today: ${stock.remaining}/${stock.cap}  ·  1 container = ${country.containerCapacity} units${scarcityNote}`,
     text: 'How many units?',
     options,
     cancelLabel: 'Back',
@@ -515,6 +523,9 @@ async function runSellMenu(sock: any, message: any, chatId: string, userId: stri
   if (sale.qty < shipment.qty) {
     lossNote = `\n_Note: ${shipment.qty - sale.qty} units lost to spoilage/courier – cost included in basis._`;
   }
+  const cappedNote = sale.capped
+    ? `\n⚠️ _Market liquidity was thin — the buyer's pool couldn't cover the full quoted price, so this payout was capped below what the price board showed._`
+    : '';
   await sock.sendMessage(chatId, {
     text:
       `${header()}\n${sale.blackMarket ? '⚠️ Black-market sale — ' : ''}Sold: ${shipment.goodLabel} → ${sale.hubLabel}\n${DIVIDER}\n` +
@@ -524,7 +535,7 @@ async function runSellMenu(sock: any, message: any, chatId: string, userId: stri
       `Cost basis: ${formatNumber(sale.costBasis)}` +
       `${sale.holdingFee ? `\n_warehouse storage: -${formatNumber(sale.holdingFee)}_` : ''}\n` +
       `Profit: ${deltaLine(sale.profit)} (${sale.marginPct > 0 ? '+' : ''}${sale.marginPct}%)` +
-      lossNote,
+      lossNote + cappedNote,
   });
 }
 
@@ -728,9 +739,10 @@ async function sendWalletCard(sock: any, chatId: string, userId: string) {
 
 async function sendMarketConditions(sock: any, chatId: string) {
   const detail = await getEventsDetailBlock();
+  const pulse = await getMarketPulseBlock();
   const intel = getGoodsIntelBlock();
   return sock.sendMessage(chatId, {
-    text: `${header('🌍 WORLD NEWS')}\n${detail}\n\n${DIVIDER}\n\n${intel}`,
+    text: `${header('🌍 WORLD NEWS')}\n${detail}\n\n${DIVIDER}\n\n${pulse}\n\n${DIVIDER}\n\n${intel}`,
   });
 }
 

@@ -13,7 +13,7 @@
 
 import { createStore } from './pluginStore.js';
 import { deductCoins, addCoins, todayStr, formatNumber } from './economy.js';
-import { getJackpotPool, contributeToJackpot, deductFromJackpot, settleWin } from './slotMachine.js';
+import { getJackpotPool, contributeToJackpot, deductFromJackpot, settleWin, JACKPOT_SEED } from './slotMachine.js';
 import {
   getPriceMultiplier,
   getGoodsCostMultiplier,
@@ -32,6 +32,7 @@ const stockTbl = store.table('stock');
 const marketTbl = store.table('market');
 const statsTbl = store.table('stats');
 const equipmentTbl = store.table('equipment'); // userId -> { clearingAgent: tierKey, warehouse: tierKey }
+const marketPulseCacheTbl = store.table('marketPulseCache'); // 'current' -> { text, computedAt }
 
 interface TraderStats { lifetimeNetProfit: number; lifetimeTradingVolume: number; completedShipments: number; }
 const DEFAULT_STATS: TraderStats = { lifetimeNetProfit: 0, lifetimeTradingVolume: 0, completedShipments: 0 };
@@ -70,77 +71,77 @@ export interface GoodDef {
 export const GOODS: Record<string, GoodDef> = {
   // ── Staples & Industrial (existing) ──────────────────────────────
   electronics: {
-    key: 'electronics', label: 'Electronics & Accessories', emoji: '🔌', category: 'Electronics', baseCost: 800,
+    key: 'electronics', label: 'Electronics & Accessories', emoji: '🔌', category: 'Electronics', baseCost: 5,
     priceVolatility: 0.4, demandStability: 0.3, expirationHours: 120,
     customsRiskMod: 1.4, theftRisk: 0.3, legalFlags: [], profitMarginBonus: 0.12,
     inspectionExtraDutyPct: 3, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 90,
   },
   pharmaceuticals: {
-    key: 'pharmaceuticals', label: 'Pharmaceuticals', emoji: '💊', category: 'Regulated', baseCost: 600,
+    key: 'pharmaceuticals', label: 'Pharmaceuticals', emoji: '💊', category: 'Regulated', baseCost: 4,
     priceVolatility: 0.1, demandStability: 0.9, expirationHours: 72,
     customsRiskMod: 0.8, theftRisk: 0.1, legalFlags: ['requiresInspection'], profitMarginBonus: 0.21,
     inspectionExtraDutyPct: 5, inspectionDelayHrs: 6, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 70,
   },
   rubber: {
-    key: 'rubber', label: 'Rubber & Auto Parts', emoji: '🔧', category: 'Industrial', baseCost: 700,
+    key: 'rubber', label: 'Rubber & Auto Parts', emoji: '🔧', category: 'Industrial', baseCost: 5,
     priceVolatility: 0.3, demandStability: 0.6, expirationHours: 240,
     customsRiskMod: 1.0, theftRisk: 0.2, legalFlags: [], profitMarginBonus: 0.06,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 80,
   },
   textiles: {
-    key: 'textiles', label: 'Textiles', emoji: '🧵', category: 'Fashion', baseCost: 1500,
+    key: 'textiles', label: 'Textiles', emoji: '🧵', category: 'Fashion', baseCost: 10,
     priceVolatility: 0.2, demandStability: 0.7, expirationHours: 240,
     customsRiskMod: 1.0, theftRisk: 0.2, legalFlags: [], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 9.3, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 60,
   },
   food: {
-    key: 'food', label: 'Food & Perishables', emoji: '🌽', category: 'Staples', baseCost: 200,
+    key: 'food', label: 'Food & Perishables', emoji: '🌽', category: 'Staples', baseCost: 1,
     priceVolatility: 0.5, demandStability: 0.4, expirationHours: 24,
     customsRiskMod: 1.2, theftRisk: 0.4, legalFlags: [], profitMarginBonus: 0.15,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 100,
   },
   coffee_leather: {
-    key: 'coffee_leather', label: 'Coffee & Leather', emoji: '☕', category: 'Industrial', baseCost: 2000,
+    key: 'coffee_leather', label: 'Coffee & Leather', emoji: '☕', category: 'Industrial', baseCost: 13,
     priceVolatility: 0.3, demandStability: 0.6, expirationHours: 168,
     customsRiskMod: 1.0, theftRisk: 0.3, legalFlags: [], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 12.2, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 55,
   },
   olive_wine: {
-    key: 'olive_wine', label: 'Olive Oil & Wine', emoji: '🍷', category: 'Regulated', baseCost: 1800,
+    key: 'olive_wine', label: 'Olive Oil & Wine', emoji: '🍷', category: 'Regulated', baseCost: 12,
     priceVolatility: 0.7, demandStability: 0.2, expirationHours: 720,
     customsRiskMod: 1.8, theftRisk: 0.5, legalFlags: ['bannedInKano', 'bannedInSokoto'], profitMarginBonus: 0.11,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 0, blackMarketSeizureChance: 0.35, blackMarketPriceBonus: 1.6,
     dailyStockCap: 45,
   },
   dates_textiles: {
-    key: 'dates_textiles', label: 'Dates & Textiles', emoji: '🌴', category: 'Staples', baseCost: 2200,
+    key: 'dates_textiles', label: 'Dates & Textiles', emoji: '🌴', category: 'Staples', baseCost: 15,
     priceVolatility: 0.2, demandStability: 0.8, expirationHours: 240,
     customsRiskMod: 0.9, theftRisk: 0.2, legalFlags: [], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 55,
   },
   perfume_cosmetics: {
-    key: 'perfume_cosmetics', label: 'Perfume & Cosmetics', emoji: '🧴', category: 'Fashion', baseCost: 4500,
+    key: 'perfume_cosmetics', label: 'Perfume & Cosmetics', emoji: '🧴', category: 'Fashion', baseCost: 30,
     priceVolatility: 0.5, demandStability: 0.4, expirationHours: 720,
     customsRiskMod: 1.2, theftRisk: 0.4, legalFlags: [], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 35,
   },
   machinery: {
-    key: 'machinery', label: 'Machinery', emoji: '🏭', category: 'Industrial', baseCost: 6000,
+    key: 'machinery', label: 'Machinery', emoji: '🏭', category: 'Industrial', baseCost: 40,
     priceVolatility: 0.1, demandStability: 0.9, expirationHours: 9999,
     customsRiskMod: 0.6, theftRisk: 0.1, legalFlags: [], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 19.2, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 25,
   },
   rice: {
-    key: 'rice', label: 'Rice', emoji: '🌾', category: 'Staples', baseCost: 300,
+    key: 'rice', label: 'Rice', emoji: '🌾', category: 'Staples', baseCost: 2,
     priceVolatility: 0.1, demandStability: 0.9, expirationHours: 240,
     customsRiskMod: 0.8, theftRisk: 0.1, legalFlags: [], profitMarginBonus: 0.06,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
@@ -149,28 +150,28 @@ export const GOODS: Record<string, GoodDef> = {
 
   // ── Phones ────────────────────────────────────────────────────────
   iphone: {
-    key: 'iphone', label: 'iPhone', emoji: '📱', category: 'Phones', baseCost: 6500,
+    key: 'iphone', label: 'iPhone', emoji: '📱', category: 'Phones', baseCost: 43,
     priceVolatility: 0.35, demandStability: 0.5, expirationHours: 9999,
     customsRiskMod: 1.5, theftRisk: 0.5, legalFlags: [], profitMarginBonus: 0.04,
     inspectionExtraDutyPct: 2, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 18,
   },
   samsung_galaxy: {
-    key: 'samsung_galaxy', label: 'Samsung Galaxy', emoji: '📱', category: 'Phones', baseCost: 4800,
+    key: 'samsung_galaxy', label: 'Samsung Galaxy', emoji: '📱', category: 'Phones', baseCost: 32,
     priceVolatility: 0.3, demandStability: 0.55, expirationHours: 9999,
     customsRiskMod: 1.3, theftRisk: 0.4, legalFlags: [], profitMarginBonus: 0.04,
     inspectionExtraDutyPct: 2, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 22,
   },
   tecno_camon: {
-    key: 'tecno_camon', label: 'Tecno Camon', emoji: '📱', category: 'Phones', baseCost: 1300,
+    key: 'tecno_camon', label: 'Tecno Camon', emoji: '📱', category: 'Phones', baseCost: 9,
     priceVolatility: 0.25, demandStability: 0.8, expirationHours: 9999,
     customsRiskMod: 1.0, theftRisk: 0.2, legalFlags: [], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 140,
   },
   infinix_note: {
-    key: 'infinix_note', label: 'Infinix Note', emoji: '📱', category: 'Phones', baseCost: 1100,
+    key: 'infinix_note', label: 'Infinix Note', emoji: '📱', category: 'Phones', baseCost: 7,
     priceVolatility: 0.25, demandStability: 0.8, expirationHours: 9999,
     customsRiskMod: 1.0, theftRisk: 0.2, legalFlags: [], profitMarginBonus: 0.06,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
@@ -179,21 +180,21 @@ export const GOODS: Record<string, GoodDef> = {
 
   // ── Precious Metals & Jewelry ─────────────────────────────────────
   gold_bars: {
-    key: 'gold_bars', label: 'Gold Bars', emoji: '🪙', category: 'Precious Metals', baseCost: 12000,
+    key: 'gold_bars', label: 'Gold Bars', emoji: '🪙', category: 'Precious Metals', baseCost: 80,
     priceVolatility: 0.15, demandStability: 0.9, expirationHours: 9999,
     customsRiskMod: 2.2, theftRisk: 0.8, legalFlags: ['requiresExtraSecurity'], profitMarginBonus: 0.15,
     inspectionExtraDutyPct: 5, inspectionDelayHrs: 6, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 6,
   },
   diamond_jewelry: {
-    key: 'diamond_jewelry', label: 'Diamond Jewelry', emoji: '💎', category: 'Precious Metals', baseCost: 10500,
+    key: 'diamond_jewelry', label: 'Diamond Jewelry', emoji: '💎', category: 'Precious Metals', baseCost: 70,
     priceVolatility: 0.3, demandStability: 0.6, expirationHours: 9999,
     customsRiskMod: 2.4, theftRisk: 0.85, legalFlags: ['requiresExtraSecurity'], profitMarginBonus: 0.15,
     inspectionExtraDutyPct: 6, inspectionDelayHrs: 8, blackMarketSeizureChance: 0.1, blackMarketPriceBonus: 1.3,
     dailyStockCap: 5,
   },
   silver_jewelry: {
-    key: 'silver_jewelry', label: 'Silver Jewelry', emoji: '💍', category: 'Precious Metals', baseCost: 2600,
+    key: 'silver_jewelry', label: 'Silver Jewelry', emoji: '💍', category: 'Precious Metals', baseCost: 17,
     priceVolatility: 0.25, demandStability: 0.65, expirationHours: 9999,
     customsRiskMod: 1.4, theftRisk: 0.4, legalFlags: [], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
@@ -202,21 +203,21 @@ export const GOODS: Record<string, GoodDef> = {
 
   // ── Fashion & Computers ───────────────────────────────────────────
   designer_shoes: {
-    key: 'designer_shoes', label: 'Designer Shoes', emoji: '👞', category: 'Fashion', baseCost: 3200,
+    key: 'designer_shoes', label: 'Designer Shoes', emoji: '👞', category: 'Fashion', baseCost: 21,
     priceVolatility: 0.35, demandStability: 0.45, expirationHours: 9999,
     customsRiskMod: 1.3, theftRisk: 0.3, legalFlags: [], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 14.1, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 45,
   },
   designer_bags: {
-    key: 'designer_bags', label: 'Designer Bags', emoji: '👜', category: 'Fashion', baseCost: 4200,
+    key: 'designer_bags', label: 'Designer Bags', emoji: '👜', category: 'Fashion', baseCost: 28,
     priceVolatility: 0.35, demandStability: 0.45, expirationHours: 9999,
     customsRiskMod: 1.3, theftRisk: 0.35, legalFlags: [], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 13.9, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 40,
   },
   macbook: {
-    key: 'macbook', label: 'MacBook', emoji: '💻', category: 'Computers', baseCost: 5500,
+    key: 'macbook', label: 'MacBook', emoji: '💻', category: 'Computers', baseCost: 37,
     priceVolatility: 0.2, demandStability: 0.6, expirationHours: 9999,
     customsRiskMod: 1.2, theftRisk: 0.3, legalFlags: [], profitMarginBonus: 0.11,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
@@ -225,49 +226,49 @@ export const GOODS: Record<string, GoodDef> = {
 
   // ── Vehicles ──────────────────────────────────────────────────────
   toyota_corolla: {
-    key: 'toyota_corolla', label: 'Toyota Corolla (New)', emoji: '🚗', category: 'New Vehicles', baseCost: 22000,
+    key: 'toyota_corolla', label: 'Toyota Corolla (New)', emoji: '🚗', category: 'New Vehicles', baseCost: 147,
     priceVolatility: 0.1, demandStability: 0.85, expirationHours: 9999,
     customsRiskMod: 1.1, theftRisk: 0.15, legalFlags: [], profitMarginBonus: 0.04,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 4, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 4,
   },
   toyota_camry: {
-    key: 'toyota_camry', label: 'Toyota Camry (New)', emoji: '🚗', category: 'New Vehicles', baseCost: 27000,
+    key: 'toyota_camry', label: 'Toyota Camry (New)', emoji: '🚗', category: 'New Vehicles', baseCost: 180,
     priceVolatility: 0.1, demandStability: 0.85, expirationHours: 9999,
     customsRiskMod: 1.1, theftRisk: 0.15, legalFlags: [], profitMarginBonus: 0.05,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 4, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 3,
   },
   lexus_rx: {
-    key: 'lexus_rx', label: 'Lexus RX (New)', emoji: '🚙', category: 'New Vehicles', baseCost: 38000,
+    key: 'lexus_rx', label: 'Lexus RX (New)', emoji: '🚙', category: 'New Vehicles', baseCost: 253,
     priceVolatility: 0.15, demandStability: 0.75, expirationHours: 9999,
     customsRiskMod: 1.2, theftRisk: 0.2, legalFlags: [], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 4, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 2,
   },
   ferrari: {
-    key: 'ferrari', label: 'Ferrari', emoji: '🏎️', category: 'Luxury Vehicles', baseCost: 65000,
+    key: 'ferrari', label: 'Ferrari', emoji: '🏎️', category: 'Luxury Vehicles', baseCost: 433,
     priceVolatility: 0.2, demandStability: 0.4, expirationHours: 9999,
     customsRiskMod: 1.6, theftRisk: 0.4, legalFlags: ['requiresExtraSecurity'], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 14.3, inspectionDelayHrs: 8, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 1,
   },
   lamborghini: {
-    key: 'lamborghini', label: 'Lamborghini', emoji: '🏎️', category: 'Luxury Vehicles', baseCost: 70000,
+    key: 'lamborghini', label: 'Lamborghini', emoji: '🏎️', category: 'Luxury Vehicles', baseCost: 467,
     priceVolatility: 0.2, demandStability: 0.35, expirationHours: 9999,
     customsRiskMod: 1.6, theftRisk: 0.4, legalFlags: ['requiresExtraSecurity'], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 16.2, inspectionDelayHrs: 8, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 1,
   },
   tokunbo_corolla: {
-    key: 'tokunbo_corolla', label: 'Corolla (Tokunbo)', emoji: '🚘', category: 'Tokunbo Vehicles', baseCost: 8500,
+    key: 'tokunbo_corolla', label: 'Corolla (Tokunbo)', emoji: '🚘', category: 'Tokunbo Vehicles', baseCost: 57,
     priceVolatility: 0.15, demandStability: 0.8, expirationHours: 9999,
     customsRiskMod: 0.9, theftRisk: 0.2, legalFlags: [], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 20.7, inspectionDelayHrs: 2, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 9,
   },
   tokunbo_camry: {
-    key: 'tokunbo_camry', label: 'Camry (Tokunbo)', emoji: '🚘', category: 'Tokunbo Vehicles', baseCost: 11000,
+    key: 'tokunbo_camry', label: 'Camry (Tokunbo)', emoji: '🚘', category: 'Tokunbo Vehicles', baseCost: 73,
     priceVolatility: 0.15, demandStability: 0.8, expirationHours: 9999,
     customsRiskMod: 0.9, theftRisk: 0.2, legalFlags: [], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 21.7, inspectionDelayHrs: 2, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
@@ -276,14 +277,14 @@ export const GOODS: Record<string, GoodDef> = {
 
   // ── Mobility ──────────────────────────────────────────────────────
   motorcycle_bajaj: {
-    key: 'motorcycle_bajaj', label: 'Bajaj Motorcycle', emoji: '🏍️', category: 'Mobility', baseCost: 1900,
+    key: 'motorcycle_bajaj', label: 'Bajaj Motorcycle', emoji: '🏍️', category: 'Mobility', baseCost: 13,
     priceVolatility: 0.2, demandStability: 0.7, expirationHours: 9999,
     customsRiskMod: 0.8, theftRisk: 0.25, legalFlags: [], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 17.2, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
     dailyStockCap: 70,
   },
   keke_napep: {
-    key: 'keke_napep', label: 'Keke Napep', emoji: '🛺', category: 'Mobility', baseCost: 2600,
+    key: 'keke_napep', label: 'Keke Napep', emoji: '🛺', category: 'Mobility', baseCost: 17,
     priceVolatility: 0.2, demandStability: 0.65, expirationHours: 9999,
     customsRiskMod: 0.8, theftRisk: 0.2, legalFlags: [], profitMarginBonus: 0.03,
     inspectionExtraDutyPct: 18, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
@@ -295,14 +296,14 @@ export const GOODS: Record<string, GoodDef> = {
   // inconsistent enforcement in Nigeria — reflected as extra customs
   // risk and a black-market path rather than an outright ban.
   okirika_grade_a: {
-    key: 'okirika_grade_a', label: 'Okirika Bales (Grade A)', emoji: '👕', category: 'Used Clothing', baseCost: 900,
+    key: 'okirika_grade_a', label: 'Okirika Bales (Grade A)', emoji: '👕', category: 'Used Clothing', baseCost: 6,
     priceVolatility: 0.3, demandStability: 0.6, expirationHours: 720,
     customsRiskMod: 1.5, theftRisk: 0.15, legalFlags: ['requiresInspection'], profitMarginBonus: 0.15,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 0, blackMarketSeizureChance: 0.15, blackMarketPriceBonus: 1.2,
     dailyStockCap: 90,
   },
   okirika_grade_b: {
-    key: 'okirika_grade_b', label: 'Okirika Bales (Grade B)', emoji: '👕', category: 'Used Clothing', baseCost: 550,
+    key: 'okirika_grade_b', label: 'Okirika Bales (Grade B)', emoji: '👕', category: 'Used Clothing', baseCost: 4,
     priceVolatility: 0.3, demandStability: 0.55, expirationHours: 720,
     customsRiskMod: 1.5, theftRisk: 0.15, legalFlags: ['requiresInspection'], profitMarginBonus: 0.23,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 0, blackMarketSeizureChance: 0.15, blackMarketPriceBonus: 1.2,
@@ -328,20 +329,20 @@ export interface CountryDef {
 }
 
 export const COUNTRIES: CountryDef[] = [
-  { key: 'benin',    label: 'Cotonou',      emoji: '🇧🇯', goodKeys: ['rice', 'tokunbo_corolla', 'tokunbo_camry'],            baseFreightFee: 800,  containerCapacity: 50, distanceHrs: 6,  risk: 'high',    dutyRatePercent: 10, licenseRenewCost: 1500 },
-  { key: 'india',    label: 'India',        emoji: '🇮🇳', goodKeys: ['pharmaceuticals', 'motorcycle_bajaj', 'silver_jewelry'], baseFreightFee: 3000, containerCapacity: 45, distanceHrs: 30, risk: 'medium',  dutyRatePercent: 12, licenseRenewCost: 2500 },
-  { key: 'thailand', label: 'Thailand',     emoji: '🇹🇭', goodKeys: ['rubber'],                                              baseFreightFee: 3000, containerCapacity: 45, distanceHrs: 30, risk: 'medium',  dutyRatePercent: 12, licenseRenewCost: 2500 },
-  { key: 'turkey',   label: 'Turkey',       emoji: '🇹🇷', goodKeys: ['textiles', 'designer_shoes', 'designer_bags'],         baseFreightFee: 2500, containerCapacity: 35, distanceHrs: 24, risk: 'low',     dutyRatePercent: 12, licenseRenewCost: 4500 },
-  { key: 'china',    label: 'China',        emoji: '🇨🇳', goodKeys: ['electronics', 'tecno_camon', 'infinix_note', 'keke_napep'], baseFreightFee: 4000, containerCapacity: 50, distanceHrs: 48, risk: 'medium', dutyRatePercent: 14, licenseRenewCost: 5000 },
-  { key: 'brazil',   label: 'Brazil',       emoji: '🇧🇷', goodKeys: ['coffee_leather'],                                      baseFreightFee: 4500, containerCapacity: 35, distanceHrs: 48, risk: 'medium',  dutyRatePercent: 14, licenseRenewCost: 5500 },
-  { key: 'spain',    label: 'Spain',        emoji: '🇪🇸', goodKeys: ['olive_wine'],                                          baseFreightFee: 2500, containerCapacity: 30, distanceHrs: 24, risk: 'low',     dutyRatePercent: 14, licenseRenewCost: 7000 },
-  { key: 'saudi',    label: 'Saudi Arabia', emoji: '🇸🇦', goodKeys: ['dates_textiles'],                                      baseFreightFee: 2200, containerCapacity: 30, distanceHrs: 18, risk: 'low',     dutyRatePercent: 14, licenseRenewCost: 7500 },
-  { key: 'france',   label: 'France',       emoji: '🇫🇷', goodKeys: ['perfume_cosmetics'],                                   baseFreightFee: 5000, containerCapacity: 20, distanceHrs: 40, risk: 'low',     dutyRatePercent: 18, licenseRenewCost: 14000 },
-  { key: 'uae',      label: 'UAE',          emoji: '🇦🇪', goodKeys: ['gold_bars', 'diamond_jewelry', 'iphone', 'samsung_galaxy', 'ferrari', 'lamborghini'], baseFreightFee: 1500, containerCapacity: 15, distanceHrs: 12, risk: 'low', dutyRatePercent: 18, licenseRenewCost: 16000 },
-  { key: 'germany',  label: 'Germany',      emoji: '🇩🇪', goodKeys: ['machinery'],                                           baseFreightFee: 6000, containerCapacity: 15, distanceHrs: 48, risk: 'veryLow', dutyRatePercent: 20, licenseRenewCost: 20000 },
-  { key: 'usa',      label: 'USA',          emoji: '🇺🇸', goodKeys: ['macbook'],                                             baseFreightFee: 6000, containerCapacity: 15, distanceHrs: 48, risk: 'low',     dutyRatePercent: 20, licenseRenewCost: 20000 },
-  { key: 'japan',    label: 'Japan',        emoji: '🇯🇵', goodKeys: ['toyota_corolla', 'toyota_camry', 'lexus_rx'],          baseFreightFee: 5500, containerCapacity: 2,  distanceHrs: 32, risk: 'low',     dutyRatePercent: 25, licenseRenewCost: 20000 },
-  { key: 'uk',       label: 'UK',           emoji: '🇬🇧', goodKeys: ['okirika_grade_a', 'okirika_grade_b'],                  baseFreightFee: 3500, containerCapacity: 40, distanceHrs: 20, risk: 'low',     dutyRatePercent: 15, licenseRenewCost: 6000 },
+  { key: 'benin',    label: 'Cotonou',      emoji: '🇧🇯', goodKeys: ['rice', 'tokunbo_corolla', 'tokunbo_camry'],            baseFreightFee: 5,  containerCapacity: 50, distanceHrs: 6,  risk: 'high',    dutyRatePercent: 10, licenseRenewCost: 10 },
+  { key: 'india',    label: 'India',        emoji: '🇮🇳', goodKeys: ['pharmaceuticals', 'motorcycle_bajaj', 'silver_jewelry'], baseFreightFee: 20, containerCapacity: 45, distanceHrs: 30, risk: 'medium',  dutyRatePercent: 12, licenseRenewCost: 17 },
+  { key: 'thailand', label: 'Thailand',     emoji: '🇹🇭', goodKeys: ['rubber'],                                              baseFreightFee: 20, containerCapacity: 45, distanceHrs: 30, risk: 'medium',  dutyRatePercent: 12, licenseRenewCost: 17 },
+  { key: 'turkey',   label: 'Turkey',       emoji: '🇹🇷', goodKeys: ['textiles', 'designer_shoes', 'designer_bags'],         baseFreightFee: 17, containerCapacity: 35, distanceHrs: 24, risk: 'low',     dutyRatePercent: 12, licenseRenewCost: 30 },
+  { key: 'china',    label: 'China',        emoji: '🇨🇳', goodKeys: ['electronics', 'tecno_camon', 'infinix_note', 'keke_napep'], baseFreightFee: 27, containerCapacity: 50, distanceHrs: 48, risk: 'medium', dutyRatePercent: 14, licenseRenewCost: 33 },
+  { key: 'brazil',   label: 'Brazil',       emoji: '🇧🇷', goodKeys: ['coffee_leather'],                                      baseFreightFee: 30, containerCapacity: 35, distanceHrs: 48, risk: 'medium',  dutyRatePercent: 14, licenseRenewCost: 37 },
+  { key: 'spain',    label: 'Spain',        emoji: '🇪🇸', goodKeys: ['olive_wine'],                                          baseFreightFee: 17, containerCapacity: 30, distanceHrs: 24, risk: 'low',     dutyRatePercent: 14, licenseRenewCost: 47 },
+  { key: 'saudi',    label: 'Saudi Arabia', emoji: '🇸🇦', goodKeys: ['dates_textiles'],                                      baseFreightFee: 15, containerCapacity: 30, distanceHrs: 18, risk: 'low',     dutyRatePercent: 14, licenseRenewCost: 50 },
+  { key: 'france',   label: 'France',       emoji: '🇫🇷', goodKeys: ['perfume_cosmetics'],                                   baseFreightFee: 33, containerCapacity: 20, distanceHrs: 40, risk: 'low',     dutyRatePercent: 18, licenseRenewCost: 93 },
+  { key: 'uae',      label: 'UAE',          emoji: '🇦🇪', goodKeys: ['gold_bars', 'diamond_jewelry', 'iphone', 'samsung_galaxy', 'ferrari', 'lamborghini'], baseFreightFee: 10, containerCapacity: 15, distanceHrs: 12, risk: 'low', dutyRatePercent: 18, licenseRenewCost: 107 },
+  { key: 'germany',  label: 'Germany',      emoji: '🇩🇪', goodKeys: ['machinery'],                                           baseFreightFee: 40, containerCapacity: 15, distanceHrs: 48, risk: 'veryLow', dutyRatePercent: 20, licenseRenewCost: 133 },
+  { key: 'usa',      label: 'USA',          emoji: '🇺🇸', goodKeys: ['macbook'],                                             baseFreightFee: 40, containerCapacity: 15, distanceHrs: 48, risk: 'low',     dutyRatePercent: 20, licenseRenewCost: 133 },
+  { key: 'japan',    label: 'Japan',        emoji: '🇯🇵', goodKeys: ['toyota_corolla', 'toyota_camry', 'lexus_rx'],          baseFreightFee: 37, containerCapacity: 2,  distanceHrs: 32, risk: 'low',     dutyRatePercent: 25, licenseRenewCost: 133 },
+  { key: 'uk',       label: 'UK',           emoji: '🇬🇧', goodKeys: ['okirika_grade_a', 'okirika_grade_b'],                  baseFreightFee: 23, containerCapacity: 40, distanceHrs: 20, risk: 'low',     dutyRatePercent: 15, licenseRenewCost: 40 },
 ];
 
 const RISK_BRIBE_SUCCESS: Record<RiskTier, number> = {
@@ -397,9 +398,9 @@ const RANK_DEFS: RankDef[] = [
     key: 'mini_importer', 
     label: 'Mini Importer', 
     emoji: '📦',
-    netProfitThreshold: 30000,
-    volumeThreshold: 100000,
-    minNetProfitForVolume: 10000,
+    netProfitThreshold: 200,
+    volumeThreshold: 667,
+    minNetProfitForVolume: 67,
     addsCountries: ['turkey', 'china', 'brazil'], 
     addsFreight: ['cma'] 
   },
@@ -407,9 +408,9 @@ const RANK_DEFS: RankDef[] = [
     key: 'sme', 
     label: 'SME', 
     emoji: '🛍️',
-    netProfitThreshold: 100000,
-    volumeThreshold: 500000,
-    minNetProfitForVolume: 50000,
+    netProfitThreshold: 667,
+    volumeThreshold: 3333,
+    minNetProfitForVolume: 333,
     addsCountries: ['spain', 'saudi', 'uk'], 
     addsFreight: ['maersk'] 
   },
@@ -417,9 +418,9 @@ const RANK_DEFS: RankDef[] = [
     key: 'importer', 
     label: 'Importer', 
     emoji: '📦',
-    netProfitThreshold: 300000,
-    volumeThreshold: 1500000,
-    minNetProfitForVolume: 150000,
+    netProfitThreshold: 2000,
+    volumeThreshold: 10000,
+    minNetProfitForVolume: 1000,
     addsCountries: ['france', 'uae'], 
     addsFreight: ['one'] 
   },
@@ -427,9 +428,9 @@ const RANK_DEFS: RankDef[] = [
     key: 'pro_trader', 
     label: 'Pro Trader', 
     emoji: '🚚',
-    netProfitThreshold: 700000,
-    volumeThreshold: 3000000,
-    minNetProfitForVolume: 350000,
+    netProfitThreshold: 4667,
+    volumeThreshold: 20000,
+    minNetProfitForVolume: 2333,
     addsCountries: ['germany', 'japan'], 
     addsFreight: ['cosco'] 
   },
@@ -437,7 +438,7 @@ const RANK_DEFS: RankDef[] = [
     key: 'global_trader', 
     label: 'Global Trader', 
     emoji: '🌍',
-    netProfitThreshold: 1500000,
+    netProfitThreshold: 10000,
     // No volume shortcut for final rank — forces actual profitability
     addsCountries: ['usa'], 
     addsFreight: [] 
@@ -451,7 +452,7 @@ export const LICENSE_TIERS = {
     key: 'dropshipper',
     label: 'Dropshipper License',
     emoji: '📦',
-    cost: 1500,
+    cost: 10,
     countries: ['benin', 'india', 'thailand'],
     durationMs: 7 * 24 * 60 * 60 * 1000,
   },
@@ -459,7 +460,7 @@ export const LICENSE_TIERS = {
     key: 'mini_importer',
     label: 'Mini Importer License',
     emoji: '📦',
-    cost: 4500,
+    cost: 30,
     countries: ['turkey', 'china', 'brazil'],
     durationMs: 7 * 24 * 60 * 60 * 1000,
   },
@@ -467,7 +468,7 @@ export const LICENSE_TIERS = {
     key: 'sme',
     label: 'SME License',
     emoji: '🛍️',
-    cost: 7000,
+    cost: 47,
     countries: ['spain', 'saudi', 'uk'],
     durationMs: 7 * 24 * 60 * 60 * 1000,
   },
@@ -475,7 +476,7 @@ export const LICENSE_TIERS = {
     key: 'importer',
     label: 'Importer License',
     emoji: '📦',
-    cost: 14000,
+    cost: 93,
     countries: ['france', 'uae'],
     durationMs: 7 * 24 * 60 * 60 * 1000,
   },
@@ -483,7 +484,7 @@ export const LICENSE_TIERS = {
     key: 'pro_trader',
     label: 'Pro Trader License',
     emoji: '🚚',
-    cost: 20000,
+    cost: 133,
     countries: ['germany', 'japan'],
     durationMs: 7 * 24 * 60 * 60 * 1000,
   },
@@ -491,7 +492,7 @@ export const LICENSE_TIERS = {
     key: 'global_trader',
     label: 'Global Trader License',
     emoji: '🌍',
-    cost: 30000,
+    cost: 200,
     countries: ['usa'],
     durationMs: 7 * 24 * 60 * 60 * 1000,
   },
@@ -523,6 +524,27 @@ const BRIBE_COST_PERCENT = 30;
  */
 const TRADING_COMMISSION_PCT = 2.0; // 2% marketplace fee (subtle, not prominently labeled)
 
+// A single Global Trader sale (a full day's stock of a bulk good) can request
+// a far bigger payout than a typical slot/coinflip/dice win. This caps any
+// one sale to a share of the jackpot's *current* surplus above its protected
+// floor, so one big trade can't unilaterally claim the whole pool that other
+// games are drawing from — it degrades gracefully instead. This applies on
+// top of, not instead of, settleWin()'s own floor protection.
+const MAX_SINGLE_SALE_POOL_SHARE = 0.20; // one Trader sale can claim at most 20% of current surplus
+
+// Buy-side scarcity pricing (see sourceShipment): barely moves early in the
+// day's stock, climbs fast once most of it is gone. At SCARCITY_STRENGTH=0.5,
+// buying the very last unit of a fully depleted day's stock costs up to 1.5x
+// base — enough to feel real without being punitive for normal-sized orders.
+const SCARCITY_STRENGTH = 0.5;
+const SCARCITY_POWER = 1.6;
+
+/** Exported so the UI can preview the live scarcity premium before a player commits to a quantity. */
+export function getScarcityMultiplier(remaining: number, cap: number): number {
+  const depletedFraction = 1 - (remaining / cap);
+  return 1 + SCARCITY_STRENGTH * Math.pow(Math.max(0, depletedFraction), SCARCITY_POWER);
+}
+
 // ── Hubs ──────────────────────────────────────────────────────────────
 
 export interface HubDef {
@@ -550,7 +572,7 @@ export const HUBS: HubDef[] = [
     categoryAffinity: { Phones: 1.05, Electronics: 1.05, Fashion: 1.05, 'New Vehicles': 1.02, Computers: 1.05 },
   },
   {
-    key: 'abuja', label: 'Abuja', courierRequired: true, courierName: 'ABC Transport', courierFeePerUnit: 200,
+    key: 'abuja', label: 'Abuja', courierRequired: true, courierName: 'ABC Transport', courierFeePerUnit: 1,
     priceMultiplier: 1.10, bannedGoods: [],
     categoryAffinity: {
       Phones: 1.08, 'Precious Metals': 1.15, 'Luxury Vehicles': 1.18, 'New Vehicles': 1.1, Fashion: 1.08, Computers: 1.08,
@@ -558,27 +580,27 @@ export const HUBS: HubDef[] = [
     },
   },
   {
-    key: 'onitsha', label: 'Onitsha', courierRequired: true, courierName: 'GIG Logistics', courierFeePerUnit: 150,
+    key: 'onitsha', label: 'Onitsha', courierRequired: true, courierName: 'GIG Logistics', courierFeePerUnit: 1,
     priceMultiplier: 1.15, bannedGoods: [],
     categoryAffinity: { Phones: 1.1, Electronics: 1.13, Industrial: 1.05, 'Precious Metals': 0.88, 'Luxury Vehicles': 0.85 },
   },
   {
-    key: 'aba', label: 'Aba', courierRequired: true, courierName: 'GIG Logistics', courierFeePerUnit: 150,
+    key: 'aba', label: 'Aba', courierRequired: true, courierName: 'GIG Logistics', courierFeePerUnit: 1,
     priceMultiplier: 1.12, bannedGoods: [],
     categoryAffinity: { Fashion: 1.15, 'Used Clothing': 1.1, 'Precious Metals': 0.93, 'Luxury Vehicles': 0.85 },
   },
   {
-    key: 'kano', label: 'Kano', courierRequired: true, courierName: 'ABC Transport', courierFeePerUnit: 180,
+    key: 'kano', label: 'Kano', courierRequired: true, courierName: 'ABC Transport', courierFeePerUnit: 1,
     priceMultiplier: 1.18, bannedGoods: ['olive_wine'],
     categoryAffinity: { Mobility: 1.15, Fashion: 1.08, 'Tokunbo Vehicles': 1.05, 'Precious Metals': 0.9, 'Luxury Vehicles': 0.85 },
   },
   {
-    key: 'sokoto', label: 'Sokoto', courierRequired: true, courierName: 'ABC Transport', courierFeePerUnit: 180,
+    key: 'sokoto', label: 'Sokoto', courierRequired: true, courierName: 'ABC Transport', courierFeePerUnit: 1,
     priceMultiplier: 1.18, bannedGoods: ['olive_wine'],
     categoryAffinity: { Mobility: 1.13, Staples: 1.05, Fashion: 1.02, 'Precious Metals': 0.9, 'Luxury Vehicles': 0.83 },
   },
   {
-    key: 'ph', label: 'Port Harcourt', courierRequired: true, courierName: 'Young Shall Grow Motors', courierFeePerUnit: 180,
+    key: 'ph', label: 'Port Harcourt', courierRequired: true, courierName: 'Young Shall Grow Motors', courierFeePerUnit: 1,
     priceMultiplier: 1.20, bannedGoods: [],
     categoryAffinity: { Industrial: 1.15, 'New Vehicles': 1.08, 'Tokunbo Vehicles': 1.05, Electronics: 1.02, 'Used Clothing': 0.93 },
   },
@@ -597,9 +619,9 @@ export interface AgentDef {
 
 export const CLEARING_AGENT_DEFS: AgentDef[] = [
   { tier: 'localFixer',     displayName: 'Local Fixer',     cost: 0,     bribeSuccessBonus: 0,    fineMultReduction: 0 },
-  { tier: 'licensedBroker', displayName: 'Licensed Broker', cost: 3000,  bribeSuccessBonus: 0.08, fineMultReduction: 0.10 },
-  { tier: 'customsBroker',  displayName: 'Customs Broker',  cost: 12000, bribeSuccessBonus: 0.15, fineMultReduction: 0.20 },
-  { tier: 'customsInsider', displayName: 'Customs Insider', cost: 40000, bribeSuccessBonus: 0.25, fineMultReduction: 0.35 },
+  { tier: 'licensedBroker', displayName: 'Licensed Broker', cost: 20,  bribeSuccessBonus: 0.08, fineMultReduction: 0.10 },
+  { tier: 'customsBroker',  displayName: 'Customs Broker',  cost: 80, bribeSuccessBonus: 0.15, fineMultReduction: 0.20 },
+  { tier: 'customsInsider', displayName: 'Customs Insider', cost: 267, bribeSuccessBonus: 0.25, fineMultReduction: 0.35 },
 ];
 
 export interface WarehouseDef {
@@ -613,10 +635,10 @@ export interface WarehouseDef {
 }
 
 export const WAREHOUSE_DEFS: WarehouseDef[] = [
-  { tier: 'dockside', displayName: 'Dockside Storage',  cost: 0,     capacity: 1, freeHoldingDays: 1, holdingFeePerUnitPerDay: 20, preservationFactor: 1.0 },
-  { tier: 'rented',   displayName: 'Rented Warehouse',  cost: 5000,  capacity: 3, freeHoldingDays: 2, holdingFeePerUnitPerDay: 15, preservationFactor: 0.85 },
-  { tier: 'private',  displayName: 'Private Warehouse', cost: 20000, capacity: 5, freeHoldingDays: 3, holdingFeePerUnitPerDay: 10, preservationFactor: 0.60 },
-  { tier: 'bonded',   displayName: 'Bonded Warehouse',  cost: 60000, capacity: 8, freeHoldingDays: 5, holdingFeePerUnitPerDay: 5,  preservationFactor: 0.35 },
+  { tier: 'dockside', displayName: 'Dockside Storage',  cost: 0,     capacity: 1, freeHoldingDays: 1, holdingFeePerUnitPerDay: 1, preservationFactor: 1.0 },
+  { tier: 'rented',   displayName: 'Rented Warehouse',  cost: 33,  capacity: 3, freeHoldingDays: 2, holdingFeePerUnitPerDay: 1, preservationFactor: 0.85 },
+  { tier: 'private',  displayName: 'Private Warehouse', cost: 133, capacity: 5, freeHoldingDays: 3, holdingFeePerUnitPerDay: 1, preservationFactor: 0.60 },
+  { tier: 'bonded',   displayName: 'Bonded Warehouse',  cost: 400, capacity: 8, freeHoldingDays: 5, holdingFeePerUnitPerDay: 1,  preservationFactor: 0.35 },
 ];
 
 interface TraderEquipment { clearingAgent: string; warehouse: string; }
@@ -1101,13 +1123,21 @@ export async function sourceShipment(userId: string, countryKey: string, goodKey
   const goodsCostMult = await getGoodsCostMultiplier();
   const freightCostMult = await getFreightCostMultiplier();
 
+  // Real scarcity, not just a hard stock cutoff: the more of today's
+  // allocation other players have already bought, the pricier what's left
+  // gets — mirrors real commodity behavior and gives "buy early" a genuine
+  // reason beyond just risking a sellout. Barely moves for the first ~60%
+  // of stock, then climbs fast for the last stretch (up to 1.5x at zero
+  // remaining). This is a live, honest signal World News reports on.
+  const scarcityMultiplier = getScarcityMultiplier(remaining, good.dailyStockCap);
+
   // Freight pays for container capacity, not a flat toll — order more than
   // one container's worth of units and you need (and pay for) another one.
   // Without this, a 5-unit order and a 200-unit order cost the same freight,
   // which isn't how shipping actually works.
   const containersNeeded = Math.ceil(qty / country.containerCapacity);
 
-  const goodsCost = Math.round(good.baseCost * qty * goodsCostMult);
+  const goodsCost = Math.round(good.baseCost * qty * goodsCostMult * scarcityMultiplier);
   const freightCost = Math.round(country.baseFreightFee * freight.costMult * freightCostMult * containersNeeded);
   const totalCost = goodsCost + freightCost;
 
@@ -1407,6 +1437,98 @@ export function getGoodsIntelBlock(): string {
   return `📊 *ANALYST WATCHLIST*\n${lines.join('\n')}`;
 }
 
+// ── Market Pulse: real player-driven signals for World News ────────────
+//
+// Unlike the scripted Nigeria events (globalTraderEvents.ts, macro/world
+// flavor) or the Analyst Watchlist above (ambient, static per-good stats),
+// this scans what players have actually done TODAY — real stock depletion
+// from buying, real sell volume from dumping — and reports it as news.
+// This is what makes "what you dump gets cheaper, what's scarce gets
+// pricier" visible and legible instead of a silent number change nobody
+// notices. Both mechanics (scarcity pricing in sourceShipment, depletion
+// pricing in getMarketPrice) already move real prices; this just tells
+// players about it in time to act.
+const PULSE_SCARCITY_THRESHOLD = 0.5; // report a good once 50%+ of today's stock anywhere is gone
+const PULSE_DUMP_THRESHOLD = 0.35;    // report a hub once sell volume hits 35%+ of that good's daily cap
+const MARKET_PULSE_CACHE_TTL_MS = 3 * 60 * 1000; // real signal, but doesn't need to be instant — real news isn't either
+
+export async function getMarketPulseBlock(): Promise<string> {
+  // This scan is ~250 store reads (every country×good pair, every good×hub
+  // pair). Fine occasionally, wasteful if World News gets checked a lot —
+  // cache the computed block for a few minutes rather than rescan on every
+  // single tap. Falls back to a live recompute if the cache read fails for
+  // any reason, so a cache outage never breaks the screen.
+  try {
+    const cached = await marketPulseCacheTbl.get('current');
+    if (cached && typeof cached === 'object' && Date.now() - (cached as any).computedAt < MARKET_PULSE_CACHE_TTL_MS) {
+      return (cached as any).text;
+    }
+  } catch {
+    // cache unavailable — fall through to a live computation below
+  }
+
+  const text = await computeMarketPulseBlock();
+
+  try {
+    await marketPulseCacheTbl.set('current', { text, computedAt: Date.now() });
+  } catch {
+    // caching failed — not fatal, the block itself is still valid to return
+  }
+
+  return text;
+}
+
+async function computeMarketPulseBlock(): Promise<string> {
+  const scarcityStories: { text: string; severity: number }[] = [];
+  const dumpStories: { text: string; severity: number }[] = [];
+
+  // Buy-side: how much of today's allocation is actually gone, per country×good?
+  for (const country of COUNTRIES) {
+    for (const goodKey of country.goodKeys) {
+      const good = GOODS[goodKey];
+      const { remaining, cap } = await getStockLevel(country.key, goodKey);
+      if (cap <= 0) continue;
+      const depleted = 1 - remaining / cap;
+      if (depleted >= PULSE_SCARCITY_THRESHOLD) {
+        const pctLeft = Math.round((remaining / cap) * 100);
+        scarcityStories.push({
+          severity: depleted,
+          text: remaining === 0
+            ? `🔴 ${good.emoji} ${good.label} out of ${country.label} is SOLD OUT for today — nothing left in today's allocation.`
+            : `📈 ${good.emoji} ${good.label} out of ${country.label} is running low — just ${pctLeft}% of today's stock left, and prices are climbing.`,
+        });
+      }
+    }
+  }
+
+  // Sell-side: has anyone actually flooded a hub with a good today?
+  for (const goodKey of Object.keys(GOODS)) {
+    const good = GOODS[goodKey];
+    for (const hub of HUBS) {
+      if (hub.bannedGoods?.includes(goodKey)) continue;
+      const sold = await getUnitsSoldToday(goodKey, hub.key);
+      if (sold <= 0 || good.dailyStockCap <= 0) continue;
+      const ratio = sold / good.dailyStockCap;
+      if (ratio >= PULSE_DUMP_THRESHOLD) {
+        dumpStories.push({
+          severity: ratio,
+          text: `📉 ${good.emoji} ${good.label} is flooding ${hub.label} — ${sold} units sold there today, and prices have softened.`,
+        });
+      }
+    }
+  }
+
+  scarcityStories.sort((a, b) => b.severity - a.severity);
+  dumpStories.sort((a, b) => b.severity - a.severity);
+  const picks = [...scarcityStories.slice(0, 2), ...dumpStories.slice(0, 2)];
+
+  if (!picks.length) {
+    return '_Markets are quiet so far today — no major supply moves reported yet. Be the first to move it._';
+  }
+
+  return `🔥 *MARKET PULSE* _(live, from real trading activity today)_\n${picks.map(p => `• ${p.text}`).join('\n')}`;
+}
+
 /**
  * How hard a hub's market has been hit by selling today, as a multiplier
  * on price (1 = full price, floor = fully dumped).
@@ -1554,7 +1676,20 @@ export async function sellGoods(userId: string, shipmentId: string, hubKey: stri
   const tradingCommission = Math.round(gross * (TRADING_COMMISSION_PCT / 100));
   const netProceeds = gross - tradingCommission;
 
-  const { payout, capped } = settleWin(netProceeds, await getJackpotPool());
+  // Global Trader can generate single-sale payouts larger than a typical
+  // slot/coinflip/dice win (a full day's stock of a bulk good sold at once). settleWin()'s floor protects the bank from
+  // going negative, but says nothing about one Trader sale claiming the
+  // *entire* surplus that slots/coinflip/dice players are also drawing from
+  // in the same pool. This caps any single Trader sale to a share of the
+  // current surplus, so one big trade degrades gracefully instead of either
+  // draining the shared pool in one shot or blindsiding the player with a
+  // silent full cap. Tune MAX_SINGLE_SALE_POOL_SHARE to taste.
+  const poolBeforeSale = await getJackpotPool();
+  const surplusBeforeSale = Math.max(0, poolBeforeSale - JACKPOT_SEED);
+  const shareLimitedWin = Math.min(netProceeds, Math.round(surplusBeforeSale * MAX_SINGLE_SALE_POOL_SHARE));
+
+  const { payout, capped: hardCapped } = settleWin(shareLimitedWin, poolBeforeSale);
+  const capped = hardCapped || shareLimitedWin < netProceeds;
   await addCoins(userId, payout, { type: 'admin_credit', note: `sold ${deliveredQty}x ${good.label} @ ${hub.label}` });
   await deductFromJackpot(payout);
   await contributeToJackpot(tradingCommission); // House edge to jackpot

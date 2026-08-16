@@ -1,6 +1,9 @@
 import type { BotContext } from '../types.js';
 import axios from 'axios';
 
+const API_KEY = 'xbps-install-Syu';
+const API_BASE_URL = 'https://api.qasimdev.dpdns.org/api/twitter/download';
+
 export default {
   command: 'twitter',
   aliases: ['xtweet', 'tweetdl', 'twitterdl'],
@@ -17,14 +20,14 @@ export default {
     }
 
     try {
-      const apiUrl = `https://discardapi.dpdns.org/api/dl/twitter?apikey=guru&url=${encodeURIComponent(url)}`;
+      const apiUrl = `${API_BASE_URL}?url=${encodeURIComponent(url)}&apiKey=${API_KEY}`;
       const { data } = await axios.get(apiUrl, { timeout: 10000 });
 
-      if (!data?.status || !data.result?.media?.length) {
+      if (!data?.success || !data.data?.media?.length) {
         return await sock.sendMessage(chatId, { text: '❌ No media found for this Tweet.' }, { quoted: message });
       }
 
-      const tweet = data.result;
+      const tweet = data.data;
       const caption = `
 📝 @${tweet.authorUsername} (${tweet.authorName})
 📅 ${tweet.date}

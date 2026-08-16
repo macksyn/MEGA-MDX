@@ -45,7 +45,7 @@ const jackpotTbl     = store.table('jackpot'); // 'pool' -> number, 'houseMood' 
 const playerStatsTbl = store.table('playerStats'); // tracks individual player spins
 const houseStatsTbl  = store.table('houseStats'); // tracks daily bets/wins for profit calculation
 
-const JACKPOT_SEED = 500; // protected floor — the bank can never be paid down below this, by anything
+export const JACKPOT_SEED = 500; // protected floor — the bank can never be paid down below this, by anything
 
 // ── RTP policy ───────────────────────────────────────────────────────────────
 // Every game resolver enforces these regardless of how many boosts (beginner
@@ -63,8 +63,8 @@ const JACKPOT_SEED = 500; // protected floor — the bank can never be paid down
 //                             critical solvency state, so a thin bankroll
 //                             recovers faster instead of getting boost-stacked
 //                             further down.
-export const TARGET_RTP            = 0.935;
-export const HARD_CEILING_RTP      = 0.97;
+export const TARGET_RTP            = 0.915;
+export const HARD_CEILING_RTP      = 0.93;
 export const EMERGENCY_CEILING_RTP = 0.90;
 
 export async function getJackpotPool(): Promise<number> {
