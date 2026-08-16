@@ -28,7 +28,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
   // Fetch rolling exchange count for the last 7 days
   const rollingCount = await getRollingExchangeCount(targetId, 7);
-  const levelInfo = getLevelInfo(wallet.exchangeCount, rollingCount);
+  const levelInfo = getLevelInfo(wallet.exchangeCount, rollingCount, wallet.level2SinceTs);
 
   const isSelf = targetId === cleanJid(senderId);
   const label = isSelf ? 'YOUR BALANCE' : `@${phoneNumber}'S BALANCE`;
@@ -40,7 +40,9 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     levelStatus += ` ⚠️ _(demoted – need ${levelInfo.exchangesNeededToMaintain} more exchanges in 7 days to restore)_`;
   } else if (levelInfo.levelNumber >= 2) {
     // Show maintenance status for level 2+
-    if (rollingCount < levelInfo.rollingRequired) {
+    if (levelInfo.inGracePeriod && rollingCount < levelInfo.rollingRequired) {
+      levelStatus += ` 🕒 _(new! ${levelInfo.graceDaysLeft} day(s) left in grace period before the 7-day maintenance rule applies)_`;
+    } else if (rollingCount < levelInfo.rollingRequired) {
       levelStatus += ` ⚠️ _(${levelInfo.exchangesNeededToMaintain} exchanges needed in 7 days to maintain)_`;
     } else {
       levelStatus += ` ✅ _(maintained)_`;
