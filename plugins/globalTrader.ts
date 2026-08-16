@@ -126,6 +126,16 @@ async function runSourceMenu(sock: any, message: any, chatId: string, userId: st
   const rank = await getPlayerRank(userId);
   const unlocked = COUNTRIES.filter(c => rank.unlockedCountries.includes(c.key));
 
+  if (!unlocked.length) {
+    await sock.sendMessage(chatId, {
+      text: `${header()}\n❌ No countries unlocked yet.\n\n` +
+        `Rank: ${rank.emoji} ${rank.label}\n` +
+        `Lifetime net profit: ${formatNumber(rank.lifetimeNetProfit)}\n\n` +
+        `_This shouldn't happen at Dropshipper rank (0 profit unlocks Benin/India/Thailand automatically) — if you're seeing this, something's wrong with rank tracking rather than your progress. Worth reporting._`,
+    });
+    return 'back';
+  }
+
   const options = unlocked.map(c => ({
     label: `${c.emoji} ${c.label}`,
     value: c.key,
