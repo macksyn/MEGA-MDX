@@ -41,6 +41,14 @@ interface AttendanceSettings {
   autoDetection:          boolean;
   preferredDateFormat:    string;
   enabledChats:           Record<string, boolean>;
+  // When true (default), the coin bonus is restricted to members at/above
+  // minBonusLevel (per lib/economy.js getLevelInfo, passed to
+  // awardAttendanceBonus's minLevel param). Attendance itself — the form
+  // check, streak, and record — is tracked for everyone regardless; this
+  // only gates the payout. Set false to pay everyone who submits a valid
+  // form, matching pre-level-gate behavior.
+  gateBonusByLevel:       boolean;
+  minBonusLevel:          number;
 }
 
 interface UserData {
@@ -87,7 +95,9 @@ const defaultSettings: AttendanceSettings = {
   adminNumbers:          [],
   autoDetection:         true,
   preferredDateFormat:   'DD/MM',
-  enabledChats:          {}
+  enabledChats:          {},
+  gateBonusByLevel:      true,
+  minBonusLevel:         2
 };
 
 // ── User cache ────────────────────────────────────────────────────────────────
@@ -500,14 +510,17 @@ async function handleAutoAttendance(message: any, sock: any): Promise<boolean> {
       const bonusResult = await awardAttendanceBonus(
         cleanJid(senderId),
         totalReward,
-        currentStreak
+        currentStreak,
+        attendanceSettings.gateBonusByLevel ? attendanceSettings.minBonusLevel : 1
       );
       void syncIdentity(cleanJid(senderId), sock, validation.extractedData.name || message.pushName);
       if (bonusResult.success) {
         reward = bonusResult.reward;
-        // Level 1 members: attendance is still recorded (see awardAttendanceBonus),
-        // but no bonus line is shown — nothing to inform them about here.
-        if (!bonusResult.levelGated) {
+        if (bonusResult.levelGated) {
+          // Below-threshold members: attendance/streak was still recorded
+          // by awardAttendanceBonus, just no coins this time.
+          bonusMessage = `\n🔒 _No coin bonus this time — attendance bonuses are reserved for Level ${attendanceSettings.minBonusLevel}+ members. Keep exchanging to level up! Your streak still counts._`;
+        } else {
           bonusMessage = `\n💰 Coins earned: ${reward.toLocaleString()}` +
             (streakBonus > 0 ? ` (incl. ${streakBonus.toLocaleString()} streak bonus, x${attendanceSettings.streakBonusMultiplier})` : '') +
             (imageBonus > 0 ? ` (incl. ${imageBonus.toLocaleString()} image bonus)` : '');
@@ -621,10 +634,11 @@ async function handleSettingsCmd(
       `✖️ Streak Multiplier: x${attendanceSettings.streakBonusMultiplier}\n` +
       `📶 Streak Threshold: ${attendanceSettings.streakBonusThreshold} day(s)\n` +
       `📅 Date Format: ${attendanceSettings.preferredDateFormat}\n` +
+      `🏅 Level-Gated Bonus: ${attendanceSettings.gateBonusByLevel ? `Yes ✅ (Level ${attendanceSettings.minBonusLevel}+ only)` : 'No ❌ (everyone gets paid)'}\n` +
       `🔧 *Change Settings:*\n` +
       `• *reward [amount]*\n• *requireimage on/off*\n• *imagebonus [amount]*\n` +
       `• *streakbonus on/off*\n• *streakmultiplier [number]*\n• *streakthreshold [days]*\n` +
-      `• *dateformat MM/DD|DD/MM*`;
+      `• *dateformat MM/DD|DD/MM*\n• *levelgate on/off*\n• *minlevel [number]*`;
     await sock.sendMessage(chatId, { text: settingsMessage }, { quoted: message });
     return;
   }
@@ -709,6 +723,31 @@ async function handleSettingsCmd(
       attendanceSettings.preferredDateFormat = value;
       await saveSettings();
       await sock.sendMessage(chatId, { text: `✅ Date format set to ${value}` }, { quoted: message });
+      break;
+    }
+    case 'levelgate': {
+      if (!['on', 'off'].includes(value.toLowerCase())) {
+        await sock.sendMessage(chatId, { text: '⚠️ Please specify: *on* or *off*' }, { quoted: message });
+        return;
+      }
+      attendanceSettings.gateBonusByLevel = value.toLowerCase() === 'on';
+      await saveSettings();
+      await sock.sendMessage(chatId, {
+        text: attendanceSettings.gateBonusByLevel
+          ? `✅ Level gating enabled — only Level ${attendanceSettings.minBonusLevel}+ members will receive the coin bonus. Everyone still gets attendance/streak credit.`
+          : `✅ Level gating disabled — all members receive the coin bonus regardless of level.`
+      }, { quoted: message });
+      break;
+    }
+    case 'minlevel': {
+      const lvl = parseInt(value);
+      if (isNaN(lvl) || lvl < 1) {
+        await sock.sendMessage(chatId, { text: '⚠️ Please specify a valid level number (at least 1).' }, { quoted: message });
+        return;
+      }
+      attendanceSettings.minBonusLevel = lvl;
+      await saveSettings();
+      await sock.sendMessage(chatId, { text: `✅ Minimum level for the attendance coin bonus set to Level ${lvl}` }, { quoted: message });
       break;
     }
     default:
