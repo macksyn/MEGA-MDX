@@ -141,7 +141,7 @@ export const GOODS: Record<string, GoodDef> = {
     dailyStockCap: 25,
   },
   rice: {
-    key: 'rice', label: 'Rice', emoji: '🌾', category: 'Staples', baseCost: 2,
+    key: 'rice', label: 'Rice', emoji: '🌾', category: 'Staples', baseCost: 5,
     priceVolatility: 0.1, demandStability: 0.9, expirationHours: 240,
     customsRiskMod: 0.8, theftRisk: 0.1, legalFlags: [], profitMarginBonus: 0.06,
     inspectionExtraDutyPct: 0, inspectionDelayHrs: 0, blackMarketSeizureChance: 0, blackMarketPriceBonus: 1,
