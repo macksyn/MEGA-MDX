@@ -727,11 +727,17 @@ export async function getPlayerRank(userId: string) {
   const netProfit = stats.lifetimeNetProfit;
   const volume = stats.lifetimeTradingVolume;
 
+  // The starting rank's perks are a permanent floor, not a threshold a
+  // player can fall below. A single seized shipment or failed bribe is a
+  // normal outcome of this game's risk mechanics and can legitimately push
+  // lifetime net profit negative — losing money should never revoke access
+  // to the tier everyone starts at, or a player's first bad trade would
+  // permanently lock them out of every country with no way to recover.
   let current = RANK_DEFS[0];
-  let unlockedCountries: string[] = [];
-  let unlockedFreight: string[] = [];
+  let unlockedCountries: string[] = [...RANK_DEFS[0].addsCountries];
+  let unlockedFreight: string[] = [...RANK_DEFS[0].addsFreight];
 
-  for (const rank of RANK_DEFS) {
+  for (const rank of RANK_DEFS.slice(1)) {
     // Check direct path: net profit >= threshold
     const directPath = netProfit >= rank.netProfitThreshold;
     
