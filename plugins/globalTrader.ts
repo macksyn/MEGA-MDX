@@ -36,6 +36,10 @@ import {
   getGoodsIntelBlock,
   getMarketPulseBlock,
   getScarcityMultiplier,
+  coinsToGroqCoins,
+  getPriceTrend,
+  formatTrendBadge,
+  getPriceTrendReport,
 } from '../lib/globalTraderEconomy.js';
 
 export const command = 'global';
@@ -56,9 +60,10 @@ function progressBar(value: number, max: number, size = 10): string {
   return '▰'.repeat(filled) + '▱'.repeat(size - filled);
 }
 
-function deltaLine(amount: number): string {
-  if (amount > 0) return `▲ *+${formatNumber(amount)}* coins`;
-  if (amount < 0) return `▼ *-${formatNumber(Math.abs(amount))}* coins`;
+function deltaLine(amount: number, currency: 'coins' | 'groqCoins' = 'coins'): string {
+  const label = currency === 'groqCoins' ? 'Groq Coins' : 'coins';
+  if (amount > 0) return `▲ *+${formatNumber(amount)}* ${label}`;
+  if (amount < 0) return `▼ *-${formatNumber(Math.abs(amount))}* ${label}`;
   return `• No change`;
 }
 
@@ -83,7 +88,7 @@ async function runMainMenu(sock: any, message: any, chatId: string, userId: stri
 
   const result = await promptMenu(sock, message, chatId, userId, {
     title: '🌍 GLOBAL TRADER',
-    subtitle: `${rank.emoji} Rank: ${rank.label}  ·  💰 ${formatNumber(wallet.groqCoins)} coins${events ? `\n${events}` : ''}`,
+    subtitle: `${rank.emoji} Rank: ${rank.label}  ·  💰 ${formatNumber(wallet.coins)} coins${events ? `\n${events}` : ''}`,
     text: 'What would you like to do?',
     options: [
       { label: 'Source Goods', value: 'source', description: 'Buy from a supplier country' },
@@ -92,6 +97,7 @@ async function runMainMenu(sock: any, message: any, chatId: string, userId: stri
       { label: 'License & Rank', value: 'license', description: 'Check expiry, renew, view rank' },
       { label: 'Upgrades', value: 'upgrades', description: 'Clearing Agent & Warehouse tiers' },
       { label: 'Wallet', value: 'wallet' },
+      { label: '📈 Price Check', value: 'pricecheck', description: 'Check any good\'s trend before you buy or sell' },
       { label: '🌍 World News', value: 'conditions', description: events ? '⚡ Breaking — check what\'s moving the market' : 'Today\'s dispatches from the ports' },
     ],
     cancelLabel: 'Exit',
@@ -107,6 +113,7 @@ async function runMainMenu(sock: any, message: any, chatId: string, userId: stri
     case 'license':    outcome = await runLicenseMenu(sock, message, chatId, userId); break;
     case 'upgrades':   outcome = await runUpgradesMenu(sock, message, chatId, userId); break;
     case 'wallet':     await sendWalletCard(sock, chatId, userId); outcome = 'back'; break;
+    case 'pricecheck': outcome = await runPriceCheckMenu(sock, message, chatId, userId); break;
     case 'conditions': await sendMarketConditions(sock, chatId); outcome = 'back'; break;
   }
 
@@ -150,10 +157,11 @@ async function runGoodMenu(sock: any, message: any, chatId: string, userId: stri
   const options = await Promise.all(country.goodKeys.map(async (goodKey: string) => {
     const good = GOODS[goodKey];
     const stock = await getStockLevel(country.key, goodKey);
+    const groqPerUnit = await coinsToGroqCoins(good.baseCost);
     return {
       label: `${good.emoji} ${good.label}`,
       value: goodKey,
-      description: `${formatNumber(good.baseCost)} coins/unit · ${stock.remaining}/${stock.cap} left today`,
+      description: `~${formatNumber(groqPerUnit)} Groq Coins/unit · ${stock.remaining}/${stock.cap} left today`,
     };
   }));
 
@@ -205,18 +213,19 @@ async function runQuantityMenu(sock: any, message: any, chatId: string, userId: 
   const freight = FREIGHT_TIERS.find(f => f.key === freightKey);
   const scarcityMult = getScarcityMultiplier(stock.remaining, stock.cap);
 
-  const options = QUANTITY_PRESETS
+  const options = await Promise.all(QUANTITY_PRESETS
     .filter(q => q <= stock.remaining)
-    .map(q => {
+    .map(async q => {
       const containers = Math.ceil(q / country.containerCapacity);
       const freightCost = Math.round(country.baseFreightFee * freight.costMult * containers);
       const goodsCost = Math.round(good.baseCost * q * scarcityMult);
+      const groqCost = await coinsToGroqCoins(goodsCost + freightCost);
       return {
         label: `${q} units`,
         value: String(q),
-        description: `${formatNumber(goodsCost)} goods + ${formatNumber(freightCost)} freight · ${containers} container${containers > 1 ? 's' : ''}`,
+        description: `${formatNumber(groqCost)} Groq Coins · ${containers} container${containers > 1 ? 's' : ''}`,
       };
-    });
+    }));
 
   if (!options.length) {
     await sock.sendMessage(chatId, {
@@ -258,8 +267,7 @@ async function runQuantityMenu(sock: any, message: any, chatId: string, userId: 
       `#${s.id} — ${s.goodLabel} (${country.label})\n` +
       `Qty: ${qty}  ·  Carrier: ${freight.label}  ·  ${s.containersUsed} container${s.containersUsed > 1 ? 's' : ''}\n` +
       `${DIVIDER}\n` +
-      `Goods: ${formatNumber(s.goodsCost)}  +  Freight: ${formatNumber(s.freightCost)}\n` +
-      `${deltaLine(-s.totalCost)}\n` +
+      `${deltaLine(-s.groqCoinsCost, 'groqCoins')}\n` +
       `ETA: ${s.etaLabel}\n` +
       (watchLine ? `${watchLine}\n` : '') +
       `\n_Track it anytime from the main menu → My Shipments_`,
@@ -429,21 +437,21 @@ async function runClearMenu(sock: any, message: any, chatId: string, userId: str
         `✅ CLEARED\n${DIVIDER}\n` +
         `${header()}\n#${shipment.id} — ${shipment.goodLabel}\n${DIVIDER}\n` +
         `${shipment.qty}x released.\n` +
-        `${deltaLine(-clearResult.dutyPaid)}${clearResult.bribePaid ? `\n${deltaLine(-clearResult.bribePaid)} (bribe)` : ''}`,
+        `${deltaLine(-clearResult.dutyPaidGroq, 'groqCoins')}${clearResult.bribePaidGroq ? `\n${deltaLine(-clearResult.bribePaidGroq, 'groqCoins')} (bribe)` : ''}`,
       edit: sent.key,
     });
     return;
   }
 
   const renewalMsg = clearResult.renewalSucceeded
-    ? `✅ License renewed (forced)\n${deltaLine(-clearResult.forcedRenewalCost)}`
+    ? `✅ License renewed (forced)\n${deltaLine(-clearResult.forcedRenewalCost, 'groqCoins')}`
     : `⚠️ License renewal failed — you must renew manually.`;
   await sock.sendMessage(chatId, {
     text:
       `🚨 SEIZED\n${DIVIDER}\n` +
       `${header()}\n#${shipment.id} — ${shipment.goodLabel}\n${DIVIDER}\n` +
       `❌ License expired — goods confiscated.\n` +
-      `${deltaLine(-clearResult.fine)} (fine)\n` +
+      `${deltaLine(-clearResult.fineGroq, 'groqCoins')} (fine)\n` +
       `${renewalMsg}\n` +
       `⏳ Release in ${clearResult.holdHours}h after processing.`,
     edit: sent.key,
@@ -488,6 +496,8 @@ async function runSellMenu(sock: any, message: any, chatId: string, userId: stri
     HUBS.map(async hub => {
       const isRestricted = !!(hub.bannedGoods && hub.bannedGoods.includes(good.key));
       const price = await getMarketPrice(good.key, hub.key);
+      const trend = await getPriceTrend(good.key, hub.key);
+      const badge = formatTrendBadge(trend);
       if (isRestricted) {
         const bonusPrice = Math.round(price * good.blackMarketPriceBonus);
         const bonusGross = Math.round(bonusPrice * shipment.qty * (shipment.quality || 1));
@@ -499,7 +509,7 @@ async function runSellMenu(sock: any, message: any, chatId: string, userId: stri
         };
       }
       const gross = Math.round(price * shipment.qty * (shipment.quality || 1));
-      const desc = `${hub.courierRequired ? `🚚 ${hub.courierName} fee incl.` : '🛳 port'} · ${formatNumber(price)}/unit → ${formatNumber(gross)} gross`;
+      const desc = `${hub.courierRequired ? `🚚 ${hub.courierName} fee incl.` : '🛳 port'} · ${formatNumber(price)}/unit → ${formatNumber(gross)} gross · ${badge}`;
       return { label: hub.label, value: hub.key, description: desc };
     })
   );
@@ -545,20 +555,22 @@ async function runLicenseMenu(sock: any, message: any, chatId: string, userId: s
   const rank = await getPlayerRank(userId);
   const licenses = await getLicenseStatus(userId);
 
-  const lines = licenses.map(l => {
+  const lines = await Promise.all(licenses.map(async l => {
     const status = l.hasLicense
       ? l.isValid
         ? `✅ valid`
         : `❌ expired`
       : `⭕ no license`;
     const eligibility = l.isEligible ? '' : ' 🔒 (not yet unlocked)';
-    return `${l.tierLabel}\n  Countries: ${l.countries}\n  Cost: ${formatNumber(l.cost)} · ${status}${eligibility}`;
-  }).join('\n' + DIVIDER + '\n');
+    const groqCost = await coinsToGroqCoins(l.cost);
+    return `${l.tierLabel}\n  Countries: ${l.countries}\n  Cost: ${formatNumber(groqCost)} Groq Coins · ${status}${eligibility}`;
+  }));
+  const lineText = lines.join('\n' + DIVIDER + '\n');
 
   const result = await promptMenu(sock, message, chatId, userId, {
     title: '🪪 GLOBAL TRADER · License',
     subtitle: `${rank.emoji} Rank: ${rank.label}`,
-    text: `${lines}\n\nWhat next?`,
+    text: `${lineText}\n\nWhat next?`,
     options: [
       { label: 'Buy / Renew license', value: 'buy', description: 'Purchase or extend a license for your rank tier' },
       { label: 'View rank progress', value: 'rank' },
@@ -597,14 +609,15 @@ async function runLicenseMenu(sock: any, message: any, chatId: string, userId: s
     const pick = await promptMenu(sock, message, chatId, userId, {
       title: '🪪 Buy / Renew license',
       text: 'Choose a license tier to buy or renew:',
-      options: eligibleTiers.map(l => {
+      options: await Promise.all(eligibleTiers.map(async l => {
         const status = l.hasLicense ? (l.isValid ? '✅ valid' : '⚠️ expired – renew') : '⭕ buy new';
+        const groqCost = await coinsToGroqCoins(l.cost);
         return {
           label: l.tierLabel,
           value: l.tierKey,
-          description: `${status} · ${formatNumber(l.cost)} coins · ${l.countries}`,
+          description: `${status} · ${formatNumber(groqCost)} Groq Coins · ${l.countries}`,
         };
-      }),
+      })),
       cancelLabel: 'Back',
     });
 
@@ -620,7 +633,7 @@ async function runLicenseMenu(sock: any, message: any, chatId: string, userId: s
 
     await sock.sendMessage(chatId, {
       text: action.success
-        ? `${header()}\n✅ ${tier.tierLabel} ${tier.hasLicense ? 'renewed' : 'bought'}! Expires in 7 days.\n${deltaLine(-action.cost!)}`
+        ? `${header()}\n✅ ${tier.tierLabel} ${tier.hasLicense ? 'renewed' : 'bought'}! Expires in 7 days.\n${deltaLine(-action.cost!, 'groqCoins')}`
         : `${header()}\n❌ ${action.reason}`,
     });
     return runLicenseMenu(sock, message, chatId, userId);
@@ -657,12 +670,15 @@ async function runUpgradesMenu(sock: any, message: any, chatId: string, userId: 
 }
 
 async function runAgentShop(sock: any, message: any, chatId: string, userId: string, equip: any) {
-  const options = CLEARING_AGENT_DEFS.map(a => ({
-    label: a.displayName,
-    value: a.tier,
-    description: a.cost === 0
-      ? `FREE · +${Math.round(a.bribeSuccessBonus * 100)}% bribe odds`
-      : `${formatNumber(a.cost)} coins · +${Math.round(a.bribeSuccessBonus * 100)}% bribe odds · fine -${Math.round(a.fineMultReduction * 100)}%`,
+  const options = await Promise.all(CLEARING_AGENT_DEFS.map(async a => {
+    const groqCost = await coinsToGroqCoins(a.cost);
+    return {
+      label: a.displayName,
+      value: a.tier,
+      description: a.cost === 0
+        ? `FREE · +${Math.round(a.bribeSuccessBonus * 100)}% bribe odds`
+        : `${formatNumber(groqCost)} Groq Coins · +${Math.round(a.bribeSuccessBonus * 100)}% bribe odds · fine -${Math.round(a.fineMultReduction * 100)}%`,
+    };
   }));
 
   const result = await promptMenu(sock, message, chatId, userId, {
@@ -688,17 +704,20 @@ async function runAgentShop(sock: any, message: any, chatId: string, userId: str
   }
 
   await sock.sendMessage(chatId, {
-    text: `${header()}\n✅ Equipped *${purchase.def.displayName}*!\n${deltaLine(-purchase.def.cost)}`,
+    text: `${header()}\n✅ Equipped *${purchase.def.displayName}*!\n${deltaLine(-purchase.groqCost, 'groqCoins')}`,
   });
 }
 
 async function runWarehouseShop(sock: any, message: any, chatId: string, userId: string, equip: any) {
-  const options = WAREHOUSE_DEFS.map(w => ({
-    label: w.displayName,
-    value: w.tier,
-    description: w.cost === 0
-      ? `FREE · ${w.capacity} concurrent · ${w.freeHoldingDays}d free storage`
-      : `${formatNumber(w.cost)} coins · ${w.capacity} concurrent · ${w.freeHoldingDays}d free storage`,
+  const options = await Promise.all(WAREHOUSE_DEFS.map(async w => {
+    const groqCost = await coinsToGroqCoins(w.cost);
+    return {
+      label: w.displayName,
+      value: w.tier,
+      description: w.cost === 0
+        ? `FREE · ${w.capacity} concurrent · ${w.freeHoldingDays}d free storage`
+        : `${formatNumber(groqCost)} Groq Coins · ${w.capacity} concurrent · ${w.freeHoldingDays}d free storage`,
+    };
   }));
 
   const result = await promptMenu(sock, message, chatId, userId, {
@@ -724,7 +743,7 @@ async function runWarehouseShop(sock: any, message: any, chatId: string, userId:
   }
 
   await sock.sendMessage(chatId, {
-    text: `${header()}\n✅ Equipped *${purchase.def.displayName}*!\n${deltaLine(-purchase.def.cost)}`,
+    text: `${header()}\n✅ Equipped *${purchase.def.displayName}*!\n${deltaLine(-purchase.groqCost, 'groqCoins')}`,
   });
 }
 
@@ -735,6 +754,42 @@ async function sendWalletCard(sock: any, chatId: string, userId: string) {
   return sock.sendMessage(chatId, {
     text: `${header()}\n💰 Coins: *${formatNumber(wallet.coins)}*\n💎 Groq Coins: *${formatNumber(wallet.groqCoins)}*`,
   });
+}
+
+async function runPriceCheckMenu(sock: any, message: any, chatId: string, userId: string) {
+  const categories = [...new Set(Object.values(GOODS).map((g: any) => g.category))].sort();
+
+  const result = await promptMenu(sock, message, chatId, userId, {
+    title: '📈 Price Check',
+    text: 'Check a category:',
+    options: categories.map(cat => ({ label: cat, value: cat })),
+    cancelLabel: 'Back',
+  });
+
+  if (result.cancelled) return 'back';
+  if (result.timedOut || !result.value) return;
+
+  const outcome = await runPriceCheckGoodMenu(sock, message, chatId, userId, result.value);
+  if (outcome === 'back') return runPriceCheckMenu(sock, message, chatId, userId);
+  return outcome;
+}
+
+async function runPriceCheckGoodMenu(sock: any, message: any, chatId: string, userId: string, category: string) {
+  const goodsInCategory = Object.values(GOODS).filter((g: any) => g.category === category) as any[];
+
+  const result = await promptMenu(sock, message, chatId, userId, {
+    title: `📈 Price Check · ${category}`,
+    text: 'Which good?',
+    options: goodsInCategory.map(g => ({ label: `${g.emoji} ${g.label}`, value: g.key })),
+    cancelLabel: 'Back',
+  });
+
+  if (result.cancelled) return 'back';
+  if (result.timedOut || !result.value) return;
+
+  const report = await getPriceTrendReport(result.value);
+  await sock.sendMessage(chatId, { text: `${header()}\n${report}` });
+  return runPriceCheckGoodMenu(sock, message, chatId, userId, category);
 }
 
 async function sendMarketConditions(sock: any, chatId: string) {
