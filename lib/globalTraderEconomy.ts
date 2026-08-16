@@ -12,7 +12,7 @@
  */
 
 import { createStore } from './pluginStore.js';
-import { deductCoins, addCoins, todayStr, formatNumber } from './economy.js';
+import { deductCoins, addCoins, deductGroqCoins, addGroqCoins, getSettings, todayStr, formatNumber } from './economy.js';
 import { getJackpotPool, contributeToJackpot, deductFromJackpot, settleWin, JACKPOT_SEED } from './slotMachine.js';
 import {
   getPriceMultiplier,
@@ -33,6 +33,35 @@ const marketTbl = store.table('market');
 const statsTbl = store.table('stats');
 const equipmentTbl = store.table('equipment'); // userId -> { clearingAgent: tierKey, warehouse: tierKey }
 const marketPulseCacheTbl = store.table('marketPulseCache'); // 'current' -> { text, computedAt }
+const priceHistoryTbl = store.table('priceHistory'); // `${goodKey}:${hubKey}` -> Array<{date, price}>, oldest-first
+
+// ── Currency: source in Groq Coins, sell in Coins ───────────────────────
+//
+// Mirrors real Nigerian import economics — you source in hard currency and
+// sell to local markets in local currency. Every expense (goods, freight,
+// duty, licenses, courier, warehousing, bribes/fines) is priced and paid in
+// Groq Coins — this bot's withdrawable currency. Every sale payout stays in
+// Coins, unchanged.
+//
+// All the pricing/RTP math elsewhere in this file is Coins-denominated —
+// that's what was audited and tuned. Rather than re-derive all of it in a
+// second currency, costs are still computed in Coins-equivalent internally,
+// then converted to Groq Coins only at the point the player actually pays.
+// The jackpot then receives the Coins-equivalent of what was ACTUALLY paid
+// (post-rounding), not the pre-rounding theoretical cost — so nothing about
+// the shared pool's funding balance shifts from the currency switch; GT
+// still gets from this exactly what it pays out, just re-denominated.
+export async function coinsToGroqCoins(coinsValue: number): Promise<number> {
+  const settings = await getSettings();
+  const rate = settings.coinsPerGroqCoin || 1; // confirmed: 1 Coin = 1 Groq Coin
+  return Math.max(1, Math.ceil(coinsValue / rate)); // round UP — rounding never shortchanges the house
+}
+
+async function groqCoinsToCoinsEquivalent(groqCoinsValue: number): Promise<number> {
+  const settings = await getSettings();
+  const rate = settings.coinsPerGroqCoin || 1; // confirmed: 1 Coin = 1 Groq Coin
+  return groqCoinsValue * rate; // exact coins-value of what was actually paid — no drift from the rounding above
+}
 
 interface TraderStats { lifetimeNetProfit: number; lifetimeTradingVolume: number; completedShipments: number; }
 const DEFAULT_STATS: TraderStats = { lifetimeNetProfit: 0, lifetimeTradingVolume: 0, completedShipments: 0 };
@@ -663,14 +692,15 @@ export async function buyEquipment(userId: string, type: 'clearingAgent' | 'ware
   const currentTier = type === 'clearingAgent' ? current.tiers.clearingAgent : current.tiers.warehouse;
   if (currentTier === tier) return { success: false, reason: 'Already equipped.' };
 
-  const paid = await deductCoins(userId, def.cost, { type: 'admin_debit', note: `bought ${type}: ${tier}` });
-  if (!paid.success) return { success: false, reason: 'Not enough coins.' };
-  await contributeToJackpot(def.cost);
+  const groqCost = await coinsToGroqCoins(def.cost);
+  const paid = await deductGroqCoins(userId, groqCost, { type: 'admin_debit', note: `bought ${type}: ${tier}` });
+  if (!paid.success) return { success: false, reason: 'Not enough Groq Coins.' };
+  await contributeToJackpot(await groqCoinsToCoinsEquivalent(groqCost));
 
   const stored = (await equipmentTbl.get(userId)) || { ...DEFAULT_EQUIPMENT };
   stored[type] = tier;
   await equipmentTbl.set(userId, stored);
-  return { success: true, def };
+  return { success: true, def, groqCost };
 }
 
 // ── Stock ─────────────────────────────────────────────────────────────
@@ -814,12 +844,13 @@ export async function buyLicense(
   }
 
   const cost = tier.cost;
-  const result = await deductCoins(userId, cost, { type: 'admin_debit', note: `buy license: ${tierKey}` });
+  const groqCost = await coinsToGroqCoins(cost);
+  const result = await deductGroqCoins(userId, groqCost, { type: 'admin_debit', note: `buy license: ${tierKey}` });
   if (!result.success) return { success: false, reason: 'insufficient_funds' };
 
-  await contributeToJackpot(cost);
+  await contributeToJackpot(await groqCoinsToCoinsEquivalent(groqCost));
   await setLicenseRecord(userId, tierKey, Date.now() + tier.durationMs);
-  return { success: true, cost };
+  return { success: true, cost: groqCost };
 }
 
 export async function renewLicense(
@@ -831,12 +862,13 @@ export async function renewLicense(
   if (!tier) return { success: false, reason: 'Invalid license tier.' };
 
   const cost = forced ? Math.round(tier.cost * FORCED_RENEWAL_MULT) : tier.cost;
-  const result = await deductCoins(userId, cost, { type: 'admin_debit', note: `${forced ? 'forced ' : ''}renew license: ${tierKey}` });
+  const groqCost = await coinsToGroqCoins(cost);
+  const result = await deductGroqCoins(userId, groqCost, { type: 'admin_debit', note: `${forced ? 'forced ' : ''}renew license: ${tierKey}` });
   if (!result.success) return { success: false, reason: 'insufficient_funds' };
 
-  await contributeToJackpot(cost);
+  await contributeToJackpot(await groqCoinsToCoinsEquivalent(groqCost));
   await setLicenseRecord(userId, tierKey, Date.now() + tier.durationMs);
-  return { success: true, cost };
+  return { success: true, cost: groqCost };
 }
 
 // ── Shipment with Events ─────────────────────────────────────────────
@@ -854,7 +886,8 @@ export interface Shipment {
   originalQty?: number; // CRITICAL: original qty at clearance. Spoilage is calculated from this, not from the reduced qty. Prevents repeated spoilage calculations on retry attempts.
   goodsCost: number;
   freightCost: number;
-  totalCost: number;
+  totalCost: number; // Coins-equivalent — internal RTP/duty math basis
+  groqCoinsCost: number; // what was ACTUALLY charged to the player, in Groq Coins
   createdAt: number;
   travelTimeMs: number;
   status: 'in_transit' | 'cleared_unsold' | 'seized' | 'sold';
@@ -890,7 +923,7 @@ export const EVENT_CONFIG: Record<EventType, EventDef> = {
   delay: {
     type: 'delay',
     costFraction: 0.08,
-    minCost: 800,
+    minCost: 35,
     buildDescription: (cost) => `⚠️ Your cargo ship is delayed. Pay ${formatNumber(cost)} to reroute?`,
     // BUG FIX: this used to multiply travelTimeMs directly, which retroactively
     // changed what "50% done" meant for time that had already elapsed, making
@@ -910,7 +943,7 @@ export const EVENT_CONFIG: Record<EventType, EventDef> = {
   pirates: {
     type: 'pirates',
     costFraction: 0.12,
-    minCost: 1200,
+    minCost: 50,
     buildDescription: (cost) => `⚠️ Pirates detected. Hire escort for ${formatNumber(cost)}?`,
     successEffect: () => {},
     failEffect: (s) => { s.quality *= 0.6; },
@@ -918,7 +951,7 @@ export const EVENT_CONFIG: Record<EventType, EventDef> = {
   temperature: {
     type: 'temperature',
     costFraction: 0.06,
-    minCost: 600,
+    minCost: 25,
     buildDescription: (cost) => `⚠️ Cargo temperature rising. Buy cooling for ${formatNumber(cost)}?`,
     successEffect: () => {},
     failEffect: (s) => { s.quality *= 0.75; },
@@ -998,13 +1031,14 @@ export async function resolveEvent(
   const cost = getEventCost(shipment, eventType);
   let outcome: string;
   if (choice === 'pay') {
-    const deducted = await deductCoins(userId, cost, { type: 'admin_debit', note: `event payment: ${eventType}` });
+    const groqCost = await coinsToGroqCoins(cost);
+    const deducted = await deductGroqCoins(userId, groqCost, { type: 'admin_debit', note: `event payment: ${eventType}` });
     if (!deducted.success) {
-      return { success: false, reason: 'Not enough coins to pay.' };
+      return { success: false, reason: 'Not enough Groq Coins to pay.' };
     }
-    await contributeToJackpot(cost);
+    await contributeToJackpot(await groqCoinsToCoinsEquivalent(groqCost));
     config.successEffect(shipment);
-    outcome = `✅ Paid ${formatNumber(cost)} – event resolved successfully.`;
+    outcome = `✅ Paid ${formatNumber(groqCost)} Groq Coins – event resolved successfully.`;
   } else {
     config.failEffect(shipment);
     outcome = `❌ Declined – you suffered the consequences.`;
@@ -1139,18 +1173,19 @@ export async function sourceShipment(userId: string, countryKey: string, goodKey
 
   const goodsCost = Math.round(good.baseCost * qty * goodsCostMult * scarcityMultiplier);
   const freightCost = Math.round(country.baseFreightFee * freight.costMult * freightCostMult * containersNeeded);
-  const totalCost = goodsCost + freightCost;
+  const totalCost = goodsCost + freightCost; // Coins-equivalent — drives all the RTP-tuned math downstream unchanged
 
-  const deducted = await deductCoins(userId, totalCost, { type: 'admin_debit', note: `sourced ${qty}x ${good.label} from ${country.label}` });
-  if (!deducted.success) return { success: false, reason: 'Not enough coins for that order.' };
+  const groqTotalCost = await coinsToGroqCoins(totalCost);
+  const deducted = await deductGroqCoins(userId, groqTotalCost, { type: 'admin_debit', note: `sourced ${qty}x ${good.label} from ${country.label}` });
+  if (!deducted.success) return { success: false, reason: 'Not enough Groq Coins for that order.' };
 
   const stockOk = await decrementStock(countryKey, goodKey, qty);
   if (!stockOk) {
-    await addCoins(userId, totalCost, { type: 'admin_credit', note: 'refund: stock unavailable' });
+    await addGroqCoins(userId, groqTotalCost, { type: 'admin_credit', note: 'refund: stock unavailable' });
     return { success: false, reason: 'That stock just sold out — try again or pick another country.' };
   }
 
-  await contributeToJackpot(totalCost);
+  await contributeToJackpot(await groqCoinsToCoinsEquivalent(groqTotalCost));
 
   const travelTimeMs = Math.round((country.distanceHrs * 3600000) / freight.speedMult);
   const shipment: Shipment = {
@@ -1167,6 +1202,7 @@ export async function sourceShipment(userId: string, countryKey: string, goodKey
     freightCost,
     containersUsed: containersNeeded,
     totalCost,
+    groqCoinsCost: groqTotalCost,
     createdAt: Date.now(),
     travelTimeMs,
     status: 'in_transit',
@@ -1221,9 +1257,10 @@ export async function clearShipment(userId: string, shipmentId: string, opts: { 
   const duty = Math.round(shipment.goodsCost * (effectiveDutyRate / 100));
 
   if (valid) {
-    const paid = await deductCoins(userId, duty, { type: 'admin_debit', note: `customs duty: ${shipmentId}` });
-    if (!paid.success) return { outcome: 'error', reason: 'Not enough coins for duty.' };
-    await contributeToJackpot(duty);
+    const groqDuty = await coinsToGroqCoins(duty);
+    const paid = await deductGroqCoins(userId, groqDuty, { type: 'admin_debit', note: `customs duty: ${shipmentId}` });
+    if (!paid.success) return { outcome: 'error', reason: 'Not enough Groq Coins for duty.' };
+    await contributeToJackpot(await groqCoinsToCoinsEquivalent(groqDuty));
 
     shipment.status = 'cleared_unsold';
     shipment.dutyPaid = duty;
@@ -1231,7 +1268,7 @@ export async function clearShipment(userId: string, shipmentId: string, opts: { 
     shipment.clearedAt = Date.now();
     shipment.originalQty = shipment.qty; // CRITICAL: Store original qty to prevent repeated spoilage on retry attempts
     await saveShipments(userId, all);
-    return { outcome: 'cleared', dutyPaid: duty, bribePaid: 0 };
+    return { outcome: 'cleared', dutyPaid: duty, bribePaid: 0, dutyPaidGroq: groqDuty, bribePaidGroq: 0 };
   }
 
   if (!opts.bribe) {
@@ -1240,9 +1277,10 @@ export async function clearShipment(userId: string, shipmentId: string, opts: { 
 
   const bribeCost = Math.round(duty * (BRIBE_COST_PERCENT / 100));
   const totalUpfront = duty + bribeCost;
-  const paid = await deductCoins(userId, totalUpfront, { type: 'admin_debit', note: `duty + bribe: ${shipmentId}` });
-  if (!paid.success) return { outcome: 'error', reason: 'Not enough coins for duty + bribe.' };
-  await contributeToJackpot(totalUpfront);
+  const groqUpfront = await coinsToGroqCoins(totalUpfront);
+  const paid = await deductGroqCoins(userId, groqUpfront, { type: 'admin_debit', note: `duty + bribe: ${shipmentId}` });
+  if (!paid.success) return { outcome: 'error', reason: 'Not enough Groq Coins for duty + bribe.' };
+  await contributeToJackpot(await groqCoinsToCoinsEquivalent(groqUpfront));
 
   const { agent } = await getEquipment(userId);
   const baseChance = RISK_BRIBE_SUCCESS[country.risk];
@@ -1257,7 +1295,10 @@ export async function clearShipment(userId: string, shipmentId: string, opts: { 
     shipment.clearedAt = Date.now();
     shipment.originalQty = shipment.qty; // CRITICAL: Store original qty to prevent repeated spoilage on retry attempts
     await saveShipments(userId, all);
-    return { outcome: 'cleared', dutyPaid: duty, bribePaid: bribeCost };
+    // groqUpfront covers duty+bribe together (one combined payment) — split
+    // proportionally for display so the two lines add up to what was charged.
+    const dutyPaidGroq = await coinsToGroqCoins(duty);
+    return { outcome: 'cleared', dutyPaid: duty, bribePaid: bribeCost, dutyPaidGroq, bribePaidGroq: Math.max(0, groqUpfront - dutyPaidGroq) };
   }
 
   return seizeShipment(userId, all, idx, shipment);
@@ -1267,8 +1308,9 @@ async function seizeShipment(userId: string, all: Shipment[], idx: number, shipm
   const { agent } = await getEquipment(userId);
   const effectiveFineMult = Math.max(1.0, FINE_MULT - agent.fineMultReduction);
   const fine = Math.round(shipment.totalCost * effectiveFineMult);
-  const finePaid = await deductCoins(userId, fine, { type: 'admin_debit', note: `customs seizure fine: ${shipment.id}` });
-  if (finePaid.success) await contributeToJackpot(fine);
+  const groqFine = await coinsToGroqCoins(fine);
+  const finePaid = await deductGroqCoins(userId, groqFine, { type: 'admin_debit', note: `customs seizure fine: ${shipment.id}` });
+  if (finePaid.success) await contributeToJackpot(await groqCoinsToCoinsEquivalent(groqFine));
 
   let tierKey: LicenseTierKey | null = null;
   for (const [key, tier] of Object.entries(LICENSE_TIERS)) {
@@ -1293,6 +1335,7 @@ async function seizeShipment(userId: string, all: Shipment[], idx: number, shipm
   return {
     outcome: 'seized',
     fine: finePaid.success ? fine : 0,
+    fineGroq: finePaid.success ? groqFine : 0,
     forcedRenewalCost: renewalCost,
     holdHours: CLEARANCE_HOLD_HOURS,
     renewalSucceeded,
@@ -1581,6 +1624,111 @@ export async function getMarketPrice(goodKey: string, hubKey: string): Promise<n
   return Math.round(base * hub.priceMultiplier * depletionFactor);
 }
 
+/**
+ * The "open" reference price for a (good, hub) pair — same formula as
+ * getMarketPrice minus the depletion factor. Depletion reflects real
+ * same-day trading activity (already visible live via Market Pulse and the
+ * live price itself); the open price is what a trend should track instead,
+ * so "is this market rising or falling" reflects genuine day-over-day
+ * market movement (wobble + events + hub personality), not just "did
+ * someone else already sell here today."
+ */
+async function getOpenPrice(goodKey: string, hubKey: string): Promise<number> {
+  const good = GOODS[goodKey];
+  const hub = HUBS.find(h => h.key === hubKey);
+  if (!good || !hub) return 0;
+  const wobble = getDemandWobble(goodKey, hubKey, good.priceVolatility);
+  const eventMultiplier = await getPriceMultiplier(goodKey, hubKey);
+  const affinity = hub.categoryAffinity?.[good.category] ?? 1.0;
+  const base = good.baseCost * (1.0 + good.profitMarginBonus) * wobble * eventMultiplier * affinity;
+  return Math.round(base * hub.priceMultiplier);
+}
+
+const PRICE_HISTORY_DAYS = 8; // 8 days kept so "7d ago" always has a real data point once the history fills up
+
+async function recordDailySnapshotIfNeeded(goodKey: string, hubKey: string): Promise<Array<{ date: string; price: number }>> {
+  const key = `${goodKey}:${hubKey}`;
+  const history = ((await priceHistoryTbl.get(key)) as Array<{ date: string; price: number }>) || [];
+  const today = todayStr();
+  if (history.length && history[history.length - 1].date === today) return history;
+
+  const openPrice = await getOpenPrice(goodKey, hubKey);
+  history.push({ date: today, price: openPrice });
+  while (history.length > PRICE_HISTORY_DAYS) history.shift();
+  await priceHistoryTbl.set(key, history);
+  return history;
+}
+
+export interface PriceTrend {
+  current: number;
+  openToday: number;
+  changeSinceOpenPct: number;      // today's live movement — mostly reflects real dumping/depletion
+  yesterdayOpen: number | null;
+  change24hPct: number | null;     // day-over-day market movement (wobble/events), independent of depletion
+  weekAgoOpen: number | null;
+  change7dPct: number | null;
+  direction: 'rising' | 'falling' | 'stable';
+  daysTracked: number;             // how many real days of history we actually have (transparency, not a guess)
+}
+
+/**
+ * Real price trend for a (good, hub) pair, built from actual daily open
+ * snapshots — not simulated or estimated. First time any good/hub pair is
+ * checked, this starts its own history from that day; trend data fills in
+ * naturally over the following days rather than being backfilled or faked.
+ */
+export async function getPriceTrend(goodKey: string, hubKey: string): Promise<PriceTrend> {
+  const history = await recordDailySnapshotIfNeeded(goodKey, hubKey);
+  const current = await getMarketPrice(goodKey, hubKey);
+  const openToday = history[history.length - 1].price;
+
+  const yesterdayOpen = history.length >= 2 ? history[history.length - 2].price : null;
+  const weekAgoOpen = history.length >= 8 ? history[0].price : null;
+
+  const pctChange = (from: number | null, to: number): number | null =>
+    from && from > 0 ? Math.round(((to - from) / from) * 100) : null;
+
+  const changeSinceOpenPct = pctChange(openToday, current) ?? 0;
+  const change24hPct = pctChange(yesterdayOpen, openToday);
+  const change7dPct = pctChange(weekAgoOpen, openToday);
+
+  const direction: PriceTrend['direction'] =
+    changeSinceOpenPct > 3 ? 'rising' : changeSinceOpenPct < -3 ? 'falling' : 'stable';
+
+  return { current, openToday, changeSinceOpenPct, yesterdayOpen, change24hPct, weekAgoOpen, change7dPct, direction, daysTracked: history.length };
+}
+
+function formatPct(pct: number | null): string {
+  if (pct === null) return 'n/a';
+  return pct > 0 ? `+${pct}%` : `${pct}%`;
+}
+
+/** Compact one-line trend badge for inline use next to a price, e.g. in the sell menu's hub list. */
+export function formatTrendBadge(trend: PriceTrend): string {
+  const arrow = trend.direction === 'rising' ? '📈' : trend.direction === 'falling' ? '📉' : '➖';
+  return `${arrow} ${formatPct(trend.changeSinceOpenPct)} today`;
+}
+
+/** Full multi-hub trend report for a good — the "check before you commit" screen. */
+export async function getPriceTrendReport(goodKey: string): Promise<string> {
+  const good = GOODS[goodKey];
+  if (!good) return '_Unknown good._';
+
+  const lines: string[] = [];
+  for (const hub of HUBS) {
+    if (hub.bannedGoods?.includes(goodKey)) continue;
+    const trend = await getPriceTrend(goodKey, hub.key);
+    const arrow = trend.direction === 'rising' ? '📈' : trend.direction === 'falling' ? '📉' : '➖';
+    const historyNote = trend.daysTracked < 2 ? ' _(first day tracked — no history yet)_' : '';
+    lines.push(
+      `${hub.label}: ${formatNumber(trend.current)} ${arrow}\n` +
+      `  Today: ${formatPct(trend.changeSinceOpenPct)}  ·  24h: ${formatPct(trend.change24hPct)}  ·  7d: ${formatPct(trend.change7dPct)}${historyNote}`
+    );
+  }
+
+  return `📈 *${good.emoji} ${good.label} — Price Trend*\n${lines.join('\n')}`;
+}
+
 function resolveCourierRisk(theftRisk: number, eventRiskDelta = 0): { deliveredFraction: number; note: string } {
   const troubleChance = 0.05 + theftRisk * 0.3 + eventRiskDelta;
   const roll = Math.random();
@@ -1648,9 +1796,10 @@ export async function sellGoods(userId: string, shipmentId: string, hubKey: stri
   let courierNote = '';
   if (hub.courierRequired) {
     courierFee = hub.courierFeePerUnit * shipment.qty;
-    const feeResult = await deductCoins(userId, courierFee, { type: 'admin_debit', note: `courier to ${hub.label}` });
-    if (!feeResult.success) return { success: false, reason: 'Not enough coins for the courier fee.' };
-    await contributeToJackpot(courierFee);
+    const groqCourierFee = await coinsToGroqCoins(courierFee);
+    const feeResult = await deductGroqCoins(userId, groqCourierFee, { type: 'admin_debit', note: `courier to ${hub.label}` });
+    if (!feeResult.success) return { success: false, reason: 'Not enough Groq Coins for the courier fee.' };
+    await contributeToJackpot(await groqCoinsToCoinsEquivalent(groqCourierFee));
 
     const eventRiskDelta = await getCourierRiskDelta(hubKey);
     const risk = resolveCourierRisk(good.theftRisk, eventRiskDelta);
@@ -1704,9 +1853,10 @@ export async function sellGoods(userId: string, shipmentId: string, hubKey: stri
     const billableDays = Math.max(0, Math.ceil(daysHeld - warehouse.freeHoldingDays));
     if (billableDays > 0) {
       holdingFee = billableDays * warehouse.holdingFeePerUnitPerDay * shipment.qty;
-      const feeResult = await deductCoins(userId, holdingFee, { type: 'admin_debit', note: `warehouse holding fee: ${shipmentId}` });
+      const groqHoldingFee = await coinsToGroqCoins(holdingFee);
+      const feeResult = await deductGroqCoins(userId, groqHoldingFee, { type: 'admin_debit', note: `warehouse holding fee: ${shipmentId}` });
       holdingFee = feeResult.success ? holdingFee : 0;
-      if (feeResult.success) await contributeToJackpot(holdingFee);
+      if (feeResult.success) await contributeToJackpot(await groqCoinsToCoinsEquivalent(groqHoldingFee));
     }
   }
 
