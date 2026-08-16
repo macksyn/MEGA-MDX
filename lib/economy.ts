@@ -120,6 +120,16 @@ export interface Wallet {
   lifetimeCoinsEarned: number;
   lifetimeGroqCoinsEarned: number;
   exchangeCount: number;
+  // Timestamp of the moment this member's LIFETIME exchangeCount first
+  // crossed the Level 2 threshold (LEVEL_DEFS[1].threshold). Used to give
+  // freshly-promoted members a one-time ROLLING_WINDOW_DAYS grace period
+  // before the rolling-volume maintenance check (see getLevelInfo) can
+  // demote them — without this anchor, the rolling check has no way to
+  // distinguish "just promoted 3 days ago, hasn't had a full week yet" from
+  // "been Level 2+ for months and let their volume lapse", and ends up
+  // demoting brand-new Level 2 members almost immediately. Set once, never
+  // cleared by later demotions (see addExchange).
+  level2SinceTs: number | null;
   createdAt: number;
   name: string | null;    // best-known display first name (WhatsApp pushName/contact), for recognition
   phone: string | null;   // best-known phone number, resolved from @lid where needed
@@ -145,6 +155,7 @@ const EMPTY_WALLET: Wallet = {
   lifetimeCoinsEarned: 0,
   lifetimeGroqCoinsEarned: 0,
   exchangeCount: 0,
+  level2SinceTs: null,
   createdAt: Date.now(),
   name: null,
   phone: null,
@@ -500,6 +511,11 @@ const LEVEL_DEFS = [
   { name: 'Legend', nextName: null, threshold: 200 },
 ] as const;
 
+// Single source of truth for "what lifetime exchangeCount makes someone
+// Level 2" — used both by getLevelInfo() and by addExchange() (to anchor
+// level2SinceTs the moment this is first crossed).
+const LEVEL_2_THRESHOLD = LEVEL_DEFS[1].threshold;
+
 function createProgressBar(percent: number, size = 10): string {
   const filled = Math.round((percent / 100) * size);
   const safeFilled = Math.max(0, Math.min(size, filled));
@@ -510,16 +526,30 @@ function createProgressBar(percent: number, size = 10): string {
  * Compute level info with rolling requirement:
  * - If lifetime level >= 2 but rollingCount (Groq Coins exchanged in the
  *   trailing ROLLING_WINDOW_DAYS, NOT a transaction count) is below
- *   MIN_ROLLING_EXCHANGES_FOR_LEVEL_2, effective level is forced to 1 (Novice).
- *   Because the window is rolling, a member naturally stays at their real
- *   level for up to ROLLING_WINDOW_DAYS after their last qualifying activity
- *   before demotion kicks in — no separate grace-period state needed.
+ *   MIN_ROLLING_EXCHANGES_FOR_LEVEL_2, effective level is forced to 1 (Novice)
+ *   — UNLESS the member is still within their one-time grace period (see
+ *   `level2SinceTs` below), in which case they keep their lifetime level
+ *   regardless of rolling volume.
+ * - `level2SinceTs` is the timestamp (Wallet.level2SinceTs) of the moment
+ *   this member's lifetime count first crossed the Level 2 threshold. For
+ *   the first ROLLING_WINDOW_DAYS after that moment, the rolling-volume
+ *   check is skipped entirely — a brand-new Level 2 member simply hasn't
+ *   had a full window yet to accumulate MIN_ROLLING_EXCHANGES_FOR_LEVEL_2,
+ *   so judging them against it immediately would demote them within days
+ *   instead of after the intended week. Once the grace period elapses, the
+ *   ordinary rolling check applies going forward, indefinitely — this is a
+ *   one-time onboarding allowance, not a recurring grace on every dip.
+ * - If `level2SinceTs` is not provided (null/undefined — e.g. an older
+ *   wallet from before this field existed), no grace period is applied,
+ *   matching the previous (pre-fix) behavior for that member until their
+ *   next `addExchange()` call backfills it.
  * - The `isActive` flag indicates whether the user meets the rolling requirement
  *   (useful for displaying warnings).
  */
 export function getLevelInfo(
   exchangeCount: number,
-  rollingCount: number = 0
+  rollingCount: number = 0,
+  level2SinceTs: number | null = null
 ): {
   levelNumber: number;
   levelName: string;
@@ -532,6 +562,8 @@ export function getLevelInfo(
   rollingRequired: number;
   rollingCount: number;
   exchangesNeededToMaintain: number;
+  inGracePeriod: boolean;
+  graceDaysLeft: number;
 } {
   const safeCount = Math.max(0, Math.floor(exchangeCount || 0));
   const safeRolling = Math.max(0, Math.floor(rollingCount || 0));
@@ -544,10 +576,18 @@ export function getLevelInfo(
 
   const baseLevelNumber = levelIndex + 1;
 
-  // Apply rolling requirement for level 2+
+  // Apply rolling requirement for level 2+, respecting the one-time grace
+  // period anchored to level2SinceTs.
   const minRolling = MIN_ROLLING_EXCHANGES_FOR_LEVEL_2;
+  const graceWindowMs = ROLLING_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  const graceElapsedMs = level2SinceTs != null ? Date.now() - level2SinceTs : Infinity;
+  const inGracePeriod = baseLevelNumber >= 2 && graceElapsedMs < graceWindowMs;
+  const graceDaysLeft = inGracePeriod
+    ? Math.max(0, Math.ceil((graceWindowMs - graceElapsedMs) / (24 * 60 * 60 * 1000)))
+    : 0;
+
   let effectiveIndex = levelIndex;
-  if (baseLevelNumber >= 2 && safeRolling < minRolling) {
+  if (baseLevelNumber >= 2 && safeRolling < minRolling && !inGracePeriod) {
     effectiveIndex = 0; // demote to level 1 (Novice)
   }
 
@@ -571,10 +611,12 @@ export function getLevelInfo(
     current: safeCount,
     next: nextLevel ? nextLevel.threshold : safeCount,
     bar: createProgressBar(progressPercent),
-    isActive: effectiveIndex >= 1 && safeRolling >= minRolling,
+    isActive: effectiveIndex >= 1 && (safeRolling >= minRolling || inGracePeriod),
     rollingRequired: minRolling,
     rollingCount: safeRolling,
     exchangesNeededToMaintain,
+    inGracePeriod,
+    graceDaysLeft,
   };
 }
 
@@ -629,7 +671,8 @@ export async function transferCoins(fromId: string, toId: string, amount: number
 export async function awardAttendanceBonus(
   userId: string,
   totalReward: number,
-  streak: number
+  streak: number,
+  minLevel: number = 2
 ): Promise<
   | { success: false; reason: 'already_awarded_today' }
   | { success: true; reward: number; capped: boolean; levelGated: boolean }
@@ -646,9 +689,11 @@ export async function awardAttendanceBonus(
   // it's already awarded, even if they all arrive at the exact same instant.
   let alreadyAwarded = false;
   let exchangeCountAtClaim = 0;
+  let level2SinceTsAtClaim: number | null = null;
   await mutateWallet(userId, (w) => {
     if (w.lastDailyDate === today) { alreadyAwarded = true; return; }
     exchangeCountAtClaim = w.exchangeCount;
+    level2SinceTsAtClaim = w.level2SinceTs;
     w.lastDailyDate = today;
     w.dailyStreak = streak;
   });
@@ -656,14 +701,19 @@ export async function awardAttendanceBonus(
     return { success: false, reason: 'already_awarded_today' };
   }
 
-  // Fetch rolling exchange count for the last 7 days
-  const rollingCount = await getRollingExchangeCount(userId, 7);
-  const { levelNumber } = getLevelInfo(exchangeCountAtClaim, rollingCount);
+  // minLevel <= 1 means the caller (attendance settings) wants the bonus
+  // open to everyone — skip the rolling/level lookup entirely in that case.
+  let levelNumber = 1;
+  if (minLevel > 1) {
+    // Fetch rolling exchange count for the last 7 days
+    const rollingCount = await getRollingExchangeCount(userId, 7);
+    ({ levelNumber } = getLevelInfo(exchangeCountAtClaim, rollingCount, level2SinceTsAtClaim));
+  }
 
-  if (levelNumber < 2) {
-    // Level too low (either lifetime <25 or rolling <100) – no coin reward.
-    // The claim above already recorded today's streak/date, so nothing
-    // more to write here.
+  if (minLevel > 1 && levelNumber < minLevel) {
+    // Level too low (either lifetime <25 or rolling <100, and outside any
+    // grace period) – no coin reward. The claim above already recorded
+    // today's streak/date, so nothing more to write here.
     return { success: true, reward: 0, capped: false, levelGated: true };
   }
 
@@ -1184,7 +1234,15 @@ export async function addExchange(userId: string, countIncrement = 1, groqCoinsV
   const saved = await mutateWallet(userId, (w) => {
     // Lifetime tier (Novice/Active/Pro/...) is a count of exchange
     // transactions, independent of how much GC each one moved.
+    const wasBelowLevel2 = w.exchangeCount < LEVEL_2_THRESHOLD;
     w.exchangeCount += countIncrement;
+    // Anchor the grace-period clock the instant they first cross into
+    // Level 2 lifetime-wise. Never overwritten afterward — a later
+    // rolling-volume demotion does NOT reset this, so grace only applies
+    // once, on initial promotion, not every time someone dips and recovers.
+    if (wasBelowLevel2 && w.exchangeCount >= LEVEL_2_THRESHOLD && !w.level2SinceTs) {
+      w.level2SinceTs = Date.now();
+    }
   });
   // Rolling 7-day requirement is GC VOLUME, not transaction count — record
   // the actual amount moved in this exchange.
