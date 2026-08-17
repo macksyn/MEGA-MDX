@@ -971,6 +971,60 @@ export async function resetWallet(userId: string): Promise<void> {
   await wallets.set(userId, { ...EMPTY_WALLET, createdAt: Date.now() });
 }
 
+/**
+ * ONE-OFF MAINTENANCE UTILITY — backfill `level2SinceTs` for wallets that
+ * reached Level 2 (lifetime exchangeCount >= LEVEL_2_THRESHOLD) before
+ * that field existed.
+ *
+ * Without this, those members have `level2SinceTs === null` forever (it's
+ * only ever set going forward, inside addExchange(), the moment someone
+ * NEWLY crosses the threshold — members already past it won't cross it
+ * again). getLevelInfo() treats null as "no grace period", so they'd
+ * remain exposed to the rolling-volume demotion bug retroactively fixed
+ * here, instead of getting the intended 7-day cushion.
+ *
+ * `anchorTs` defaults to "now", meaning affected members get a fresh
+ * full 7-day grace period starting from whenever you run this script —
+ * NOT backdated to whenever they actually first hit Level 2 (that
+ * moment isn't recoverable; it was never recorded). Pass an explicit
+ * timestamp if you want a shorter/backdated window instead.
+ *
+ * Safe to run multiple times — only touches wallets where
+ * level2SinceTs is still null, so it never overwrites a real value
+ * (including one this same script already set on a prior run).
+ *
+ * Not wired to any command; run it once via
+ * scripts/backfillLevel2SinceTs.ts (see that file) and remove/ignore
+ * afterward.
+ */
+export async function backfillLevel2SinceTs(anchorTs: number = Date.now()): Promise<{
+  scanned: number;
+  updated: number;
+  updatedUserIds: string[];
+}> {
+  const all = await wallets.getAll();
+  const userIds = Object.keys(all || {});
+  const updatedUserIds: string[] = [];
+
+  for (const userId of userIds) {
+    const raw = all[userId];
+    const w = { ...EMPTY_WALLET, ...raw };
+    const qualifies = (w.exchangeCount || 0) >= LEVEL_2_THRESHOLD && w.level2SinceTs == null;
+    if (!qualifies) continue;
+
+    await mutateWallet(userId, (wallet) => {
+      // Re-check inside the lock in case something else set it between
+      // the getAll() snapshot above and now.
+      if ((wallet.exchangeCount || 0) >= LEVEL_2_THRESHOLD && wallet.level2SinceTs == null) {
+        wallet.level2SinceTs = anchorTs;
+      }
+    });
+    updatedUserIds.push(userId);
+  }
+
+  return { scanned: userIds.length, updated: updatedUserIds.length, updatedUserIds };
+}
+
 export function formatNumber(n: number): string {
   return n.toLocaleString('en-US');
 }
