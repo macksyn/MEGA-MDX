@@ -171,7 +171,7 @@ async function runGoodMenu(sock: any, message: any, chatId: string, userId: stri
     return {
       label: `${good.emoji} ${good.label}`,
       value: goodKey,
-      description: `~${formatNumber(groqPerUnit)} Groq Coins/unit · ${stock.remaining}/${stock.cap} left today`,
+      description: `${formatNumber(groqPerUnit)} Groq Coins/unit · ${stock.remaining}/${stock.cap} left today`,
     };
   }));
 
@@ -199,7 +199,7 @@ async function runFreightMenu(sock: any, message: any, chatId: string, userId: s
     .map(f => ({
       label: f.label,
       value: f.key,
-      description: `~${Math.round(country.distanceHrs / f.speedMult)}h · ${f.costMult}x freight cost`,
+      description: `${Math.round(country.distanceHrs / f.speedMult)}h · ${f.costMult}x freight cost`,
     }));
 
   const result = await promptMenu(sock, message, chatId, userId, {
