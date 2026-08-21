@@ -63,6 +63,7 @@
     "express": "^4.22.1",
     "file-type": "^21.3.4",
     "form-data": "^4.0.1",
+    "gifted-btns": "^1.0.2",
     "gspeak": "^0.0.3",
     "human-readable": "^0.2.1",
     "libphonenumber-js": "^1.11.18",
@@ -101,7 +102,7 @@
   "overrides": {
     "minimatch": "^10.2.1",
     "yargs-parser": "^21.1.1"
-    },
+  },
   "allowScripts": {
     "protobufjs@7.6.5": true,
     "better-sqlite3@12.6.2": true,
