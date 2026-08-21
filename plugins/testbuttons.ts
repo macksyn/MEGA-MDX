@@ -110,11 +110,11 @@ export default {
         // matters most, since it's the one menuSession.ts was built to
         // replace if buttons ever start working reliably.
         const payload = {
-          text: 'Quick reply test — Tamara what do you want?',
-          footer: 'Btns smoke test',
+          text: 'Quick reply test — Tamara, what do you want?',
+          footer: 'Quick-btns smoke test',
           buttons: [
             { id: 'testbtn_balance', text: '💰 Money' },
-            { id: 'testbtn_bank', text: '🏦 House' },
+            { id: 'testbtn_bank', text: '🏦 Company' },
             { id: 'testbtn_shop', text: '🛒 Shopping' },
           ],
         };
