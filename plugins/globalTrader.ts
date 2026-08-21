@@ -3,7 +3,8 @@
  * plugins/globalTrader.ts – UI layer for Global Trader.
  */
 
-import { promptMenu } from '../lib/menuSession.js';
+// import { promptMenu } from '../lib/menuSession.js';
+import { promptMenu } from '../lib/buttonSession.js';
 import { getWallet, formatNumber, withEconomyGuard } from '../lib/economy.js';
 import { cleanJid } from '../lib/isOwner.js';
 import {
@@ -91,12 +92,12 @@ async function runMainMenu(sock: any, message: any, chatId: string, userId: stri
     subtitle: `${rank.emoji} Rank: ${rank.label}  ·  💰 ${formatNumber(wallet.coins)} coins${events ? `\n${events}` : ''}`,
     text: 'What would you like to do?',
     options: [
-      { label: 'Source Goods', value: 'source', description: 'Buy from a supplier country' },
-      { label: 'My Shipments', value: 'shipments', description: 'Track everything in transit' },
-      { label: 'Sell / Market', value: 'sell', description: 'Cash out cleared goods' },
-      { label: 'License & Rank', value: 'license', description: 'Check expiry, renew, view rank' },
-      { label: 'Upgrades', value: 'upgrades', description: 'Clearing Agent & Warehouse tiers' },
-      { label: 'Wallet', value: 'wallet' },
+      { label: '🛒 Source Goods', value: 'source', description: 'Buy from a supplier country' },
+      { label: '📦 My Shipments', value: 'shipments', description: 'Track everything in transit' },
+      { label: '🏷️ Sell / Market', value: 'sell', description: 'Cash out cleared goods' },
+      { label: '🪪 License & Rank', value: 'license', description: 'Check expiry, renew, view rank' },
+      { label: '🔝 Upgrades', value: 'upgrades', description: 'Clearing Agent & Warehouse tiers' },
+      { label: '💰 Wallet', value: 'wallet' },
       { label: '📈 Price Check', value: 'pricecheck', description: 'Check any good\'s trend before you buy or sell' },
       { label: '🌍 World News', value: 'conditions', description: events ? '⚡ Breaking — check what\'s moving the market' : 'Today\'s dispatches from the ports' },
     ],

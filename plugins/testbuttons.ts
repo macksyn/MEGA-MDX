@@ -15,11 +15,14 @@
  * (sock, m, args) shape seen across chatbot.ts / antilink.ts style plugins.
  */
 
-// gifted-btns' README only demonstrates CommonJS `require(...)`. If your
-// tsconfig doesn't have "esModuleInterop": true, a named `import` may not
-// resolve the two functions correctly. This require-style pattern works
-// regardless of your TS module config — swap to a named `import` only
-// after confirming node_modules/gifted-btns/package.json exposes ESM exports.
+// This project runs as ESM ("type": "module" in package.json), but
+// gifted-btns is published as CommonJS ("type": "commonjs", main: "gifted.js").
+// Top-level `require()` does not exist in ESM scope, so we bridge via
+// Node's createRequire — this is the standard way to consume a CJS-only
+// package from an ESM file without renaming anything to .cjs.
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+
 const {
   sendButtons,
   sendInteractiveMessage,
@@ -32,19 +35,25 @@ const {
 // Example: validateSendButtonsPayload({}) ->
 //   { valid: false, errors: ["text is mandatory...", "buttons is mandatory..."], warnings: [] }
 
-interface PluginContext {
-  sock: any; // WASocket from @whiskeysockets/baileys
-  m: any;    // the incoming message object from your loader
-  args: string[];
+interface WASocket {
+  sendMessage: (jid: string, content: any, options?: any) => Promise<any>;
+  [key: string]: any;
 }
 
 export default {
   command: 'testbtn',
   description: 'Smoke test for gifted-btns rendering',
 
-  async handler({ sock, m, args }: PluginContext) {
-    const jid = m.key.remoteJid;
-    const mode = args[0]?.toLowerCase();
+  // Confirmed against lib/commandHandler.ts: monitoredHandler itself is
+  // called as (sock, message, ...args) from messageHandler.ts, then invokes
+  // `handler(sock, message, ...args)`. Because monitoredHandler's own ...args
+  // rest-collects whatever messageHandler passed (apparently a single args
+  // array, not individually spread strings), spreading it again here hands
+  // the plugin handler that one array as its third positional param — not
+  // a spread of strings. So the real shape is a single array, not a rest.
+  async handler(sock: WASocket, message: any, args: string[]) {
+    const jid = message.key.remoteJid;
+    const mode = args?.[0]?.toLowerCase();
 
     // Local helper so all three modes report validation failures the same
     // way, and so a bad payload never reaches sendButtons/sendInteractiveMessage.
@@ -110,12 +119,12 @@ export default {
         // matters most, since it's the one menuSession.ts was built to
         // replace if buttons ever start working reliably.
         const payload = {
-          text: 'Quick reply test — Tamara, what do you want?',
-          footer: 'Quick-btns smoke test',
+          text: 'Quick reply test — tap any button below.',
+          footer: 'gifted-btns smoke test',
           buttons: [
-            { id: 'testbtn_balance', text: '💰 Money' },
-            { id: 'testbtn_bank', text: '🏦 Company' },
-            { id: 'testbtn_shop', text: '🛒 Shopping' },
+            { id: 'testbtn_balance', text: '💰 Balance' },
+            { id: 'testbtn_bank', text: '🏦 Bank' },
+            { id: 'testbtn_shop', text: '🛒 Shop' },
           ],
         };
         assertValid(validateSendButtonsPayload(payload));
@@ -146,23 +155,22 @@ export default {
   },
 
   // Listen for the button taps so you can confirm the round-trip, not
-  // just that the message sent. Wire this into whatever event your
-  // pluginLoader uses for interactiveResponseMessage / buttonsResponseMessage.
+  // just that the message sent. This is NOT wired into your loader yet —
+  // there's no evidence from commandHandler.ts that onButtonResponse is a
+  // recognized lifecycle hook. Confirm how your loader dispatches
+  // interactiveResponseMessage / buttonsResponseMessage events (likely in
+  // messageHandler.ts, based on the stack trace) before relying on this.
   //
-  // NOTE: gifted-btns' README doesn't document incoming tap parsing at all —
-  // it only covers outbound sends. The shape below (buttonsResponseMessage /
-  // nativeFlowResponseMessage.paramsJson) is standard Baileys message
-  // decoding, unrelated to this package. Treat it as a reasonable starting
-  // guess to verify against your actual Baileys version, not a documented
-  // contract from gifted-btns.
-  async onButtonResponse({ sock, m }: { sock: any; m: any }) {
+  // Signature kept positional to match the (sock, message, ...args) pattern
+  // confirmed above, rather than the earlier guessed object-destructure shape.
+  async onButtonResponse(sock: WASocket, message: any) {
     const selectedId =
-      m.message?.buttonsResponseMessage?.selectedButtonId ||
-      m.message?.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson;
+      message.message?.buttonsResponseMessage?.selectedButtonId ||
+      message.message?.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson;
 
     if (selectedId) {
       console.log('[testbtn] tap received:', selectedId);
-      await sock.sendMessage(m.key.remoteJid, {
+      await sock.sendMessage(message.key.remoteJid, {
         text: `✅ Round-trip confirmed. You tapped: ${selectedId}`,
       });
     }

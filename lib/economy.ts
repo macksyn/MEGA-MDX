@@ -1025,6 +1025,39 @@ export async function backfillLevel2SinceTs(anchorTs: number = Date.now()): Prom
   return { scanned: userIds.length, updated: updatedUserIds.length, updatedUserIds };
 }
 
+/**
+ * ONE-OFF SUPPORT UTILITY — manually (re)anchor a *specific* member's
+ * `level2SinceTs` to `anchorTs` (defaults to now), giving them a fresh
+ * MIN_ROLLING_EXCHANGES_FOR_LEVEL_2 grace window starting from that moment.
+ *
+ * Unlike backfillLevel2SinceTs(), this DOES overwrite an existing (e.g.
+ * stale/expired) level2SinceTs — it's for support cases where a member's
+ * grace period lapsed through no fault of their own (a bug denied them the
+ * bonus that would've kept their rolling volume up) and you want to restore
+ * them to Level 2 with a clean 7-day window, not just backfill a null.
+ *
+ * Does NOT touch exchangeCount — only makes sense for wallets that already
+ * have exchangeCount >= LEVEL_2_THRESHOLD; it will not promote someone who
+ * hasn't actually reached Level 2 lifetime.
+ *
+ * Not wired to any command; run via scripts/resetLevel2Grace.ts.
+ */
+export async function resetLevel2Grace(
+  userId: string,
+  anchorTs: number = Date.now()
+): Promise<{ success: boolean; reason?: 'below_level_2_threshold'; wallet?: Wallet }> {
+  let reason: 'below_level_2_threshold' | undefined;
+  const wallet = await mutateWallet(userId, (w) => {
+    if ((w.exchangeCount || 0) < LEVEL_2_THRESHOLD) {
+      reason = 'below_level_2_threshold';
+      return;
+    }
+    w.level2SinceTs = anchorTs;
+  });
+  if (reason) return { success: false, reason };
+  return { success: true, wallet };
+}
+
 export function formatNumber(n: number): string {
   return n.toLocaleString('en-US');
 }

@@ -2,7 +2,8 @@ import type { BotContext } from '../types.js';
 import store from '../lib/lightweight_store.js';
 import isOwnerOrSudo from '../lib/isOwner.js';
 import isAdmin from '../lib/isAdmin.js';
-import { promptMenu } from '../lib/menuSession.js';
+import { promptMenu } from '../lib/buttonSession.js';
+// import { promptMenu } from '../lib/menuSession.js';
 import { cleanJid } from '../lib/isOwner.js';
 
 interface AntilinkSettings {
