@@ -51,7 +51,7 @@ interface EconomySettings {
 }
 
 const DEFAULT_SETTINGS: EconomySettings = {
-  coinsPerGroqCoin: Number(process.env.ECONOMY_COINS_PER_GROQCOIN) || 100,
+  coinsPerGroqCoin: Number(process.env.ECONOMY_COINS_PER_GROQCOIN) || 1,
   groqCoinWithdrawThreshold: Number(process.env.ECONOMY_GROQCOIN_WITHDRAW_THRESHOLD) || 50,
   workMin: Number(process.env.ECONOMY_WORK_MIN) || 50,
   workMax: Number(process.env.ECONOMY_WORK_MAX) || 300,
