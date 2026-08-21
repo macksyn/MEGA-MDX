@@ -1194,7 +1194,7 @@ export async function drainFeePool(): Promise<number> {
 
 export async function exchangeWithMember(senderId: string, targetId: string, coinsAmount: number): Promise<
   | { success: false; reason: 'invalid_amount' | 'amount_not_allowed' | 'self_exchange' | 'below_minimum' | 'insufficient_funds' | 'exchange_failed' }
-  | { success: true; coinsSpent: number; groqCoinsGained: number; fee: number; debtResolved: boolean }
+  | { success: true; coinsSpent: number; groqCoinsGained: number; fee: number; debtResolved: boolean; debtResolvedAmount?: number }
 > {
   if (!coinsAmount || coinsAmount <= 0) return { success: false, reason: 'invalid_amount' };
   if (senderId === targetId) return { success: false, reason: 'self_exchange' };
@@ -1254,10 +1254,10 @@ export async function exchangeWithMember(senderId: string, targetId: string, coi
   // this exchange settles that debt. Either way, the target now owes the
   // sender a reciprocal exchange going forward — that's the whole "Peter
   // sends Paul, so now Paul owes Peter" loop.
-  const debtResolved = await resolveOldestDebt(senderId, targetId);
-  await addDebt(targetId, senderId);
+  const { resolved: debtResolved, amount: debtResolvedAmount } = await resolveOldestDebt(senderId, targetId);
+  await addDebt(targetId, senderId, coinsToSpend);
 
-  return { success: true, coinsSpent: coinsToSpend, groqCoinsGained: netGroqCoins, fee, debtResolved };
+  return { success: true, coinsSpent: coinsToSpend, groqCoinsGained: netGroqCoins, fee, debtResolved, debtResolvedAmount };
 }
 
 // ── Reciprocal exchange debt ledger ───────────────────────────────────────────
@@ -1268,15 +1268,16 @@ export async function exchangeWithMember(senderId: string, targetId: string, coi
 interface ExchangeDebt {
   id: string;
   creditorId: string; // the person who is owed a reciprocal exchange
+  amount: number;     // coin amount of the exchange that created this debt (what a reciprocal should match)
   timestamp: number;
 }
 
 const MAX_DEBTS_PER_USER = 100;
 
-async function addDebt(debtorId: string, creditorId: string): Promise<void> {
+async function addDebt(debtorId: string, creditorId: string, amount: number): Promise<void> {
   try {
     const list: ExchangeDebt[] = (await exchangeDebtsTbl.get(debtorId)) || [];
-    list.push({ id: `debt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, creditorId, timestamp: Date.now() });
+    list.push({ id: `debt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, creditorId, amount, timestamp: Date.now() });
     if (list.length > MAX_DEBTS_PER_USER) list.splice(0, list.length - MAX_DEBTS_PER_USER);
     await exchangeDebtsTbl.set(debtorId, list);
   } catch (_) {
@@ -1284,17 +1285,17 @@ async function addDebt(debtorId: string, creditorId: string): Promise<void> {
   }
 }
 
-/** Resolves (removes) the oldest debt debtorId owes to creditorId, if any. Returns whether one was found. */
-async function resolveOldestDebt(debtorId: string, creditorId: string): Promise<boolean> {
+/** Resolves (removes) the oldest debt debtorId owes to creditorId, if any. Returns whether one was found and its amount. */
+async function resolveOldestDebt(debtorId: string, creditorId: string): Promise<{ resolved: boolean; amount?: number }> {
   try {
     const list: ExchangeDebt[] = (await exchangeDebtsTbl.get(debtorId)) || [];
     const idx = list.findIndex(d => d.creditorId === creditorId);
-    if (idx === -1) return false;
-    list.splice(idx, 1);
+    if (idx === -1) return { resolved: false };
+    const [removed] = list.splice(idx, 1);
     await exchangeDebtsTbl.set(debtorId, list);
-    return true;
+    return { resolved: true, amount: removed.amount };
   } catch (_) {
-    return false;
+    return { resolved: false };
   }
 }
 
@@ -1304,12 +1305,12 @@ export async function getDebtsOwedByUser(userId: string): Promise<ExchangeDebt[]
 }
 
 /** Who still owes THIS user a reciprocal exchange (they sent coins to these people, no payback yet). */
-export async function getDebtsOwedToUser(userId: string): Promise<Array<{ debtorId: string; timestamp: number }>> {
+export async function getDebtsOwedToUser(userId: string): Promise<Array<{ debtorId: string; amount: number; timestamp: number }>> {
   const all = (await exchangeDebtsTbl.getAll()) || {};
-  const results: Array<{ debtorId: string; timestamp: number }> = [];
+  const results: Array<{ debtorId: string; amount: number; timestamp: number }> = [];
   for (const [debtorId, list] of Object.entries(all as Record<string, ExchangeDebt[]>)) {
     for (const d of list) {
-      if (d.creditorId === userId) results.push({ debtorId, timestamp: d.timestamp });
+      if (d.creditorId === userId) results.push({ debtorId, amount: d.amount, timestamp: d.timestamp });
     }
   }
   return results.sort((a, b) => a.timestamp - b.timestamp);
