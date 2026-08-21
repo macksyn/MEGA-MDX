@@ -97,7 +97,7 @@ interface PendingPrompt {
 }
 
 const pending = new Map<string, PendingPrompt>(); // keyed by the sent menu message's own id
-let listenerRegistered = false;
+const registeredSocks = new WeakSet<any>();
 
 const KEYCAP_DIGITS: Record<string, string> = {
   '0': '0️⃣', '1': '1️⃣', '2': '2️⃣', '3': '3️⃣', '4': '4️⃣',
@@ -155,8 +155,8 @@ function extractPlainText(msg: any): string | null {
 }
 
 function registerListener(sock: any) {
-  if (listenerRegistered) return;
-  listenerRegistered = true;
+  if (registeredSocks.has(sock)) return;
+   registeredSocks.add(sock);
 
   sock.ev.on('messages.upsert', async (upsert: any) => {
     try {
