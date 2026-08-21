@@ -3,7 +3,7 @@ import { getWallet, formatNumber, withEconomyGuard, getLevelInfo, getRollingExch
 import { cleanJid } from '../lib/isOwner.js';
 import { extractTargetJid } from '../lib/resolveTarget.js';
 import { resolveParticipant } from '../lib/contactUtil.js';
-import { promptMenu } from '../lib/menuSession.js';
+import { promptMenu } from '../lib/buttonSession.js';
 import { sendStatement } from '../lib/statement.js';
 
 export const command = 'balance';
@@ -49,8 +49,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     }
   }
 
-  const text =
-    `💰 *${label}*\n\n` +
+  const statsBlock =
     `🪙 Coins: *${formatNumber(wallet.coins)}*\n` +
     `💲 Groq Coins: *${formatNumber(wallet.groqCoins)}*\n` +
     `${levelStatus}\n` +
@@ -59,24 +58,30 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     `📈 ${levelInfo.bar} ${levelInfo.progressPercent}%\n\n` +
     `➡️ _Next: *${levelInfo.nextLevelName || 'Max'}* at ${formatNumber(levelInfo.next)} exchanges_ `;
 
-  await sock.sendMessage(chatId, {
-    text,
-    mentions: isSelf ? [] : [resolvedJid],
-    ...channelInfo
-  }, { quoted: message });
+  // Viewing someone else's balance never offered the statement button
+  // (strictly self-only, even for owner/sudo) — keep that as a plain
+  // message so we can still pass mentions, which promptMenu doesn't
+  // support forwarding into the send payload.
+  if (!isSelf) {
+    await sock.sendMessage(chatId, {
+      text: `💰 *${label}*\n\n${statsBlock}`,
+      mentions: [resolvedJid],
+      ...channelInfo
+    }, { quoted: message });
+    return;
+  }
 
-  // Follow-up statement-of-account view. Strictly self-only — even
-  // owner/sudo don't get the option when looking at someone else's
-  // balance. Only the account owner ever sees this menu.
-  if (!isSelf) return;
-
+  // Self-view: balance report and the "view statement" option go out as
+  // ONE button message instead of a report followed by a separate menu
+  // prompt. Only the account owner ever sees this option.
   const selfId = cleanJid(senderId);
 
   const result = await promptMenu(sock, message, chatId, selfId, {
-    title: '💰 BALANCE',
-    text: 'Want more detail?',
+    title: `💰 ${label}`,
+    text: statsBlock,
+    footer: 'Tap below for your full transaction history',
     options: [
-      { label: 'View statement of account', value: 'statement', description: 'Full transaction history' },
+      { label: 'View statement', value: 'statement', description: 'Full transaction history' },
     ],
   });
 
