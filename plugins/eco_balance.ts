@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { getWallet, formatNumber, withEconomyGuard, getLevelInfo, getRollingExchangeCount } from '../lib/economy.js';
+import { getWallet, formatNumber, withEconomyGuard, getPlayerLevel } from '../lib/economy.js';
 import { cleanJid } from '../lib/isOwner.js';
 import { extractTargetJid } from '../lib/resolveTarget.js';
 import { resolveParticipant } from '../lib/contactUtil.js';
@@ -26,9 +26,11 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const targetId = cleanJid(resolvedJid);
   const wallet = await getWallet(targetId);
 
-  // Fetch rolling exchange count for the last 7 days
-  const rollingCount = await getRollingExchangeCount(targetId, 7);
-  const levelInfo = getLevelInfo(wallet.exchangeCount, rollingCount, wallet.level2SinceTs);
+  // getPlayerLevel() gathers exchangeCount, rollingCount, and level2SinceTs
+  // itself — the same source of truth this file used to assemble by hand.
+  // Its returned rollingCount is reused below instead of a second call.
+  const levelInfo = await getPlayerLevel(targetId);
+  const rollingCount = levelInfo.rollingCount;
 
   const isSelf = targetId === cleanJid(senderId);
   const label = isSelf ? 'YOUR BALANCE' : `@${phoneNumber}'S BALANCE`;
