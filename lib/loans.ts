@@ -46,7 +46,7 @@
  * is garnished.
  */
 import { createStore } from './pluginStore.js';
-import { getWallet, getLevelInfo, addCoins, deductCoins, registerGarnishmentHandler, type TransactionMeta } from './economy.js';
+import { getPlayerLevel, addCoins, deductCoins, registerGarnishmentHandler, type TransactionMeta } from './economy.js';
 import { getJackpotPool, deductFromJackpot, contributeToJackpot, settleWin } from './slotMachine.js';
 
 const root = createStore('loans');
@@ -105,7 +105,7 @@ export interface EligibilityResult {
   tier?: LoanTier;
   maxAmount?: number;        // streak-bonus-adjusted max for this tier
   repaidStreak?: number;
-  economyLevel?: ReturnType<typeof getLevelInfo>;
+  economyLevel?: Awaited<ReturnType<typeof getPlayerLevel>>;
   // populated on below_minimum_tier — the first loan level they're working toward
   nextTier?: LoanTier;
   progress?: { economyLevel: number };
@@ -196,7 +196,6 @@ export async function getRepayableLoan(userId: string): Promise<Loan | null> {
 // ── Eligibility ───────────────────────────────────────────────────────────────
 
 export async function checkEligibility(userId: string): Promise<EligibilityResult> {
-  const wallet = await getWallet(userId);
   const history = await getLoanHistory(userId);
 
   if (history.some(l => l.status === 'active')) {
@@ -210,7 +209,15 @@ export async function checkEligibility(userId: string): Promise<EligibilityResul
   }
 
   const repaidStreak = computeRepaidStreak(history);
-  const economyLevel = getLevelInfo(wallet.exchangeCount);
+  // BUG FIX: this used to call getLevelInfo(wallet.exchangeCount) directly,
+  // omitting rollingCount and level2SinceTs. Both default to values that
+  // ALWAYS demote a Level 2+ member back to Level 1 (rollingCount defaults
+  // to 0, which is always below the maintenance threshold, and no grace
+  // period applies without a real level2SinceTs) — so loans.ts silently
+  // treated every player as Level 1 regardless of actual standing.
+  // getPlayerLevel() gathers all three inputs correctly from the wallet
+  // and rolling exchange history, so this can't happen again here.
+  const economyLevel = await getPlayerLevel(userId);
   const qualifiedTier = [...LOAN_TIERS]
     .reverse()
     .find(t => economyLevel.levelNumber >= t.minLevel) || null;
