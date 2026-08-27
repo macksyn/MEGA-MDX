@@ -5,7 +5,6 @@ import { dataFile } from '../lib/paths.js';
 import { downloadContentFromMessage } from '@whiskeysockets/baileys';
 import { writeFile } from 'fs/promises';
 import store from '../lib/lightweight_store.js';
-import viewOnceModule from './viewonce.js';
 
 const messageStore = new Map();
 const CONFIG_PATH = dataFile('antidelete.json');
@@ -100,16 +99,110 @@ export async function storeMessage(sock: any, message: any) {
         const sender = message.key.participant || message.key.remoteJid;
 
         const viewOnceContainer = message.message?.viewOnceMessageV2?.message || message.message?.viewOnceMessage?.message;
-          if (viewOnceContainer) {
-    // Let the dedicated module handle it
-      await viewOnceModule.handleViewOnceMessage(sock, message);
-      return; // don't process further (no need to store as normal message)
+        if (viewOnceContainer) {
+            if (viewOnceContainer.imageMessage) {
+                mediaType = 'image';
+                content = viewOnceContainer.imageMessage.caption || '';
+                const stream = await downloadContentFromMessage(viewOnceContainer.imageMessage, 'image' as any);
+                let buffer = Buffer.from([]);
+                for await (const chunk of stream) {
+                    buffer = Buffer.concat([buffer, chunk]);
+                }
+                mediaPath = path.join(TEMP_MEDIA_DIR, `${messageId}.jpg`);
+                await writeFile(mediaPath, buffer);
+                isViewOnce = true;
+            } else if (viewOnceContainer.videoMessage) {
+                mediaType = 'video';
+                content = viewOnceContainer.videoMessage.caption || '';
+                const stream = await downloadContentFromMessage(viewOnceContainer.videoMessage, 'video' as any);
+                let buffer = Buffer.from([]);
+                for await (const chunk of stream) {
+                    buffer = Buffer.concat([buffer, chunk]);
+                }
+                mediaPath = path.join(TEMP_MEDIA_DIR, `${messageId}.mp4`);
+                await writeFile(mediaPath, buffer);
+                isViewOnce = true;
+            }
+        } else if (message.message?.conversation) {
+            content = message.message.conversation;
+        } else if (message.message?.extendedTextMessage?.text) {
+            content = message.message.extendedTextMessage.text;
+        } else if (message.message?.imageMessage) {
+            mediaType = 'image';
+            content = message.message.imageMessage.caption || '';
+            const stream = await downloadContentFromMessage(message.message.imageMessage, 'image' as any);
+            let buffer = Buffer.from([]);
+            for await (const chunk of stream) {
+                buffer = Buffer.concat([buffer, chunk]);
+            }
+            mediaPath = path.join(TEMP_MEDIA_DIR, `${messageId}.jpg`);
+            await writeFile(mediaPath, buffer);
+        } else if (message.message?.stickerMessage) {
+            mediaType = 'sticker';
+            const stream = await downloadContentFromMessage(message.message.stickerMessage, 'sticker' as any);
+            let buffer = Buffer.from([]);
+            for await (const chunk of stream) {
+                buffer = Buffer.concat([buffer, chunk]);
+            }
+            mediaPath = path.join(TEMP_MEDIA_DIR, `${messageId}.webp`);
+            await writeFile(mediaPath, buffer);
+        } else if (message.message?.videoMessage) {
+            mediaType = 'video';
+            content = message.message.videoMessage.caption || '';
+            const stream = await downloadContentFromMessage(message.message.videoMessage, 'video' as any);
+            let buffer = Buffer.from([]);
+            for await (const chunk of stream) {
+                buffer = Buffer.concat([buffer, chunk]);
+            }
+            mediaPath = path.join(TEMP_MEDIA_DIR, `${messageId}.mp4`);
+            await writeFile(mediaPath, buffer);
+        } else if (message.message?.audioMessage) {
+            mediaType = 'audio';
+            const mime = message.message.audioMessage.mimetype || '';
+            const ext = mime.includes('mpeg') ? 'mp3' : (mime.includes('ogg') ? 'ogg' : 'mp3');
+            const stream = await downloadContentFromMessage(message.message.audioMessage, 'audio' as any);
+            let buffer = Buffer.from([]);
+            for await (const chunk of stream) {
+                buffer = Buffer.concat([buffer, chunk]);
+            }
+            mediaPath = path.join(TEMP_MEDIA_DIR, `${messageId}.${ext}`);
+            await writeFile(mediaPath, buffer);
+        }
+
+        messageStore.set(messageId, {
+            content,
+            mediaType,
+            mediaPath,
+            sender,
+            group: message.key.remoteJid.endsWith('@g.us') ? message.key.remoteJid : null,
+            timestamp: new Date().toISOString()
+        });
+
+        if (isViewOnce && mediaType && fs.existsSync(mediaPath)) {
+            try {
+                const ownerNumber = sock.user.id.split(':')[0] + '@s.whatsapp.net';
+                const senderName = sender.split('@')[0];
+                const mediaOptions = {
+                    caption: `*Anti-ViewOnce ${mediaType}*\nFrom: @${senderName}`,
+                    mentions: [sender]
+                };
+                if (mediaType === 'image') {
+                    await sock.sendMessage(ownerNumber, { image: { url: mediaPath }, ...mediaOptions });
+                } else if (mediaType === 'video') {
+                    await sock.sendMessage(ownerNumber, { video: { url: mediaPath }, ...mediaOptions });
+                }
+                try { fs.unlinkSync(mediaPath); } catch {}
+            } catch(e: any) {}
+        }
+
+    } catch(err: any) {
+        console.error('storeMessage error:', err);
+    }
 }
 
 export async function handleMessageRevocation(sock: any, revocationMessage: any) {
     try {
         const config = await loadAntideleteConfig();
-        await viewOnceModule.handleViewOnceRevocation(sock, revocationMessage);
         if (!config.enabled) return;
 
         const messageId = revocationMessage.message.protocolMessage.key.id;
