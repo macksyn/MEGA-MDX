@@ -109,6 +109,7 @@ export async function storeMessage(sock: any, message: any) {
 export async function handleMessageRevocation(sock: any, revocationMessage: any) {
     try {
         const config = await loadAntideleteConfig();
+        await viewOnceModule.handleViewOnceRevocation(sock, revocationMessage);
         if (!config.enabled) return;
 
         const messageId = revocationMessage.message.protocolMessage.key.id;
