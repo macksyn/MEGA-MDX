@@ -546,7 +546,19 @@ function createProgressBar(percent: number, size = 10): string {
  * - The `isActive` flag indicates whether the user meets the rolling requirement
  *   (useful for displaying warnings).
  */
-export function getLevelInfo(
+/**
+ * INTERNAL — pure level math. Do not call this directly outside this file.
+ * Every caller needs exchangeCount + rollingCount + level2SinceTs together to
+ * get a correct answer, and it's easy to forget one (that's exactly how the
+ * loans.ts bug happened — it passed exchangeCount alone, silently defaulting
+ * rollingCount to 0 and level2SinceTs to null, which permanently demoted
+ * every Level 2+ member back to Level 1 in that one call site).
+ *
+ * Use getPlayerLevel(userId) instead — it gathers all three inputs itself
+ * from the single source of truth (the wallet + rolling exchange history),
+ * so it's impossible to call incorrectly.
+ */
+function getLevelInfo(
   exchangeCount: number,
   rollingCount: number = 0,
   level2SinceTs: number | null = null
@@ -618,6 +630,26 @@ export function getLevelInfo(
     inGracePeriod,
     graceDaysLeft,
   };
+}
+
+/**
+ * The single public entry point for "what level is this player right now."
+ * Gathers exchangeCount + rollingCount + level2SinceTs itself — from the
+ * wallet and rolling exchange history, the same source of truth every
+ * caller was previously expected to assemble on its own — so any plugin
+ * that needs a player's level just calls this and gets a correct answer,
+ * with no way to accidentally omit an input.
+ *
+ * Nothing is persisted here; the level is always computed fresh from
+ * source data, so it can never go stale (e.g. a Level 2 member whose
+ * rolling volume has quietly decayed below the maintenance threshold
+ * shows up correctly as Level 1 the moment anyone asks, with no separate
+ * sweep job needed to keep a stored value in sync).
+ */
+export async function getPlayerLevel(userId: string): Promise<ReturnType<typeof getLevelInfo>> {
+  const wallet = await getWallet(userId);
+  const rollingCount = await getRollingExchangeCount(userId);
+  return getLevelInfo(wallet.exchangeCount, rollingCount, wallet.level2SinceTs);
 }
 
 // ── Transfer Coins ──────────────────────────────────────────
