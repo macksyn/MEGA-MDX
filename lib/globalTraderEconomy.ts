@@ -897,6 +897,9 @@ export interface Shipment {
   status: 'in_transit' | 'cleared_unsold' | 'seized' | 'sold';
   dutyPaid: number | null;
   bribePaid: number | null;
+  finePaid: number | null;       // seizure fine actually charged — folded into cost basis on eventual sale
+  seizedAt: number | null;       // timestamp of seizure; hold releases CLEARANCE_HOLD_HOURS after this
+  releasedFromSeizure: boolean;  // true once a formerly-seized shipment auto-releases, for UI/labeling
   quality: number;
   hub: string | null;
   soldAt: number | null;
@@ -1057,11 +1060,48 @@ export async function resolveEvent(
 // ── Shipment helpers ─────────────────────────────────────────────────
 
 async function getAllShipments(userId: string): Promise<Shipment[]> {
-  return (await shipmentsTbl.get(userId)) || [];
+  const all = (await shipmentsTbl.get(userId)) || [];
+  return releaseExpiredSeizures(userId, all);
 }
 
 async function saveShipments(userId: string, list: Shipment[]): Promise<void> {
   await shipmentsTbl.set(userId, list);
+}
+
+// RELEASE MECHANIC: a seized shipment isn't gone forever. Customs holds it
+// for CLEARANCE_HOLD_HOURS, then hands it back as cleared, sellable stock —
+// no re-clearance, no second duty payment, since the seizure fine (plus
+// whatever duty/bribe was already paid on a failed-bribe seizure) already
+// covers it. This is checked lazily on every read, the same way an
+// in-transit shipment becomes "awaiting_clearance" purely from elapsed
+// time with no scheduler involved — and persisted the instant it's
+// noticed, since sellGoods() reads shipment.status directly and needs the
+// DB, not just the computed progress, to say 'cleared_unsold'.
+//
+// Quality takes a hit (rough handling during the hold) but is never
+// increased — a shipment already degraded by a failed in-transit event
+// stays degraded. Tune RELEASE_QUALITY_CEILING to taste.
+const RELEASE_QUALITY_CEILING = 0.85;
+
+async function releaseExpiredSeizures(userId: string, all: Shipment[]): Promise<Shipment[]> {
+  const holdMs = CLEARANCE_HOLD_HOURS * 3600000;
+  let changed = false;
+
+  for (const shipment of all) {
+    if (shipment.status !== 'seized') continue;
+    const heldSince = shipment.seizedAt || 0;
+    if (Date.now() - heldSince < holdMs) continue;
+
+    shipment.status = 'cleared_unsold';
+    shipment.clearedAt = Date.now();
+    shipment.originalQty = shipment.qty; // full remaining qty is what's released
+    shipment.quality = Math.min(shipment.quality ?? 1, RELEASE_QUALITY_CEILING);
+    shipment.releasedFromSeizure = true;
+    changed = true;
+  }
+
+  if (changed) await saveShipments(userId, all);
+  return all;
 }
 
 function formatDuration(ms: number): string {
@@ -1085,8 +1125,22 @@ const TRANSIT_STAGES: Array<{ upTo: number; stage: string; label: string }> = [
 ];
 
 export async function getShipmentProgress(shipment: Shipment) {
-  if (shipment.status === 'cleared_unsold') return { stage: 'cleared_unsold', pct: 100, etaMs: 0, label: '✅ Cleared — ready to sell' };
-  if (shipment.status === 'seized') return { stage: 'seized', pct: 100, etaMs: 0, label: '❌ Seized' };
+  if (shipment.status === 'cleared_unsold') {
+    const label = shipment.releasedFromSeizure ? '✅ Released from customs hold — ready to sell' : '✅ Cleared — ready to sell';
+    return { stage: 'cleared_unsold', pct: 100, etaMs: 0, label };
+  }
+  if (shipment.status === 'seized') {
+    const holdMs = CLEARANCE_HOLD_HOURS * 3600000;
+    const elapsedHold = Date.now() - (shipment.seizedAt || 0);
+    if (elapsedHold < holdMs) {
+      const remaining = holdMs - elapsedHold;
+      return { stage: 'seized', pct: 100, etaMs: remaining, label: `❌ Seized — releases in ${formatDuration(remaining)}` };
+    }
+    // Hold has elapsed on a stale object (this shipment hasn't been re-fetched
+    // through getAllShipments yet to persist the release). Report it as
+    // already released so nothing displays a contradictory "still held" state.
+    return { stage: 'cleared_unsold', pct: 100, etaMs: 0, label: '✅ Released from customs hold — ready to sell' };
+  }
   if (shipment.status === 'sold') return { stage: 'sold', pct: 100, etaMs: 0, label: '🏪 Sold' };
 
   const elapsed = Date.now() - shipment.createdAt;
@@ -1212,6 +1266,9 @@ export async function sourceShipment(userId: string, countryKey: string, goodKey
     status: 'in_transit',
     dutyPaid: null,
     bribePaid: null,
+    finePaid: null,
+    seizedAt: null,
+    releasedFromSeizure: false,
     quality: 1.0,
     hub: null,
     soldAt: null,
@@ -1305,10 +1362,18 @@ export async function clearShipment(userId: string, shipmentId: string, opts: { 
     return { outcome: 'cleared', dutyPaid: duty, bribePaid: bribeCost, dutyPaidGroq, bribePaidGroq: Math.max(0, groqUpfront - dutyPaidGroq) };
   }
 
-  return seizeShipment(userId, all, idx, shipment);
+  // Duty + bribe were already deducted upfront before the roll — fold them
+  // into the seizure record so cost basis is correct once this releases.
+  return seizeShipment(userId, all, idx, shipment, { dutyAlreadyPaid: duty, bribeAlreadyPaid: bribeCost });
 }
 
-async function seizeShipment(userId: string, all: Shipment[], idx: number, shipment: Shipment) {
+async function seizeShipment(
+  userId: string,
+  all: Shipment[],
+  idx: number,
+  shipment: Shipment,
+  opts: { dutyAlreadyPaid?: number; bribeAlreadyPaid?: number } = {}
+) {
   const { agent } = await getEquipment(userId);
   const effectiveFineMult = Math.max(1.0, FINE_MULT - agent.fineMultReduction);
   const fine = Math.round(shipment.totalCost * effectiveFineMult);
@@ -1332,7 +1397,16 @@ async function seizeShipment(userId: string, all: Shipment[], idx: number, shipm
     renewalCost = renewal.success ? (renewal.cost || 0) : 0; // BUG FIX: this used to report `fine` here, not the actual renewal cost
   }
 
+  // RELEASE MECHANIC: not a dead end — see releaseExpiredSeizures(). Record
+  // what actually left the wallet here (fine always; duty+bribe too on a
+  // failed-bribe seizure, since that path charges upfront before the roll)
+  // so the eventual sale's cost basis reflects the real total spent, not
+  // just the original goods+freight cost.
   shipment.status = 'seized';
+  shipment.seizedAt = Date.now();
+  shipment.finePaid = finePaid.success ? fine : 0;
+  shipment.dutyPaid = opts.dutyAlreadyPaid || 0;
+  shipment.bribePaid = opts.bribeAlreadyPaid || 0;
   all[idx] = shipment;
   await saveShipments(userId, all);
 
@@ -1864,8 +1938,10 @@ export async function sellGoods(userId: string, shipmentId: string, hubKey: stri
     }
   }
 
-  // Cost basis includes trading commission (it reduces effective payout to player)
-  const costBasis = shipment.totalCost + (shipment.dutyPaid || 0) + (shipment.bribePaid || 0) + courierFee + holdingFee + tradingCommission;
+  // Cost basis includes trading commission (it reduces effective payout to
+  // player) and, for anything released from a seizure, the fine that was
+  // actually charged to get it back.
+  const costBasis = shipment.totalCost + (shipment.dutyPaid || 0) + (shipment.bribePaid || 0) + (shipment.finePaid || 0) + courierFee + holdingFee + tradingCommission;
   const profit = payout - costBasis;
   const marginPct = costBasis > 0 ? Math.round((profit / costBasis) * 100) : 0;
 
