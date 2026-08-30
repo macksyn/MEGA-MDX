@@ -454,6 +454,22 @@ async function runClearMenu(sock: any, message: any, chatId: string, userId: str
     return;
   }
 
+  // BUG FIX: clearShipment() can return outcome:'error' (bad shipment id,
+  // not ready yet, or — most commonly — not enough Groq Coins for duty)
+  // completely separately from outcome:'seized'. This used to fall through
+  // to the SEIZED branch below for BOTH cases, misreporting a simple
+  // "you can't afford the duty" error as "license expired, goods
+  // confiscated" — complete with a fake fine line and an undefined
+  // hold-hours line, even though nothing was actually charged or seized
+  // (the shipment stays at 'awaiting_clearance' on this path).
+  if (clearResult.outcome === 'error') {
+    await sock.sendMessage(chatId, {
+      text: `${header()}\n❌ ${clearResult.reason || 'Could not clear that shipment.'}\n\n_Nothing was charged — try again once you're able to cover it._`,
+      edit: sent.key,
+    });
+    return;
+  }
+
   const renewalMsg = clearResult.renewalSucceeded
     ? `✅ License renewed (forced)\n${deltaLine(-clearResult.forcedRenewalCost, 'groqCoins')}`
     : `⚠️ License renewal failed — you must renew manually.`;
