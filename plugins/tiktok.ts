@@ -38,7 +38,7 @@ async function fetchPrimaryApi(url: string) {
 
 /** Fallback API (JawadTech) – used only when the primary fails */
 async function fetchFallbackApi(url: string) {
-  const apiUrl = `https://jawad-tech.vercel.app/download/ttdl?url=${encodeURIComponent(url)}`;
+  const apiUrl = `https://jawad-tech.vercel.app/download/tiktok?url=${encodeURIComponent(url)}`;
   
   // Accept all HTTP status codes so we can read the JSON error message
   const { data } = await axios.get(apiUrl, {
