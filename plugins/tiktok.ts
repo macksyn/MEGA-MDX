@@ -3,35 +3,45 @@ import axios from 'axios';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Use the primary discardapi for any TikTok link */
+/** Malvin tiktokio wrapper — current primary source for TikTok links */
 async function fetchPrimaryApi(url: string) {
-  const apiUrl = `https://discardapi.onrender.com/api/dl/tiktok?apikey=guru&url=${encodeURIComponent(url)}`;
+  const apiUrl = `https://api.malvin.gleeze.com/api/download/tiktokio?url=${encodeURIComponent(url)}&apikey=malvin-2jlQ1pnPfogmXHjlVBUnzgWLHtDLoLXmuVojOdvh`;
   const { data } = await axios.get(apiUrl, {
     timeout: 45000,
-    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': '*/*'
+    }
   });
 
-  if (!data?.status || !data?.result) throw new Error('Invalid API response');
+  if (!data?.status || !data?.data) throw new Error('Invalid API response');
 
-  const res = data.result;
-  const hd   = res.data.find((v: any) => v.type === 'nowatermark_hd');
-  const noWm = res.data.find((v: any) => v.type === 'nowatermark');
-  const videoUrl = hd?.url || noWm?.url;
+  const res    = data.data;
+  const medias: any[] = Array.isArray(res.medias) ? res.medias : [];
+  const video  = medias.find((m: any) => m.type === 'video');
+  if (!video) throw new Error('No downloadable video found');
+
+  // download_url (tiktokio's own proxy) has come back clean in testing;
+  // direct_url occasionally has corrupted trailing bytes on some CDN
+  // mirrors, so it's only used as a fallback, not the first choice.
+  const videoUrl = video.download_url || video.direct_url;
   if (!videoUrl) throw new Error('No downloadable video found');
 
+  // This API only returns media links, a thumbnail, and an (often null)
+  // title — no author/stats/sound metadata — so those fields default out.
   return {
     videoUrl,
-    isHd:      !!hd,
-    author:    res.author.nickname,
-    username:  res.author.fullname,
-    region:    res.region,
-    duration:  res.duration,
-    likes:     res.stats.likes,
-    comments:  res.stats.comment,
-    shares:    res.stats.share,
-    views:     res.stats.views,
-    sound:     res.music_info.title,
-    posted:    res.taken_at,
+    isHd:      /hd/i.test(video.quality ?? ''),
+    author:    'Unknown',
+    username:  'Unknown',
+    region:    'N/A',
+    duration:  'N/A',
+    likes:     0,
+    comments:  0,
+    shares:    0,
+    views:     0,
+    sound:     'N/A',
+    posted:    'N/A',
     title:     res.title || 'No caption'
   };
 }
