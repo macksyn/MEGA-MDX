@@ -85,10 +85,21 @@ export default {
   async handler(sock: any, message: any, args: any, context: BotContext) {
     const { chatId, rawText } = context;
 
-    const prefix      = rawText.match(/^[.!#]/)?.[0] || '.';
-    const commandPart = rawText.slice(prefix.length).trim();
-    const parts       = commandPart.split(/\s+/);
-    const url         = parts.slice(1).join(' ').trim();
+    // The URL is passed explicitly via `args` by every delegating caller
+    // (download.ts sends `[normalized]`, group-autodownload.ts goes through
+    // download.ts). Trust that first instead of re-deriving it from rawText.
+    let url = Array.isArray(args) && args.length > 0
+      ? args.join(' ').trim()
+      : '';
+
+    // Fallback: pull the first URL out of rawText with a real URL regex.
+    // Works whether rawText is a full command (".tiktok <url>") or a bare
+    // link — unlike the old "slice off prefix + first word" approach, which
+    // assumed rawText always had the shape "<prefix><command> <url>" and
+    // silently mangled anything that didn't (e.g. auto-downloaded bare links).
+    if (!url && rawText) {
+      url = rawText.match(/https?:\/\/\S+/i)?.[0] ?? '';
+    }
 
     if (!url) {
       return await sock.sendMessage(chatId, {
