@@ -346,6 +346,11 @@ const TEMPERATURE_BY_INTENT: Record<ChatIntent, number> = {
     realtime:   0.3
 };
 
+// A bare acknowledgment/thanks isn't banter that benefits from personality
+// variance — it's a one-line close. Lower and steadier than casual (0.8) so
+// it doesn't wander into re-explaining things.
+const CLOSING_REMARK_TEMPERATURE = 0.5;
+
 const apiStats: Record<string, { count: number; lastFailAt: number; lastSuccessAt: number }> = {};
 GROQ_MODELS.forEach(m => {
     apiStats[m.name] = { count: 0, lastFailAt: 0, lastSuccessAt: 0 };
@@ -467,6 +472,53 @@ function isNegative(text: string): boolean {
     return /^\s*(no|nope|nah|nah+|not (right|correct|me|really)|wrong|that'?s (wrong|not (right|me))|different|change it|incorrect)\b/i.test(text.trim());
 }
 
+// ── Closing-remark detector ───────────────────────────────────────────────────
+// Bare acknowledgments, reactions, and short thanks — "ok", "yeah", "for
+// real", "🙏", "thanks I appreciate". A real person replies to these with a
+// short line and moves on; the bot was instead treating them like any other
+// message and re-explaining or re-emphasizing whatever was just discussed
+// (including tacking on "in case it happens again"-style caveats nobody
+// asked for). This is intentionally narrow — it only fires when the WHOLE
+// message is a closing remark, never on a short question ("ok but why").
+// Add more phrases (e.g. pidgin your group actually uses) to these lists as
+// you notice them.
+const CLOSING_ACK_PHRASES = [
+    'ok', 'okay', 'k', 'kk', 'okie', 'alright', 'aight', 'alr', 'true', 'word', 'bet',
+    'say less', 'fr', 'frfr', 'for real', 'facts', 'deadass', 'yeah', 'yea', 'yeh', 'yh',
+    'yep', 'yup', 'ya', 'mhm', 'nice', 'cool', 'noted', 'got it', 'gotcha', 'i see', 'ic',
+    'makes sense', 'fair enough', 'lol', 'lmao', 'lmaoo', 'lool', 'haha', 'hahaha', 'hehe'
+];
+const CLOSING_THANKS_PHRASES = [
+    'thanks', 'thank you', 'thank u', 'thanks a lot', 'thanks alot', 'thanks so much',
+    'thank you so much', 'appreciate it', 'appreciate that', 'i appreciate', 'i appreciate it',
+    'i appreciate that', 'tysm', 'ty', 'much appreciated', 'appreciated', 'thank you very much'
+];
+
+function normalizeForClosingCheck(text: string): string {
+    return text.trim().toLowerCase().replace(/[.!?,~]+$/g, '').replace(/\s+/g, ' ').trim();
+}
+
+/** True only if the ENTIRE message is a bare acknowledgment/reaction/thanks — never a new question. */
+function isClosingRemark(text: string): boolean {
+    const raw = text.trim();
+    if (!raw) return false;
+    if (raw.includes('?')) return false;
+
+    // Emoji/symbol-only message (no letters anywhere) — a reaction, not a question.
+    if (!/\p{L}/u.test(raw)) return true;
+
+    const t = normalizeForClosingCheck(raw);
+    if (CLOSING_ACK_PHRASES.includes(t)) return true;
+
+    const thanksMatch = CLOSING_THANKS_PHRASES.find(p => t === p || t.startsWith(p + ' '));
+    if (thanksMatch) {
+        // "thank you so much man" is still just thanks; "thanks but can you
+        // also..." is a new ask riding along with it — don't short-circuit that.
+        return !/\b(but|also|however|and|can you|could you|what about)\b/.test(t);
+    }
+    return false;
+}
+
 /**
  * Try to pull a name out of a short reply during name-collection flow.
  * Works for formal patterns ("My name is X") and bare short replies ("just call me Tunde").
@@ -553,7 +605,7 @@ function requiresLiveData(message: string): boolean {
 function buildPrompt(
     userMessage: string,
     userInfo: Record<string, any>
-): { systemPrompt: string; intent: ChatIntent } {
+): { systemPrompt: string; intent: ChatIntent; closingRemark: boolean } {
     const info = userInfo || {};
 
     const nameLine = info.name
@@ -570,14 +622,22 @@ function buildPrompt(
         ? `Quoted follow-up context: the user is replying to a previous bot message: "${info.quotedContext.substring(0, 80)}". Treat pronouns like "that", "him", "her", "it", or "they" as references to this quoted message when relevant. Answer as a direct follow-up to that exchange, not as a new topic. `
         : '';
 
+    // BUG FIX: a bare "okay" / "yeah" / "thanks I appreciate" used to go
+    // through the exact same intent/confidence/clarification/consistency
+    // scaffolding as a real question — which is exactly why the bot kept
+    // re-explaining itself or tacking on unsolicited "just in case" follow-ups
+    // onto a simple acknowledgment. Detect it up front and skip all of that
+    // in favour of one direct instruction.
+    const closingRemark = isClosingRemark(userMessage);
+
     const intent            = classifyIntent(userMessage);
     const confidence        = getConfidenceLevel(userMessage);
     const clarification     = getClarificationHint(intent, confidence);
-    const needsWeb          = requiresLiveData(userMessage) || intent === 'realtime';
+    const needsWeb          = !closingRemark && (requiresLiveData(userMessage) || intent === 'realtime');
     const webInstruction    = needsWeb
         ? 'IMPORTANT: This question requires current real-time information — search the web before responding. Do not guess. '
         : '';
-    const intentInstruction = getIntentInstruction(intent);
+    const intentInstruction = closingRemark ? '' : getIntentInstruction(intent);
     // FIX: repeated questions were "drifting" — the model had no instruction
     // to check its own prior answers, so identical questions asked minutes
     // apart could get different facts each time. Point it at the history
@@ -586,20 +646,29 @@ function buildPrompt(
     // actually confident about, not stubbornness on facts you got wrong. If
     // a fresh search turns up different/better information, or you can tell
     // the earlier answer was a mistake, correct it plainly instead of
-    // repeating the error.
-    const consistencyLine =
+    // repeating the error. Skipped entirely for a closing remark — there's no
+    // question to be consistent about, and the instruction itself nudges the
+    // model to go re-read "Recent Chat," which is the opposite of what we want.
+    const consistencyLine = closingRemark ? '' :
         'If "Recent Chat" above shows you already answered this same or a very similar question, ' +
         'stay consistent — don\'t restate it differently just for variety, and don\'t contradict yourself ' +
         'for no reason. But if you now have better information, or you can tell your earlier answer was ' +
         'actually wrong, correct it plainly like a person admitting a mistake — don\'t repeat an error just ' +
         'to seem consistent. ';
 
+    const closingInstruction = closingRemark
+        ? 'The user just sent a brief acknowledgment, reaction, or thanks — not a new question or topic. ' +
+          'Reply the way a real person texting back would: one short line, or just an emoji. Do NOT recap ' +
+          'or re-explain anything you just said, do NOT restate the topic "just in case," and do NOT add ' +
+          'unrelated follow-up advice. '
+        : '';
+
     const systemPrompt =
-        'You are a wise, super intelligent and straight forward human in GHQ WhatsApp group. Name: Groq. ' +
+        'You are a smart, laconic, honest and direct guy in GHQ WhatsApp group. Name: Groq. ' +
         'Keep replies to 1-7 lines max, emojis ok. Always reply in English. ' +
         'You live in Lagos, Nigeria. ' +
         intentInstruction + ' ' +
-        `Confidence: ${confidence}. ${clarification} ` +
+        (closingRemark ? '' : `Confidence: ${confidence}. ${clarification} `) +
         'Match the energy of whoever you\'re talking to — chill and warm for greetings, ' +
         'sarcastic when they\'re joking, savage when they\'re rude, supportive when they\'re down. ' +
         'Explain deeply when a curiosity is shown, but don\'t over-explain. ' +
@@ -610,9 +679,10 @@ function buildPrompt(
         quotedContextLine +
         memoryLine + ' ' +
         webInstruction +
+        closingInstruction +
         consistencyLine;
 
-    return { systemPrompt, intent };
+    return { systemPrompt, intent, closingRemark };
 }
 
 // ── Context block builder ─────────────────────────────────────────────────────
@@ -660,7 +730,8 @@ async function callGroq(
     modelEntry: typeof GROQ_MODELS[number],
     systemPrompt: string,
     contextBlock: string,
-    temperature: number
+    temperature: number,
+    maxTokens: number = 500
 ): Promise<{ text: string }> {
     if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY is not set');
 
@@ -682,7 +753,7 @@ async function callGroq(
                     { role: 'user',   content: contextBlock }
                 ],
                 temperature,
-                max_completion_tokens: 500,
+                max_completion_tokens: maxTokens,
                 // Compound systems can auto-append web-search citations; we want
                 // short, clean WhatsApp replies rather than footnoted answers.
                 citation_options: 'disabled'
@@ -738,8 +809,14 @@ async function getAIResponse(
     _chatId: string,
     _senderId: string
 ): Promise<string | null> {
-    const { systemPrompt, intent } = buildPrompt(userMessage, userContext.userInfo);
-    const temperature = TEMPERATURE_BY_INTENT[intent];
+    const { systemPrompt, intent, closingRemark } = buildPrompt(userMessage, userContext.userInfo);
+    const temperature = closingRemark ? CLOSING_REMARK_TEMPERATURE : TEMPERATURE_BY_INTENT[intent];
+    // OPT: a real closing line never needs anywhere near 500 tokens — capping
+    // it here is a second, harder guarantee of brevity on top of the prompt
+    // instruction (which the model can still ignore), and it cuts real cost:
+    // acknowledgments/thanks are a big share of chatbot turns in an active
+    // group, so this is the single cheapest optimization in this file.
+    const maxTokens = closingRemark ? 60 : 500;
 
     const compressed  = compressHistory(userContext.messages, 6);
     const contextBlock = buildContextBlock(
@@ -769,9 +846,9 @@ async function getAIResponse(
     // compound-mini only if the primary actually fails.
     for (const modelEntry of healthyModels) {
         try {
-            const result = await callGroq(modelEntry, systemPrompt, contextBlock, temperature);
+            const result = await callGroq(modelEntry, systemPrompt, contextBlock, temperature, maxTokens);
             recordSuccess(modelEntry.name);
-            console.log(`[GROQ] ${modelEntry.name} responded (intent=${intent}, temp=${temperature})`);
+            console.log(`[GROQ] ${modelEntry.name} responded (intent=${intent}, temp=${temperature}, closing=${closingRemark}, maxTokens=${maxTokens})`);
             return cleanResponse(result.text);
         } catch (err: any) {
             recordFailure(modelEntry.name);
