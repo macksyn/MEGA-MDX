@@ -103,7 +103,16 @@ const cacheLastAccessed  = new Map<string, number>();
 // doesn't drag a stale, finished conversation into a new one.
 const SESSION_GAP_HOURS       = Number(process.env.CHATBOT_SESSION_GAP_HOURS) || 4;
 const SESSION_GAP_MS          = SESSION_GAP_HOURS * 60 * 60 * 1000;
-const GROUP_SESSION_GAP_HOURS = Number(process.env.CHATBOT_GROUP_SESSION_GAP_HOURS) || SESSION_GAP_HOURS;
+// BUG FIX: this used to default to SESSION_GAP_HOURS (4h), the same window as
+// a single person's own memory. But the group thread logs EVERY member's
+// exchange with the bot — a topic one person raised (e.g. a health
+// complaint) stayed "live" and eligible to bleed into a totally different
+// member's unrelated message for up to 4 hours. A room's live topic goes
+// stale much faster than one person's own conversation does, so this now
+// defaults to 20 minutes and is decoupled from the personal gap. Still
+// overridable via the same env var (in hours) if a group genuinely wants a
+// longer shared-context window.
+const GROUP_SESSION_GAP_HOURS = Number(process.env.CHATBOT_GROUP_SESSION_GAP_HOURS) || (20 / 60);
 const GROUP_SESSION_GAP_MS    = GROUP_SESSION_GAP_HOURS * 60 * 60 * 1000;
 
 // FIX: history turns used to be hard-truncated to 80 chars at SAVE time, on
@@ -260,6 +269,18 @@ async function saveHistory(senderId: string, chatId: string, messages: string[])
 async function clearHistory(senderId: string, chatId: string): Promise<void> {
     const key = historyKey(senderId, chatId);
     historyCache.delete(key);
+    await dbHistory.del(key);
+}
+
+// BUG FIX: there was previously no way to wipe the shared group-wide thread
+// short of waiting out GROUP_SESSION_GAP_MS. That's what let a stuck topic
+// (e.g. "no one has cramps") keep circulating — every attempt to tell the
+// bot to drop it necessarily re-mentioned it, which just added a fresh turn
+// back into the same shared thread. .chatbot reset (no @mention) now calls
+// this to clear it immediately. No historyCache entry to clean up here —
+// group history is never cached in memory (see saveGroupHistory).
+async function clearGroupHistory(chatId: string): Promise<void> {
+    const key = groupHistoryKey(chatId);
     await dbHistory.del(key);
 }
 
@@ -822,19 +843,6 @@ export async function handleChatbotResponse(
             }
         }
 
-        // ── OPT 1: use TTL-cached groupMetadata (10-minute window) ──────────
-        // Avoids a live WA network fetch on every chatbot message. The cache is
-        // invalidated immediately by invalidateGroupMetaCache() on participant
-        // updates so kicks/joins are still reflected promptly.
-        const groupMeta = await getCachedGroupMeta(sock, chatId);
-        const memberNames = (groupMeta?.participants || [])
-            .map((p: any) => p?.notify || p?.name || p?.subject || p?.id)
-            .filter(Boolean)
-            .slice(0, 10);
-        const groupLabel = memberNames.length
-            ? `Group context: this chat includes ${memberNames.join(', ')}. Keep replies anchored to the current topic and the member asking the question.`
-            : 'Group context: this is a group chat. Keep replies anchored to the current topic and the person asking the question.';
-
         // Grudge check
         const activeGrudge = await getGrudge(chatId, senderId, profileCache);
         if (activeGrudge) {
@@ -846,11 +854,6 @@ export async function handleChatbotResponse(
         //    that removes it is always reachable, even if startTyping() throws. ──
         try {
             processingLock.add(senderId);
-
-            if (processingLock.size > 1 && processingLock.has(senderId)) {
-                // senderId was already in the lock before we added it — concurrent call
-                // Note: Set.add is idempotent, so check before adding instead
-            }
 
             // Insult detection
             const insult = detectInsult(cleanedMessage);
@@ -878,7 +881,16 @@ export async function handleChatbotResponse(
             // Normal flow
             const sharedMessages = await loadGroupHistory(chatId);
             const userMessages   = await loadHistory(senderId, chatId);
-            const messages       = [...sharedMessages, ...userMessages].slice(-8);
+            // BUG FIX: sharedMessages is every member's recent exchange with the
+            // bot in this group, not just this sender's. It used to be
+            // concatenated in uncapped, so a sender with little or no personal
+            // history (e.g. someone just saying "hi") got their context window
+            // filled almost entirely by whatever someone else last discussed —
+            // that's how one member's topic kept showing up in everyone else's
+            // replies. Cap the shared slice to the last exchange and always put
+            // it before the sender's own history, so their own turns are never
+            // the ones dropped by the slice(-8) budget below.
+            const messages = [...sharedMessages.slice(-2), ...userMessages].slice(-8);
 
             // ── Name resolution: WhatsApp first name takes priority ───────────
             // 1. Try to extract a clean first name from WhatsApp's pushName.
@@ -993,6 +1005,22 @@ export async function handleChatbotResponse(
 
             await saveProfile(senderId, profile);
 
+            // ── OPT 1: use TTL-cached groupMetadata (10-minute window) ──────────
+            // Moved here (was computed at the top of the handler) so grudge-
+            // silenced, insult, thaw, and name-collection turns — which all
+            // return before this point — never pay for it. Avoids a live WA
+            // network fetch on every chatbot message; invalidateGroupMetaCache()
+            // still clears it immediately on group-participants.update so
+            // kicks/joins are reflected promptly.
+            const groupMeta = await getCachedGroupMeta(sock, chatId);
+            const memberNames = (groupMeta?.participants || [])
+                .map((p: any) => p?.notify || p?.name || p?.subject || p?.id)
+                .filter(Boolean)
+                .slice(0, 10);
+            const groupLabel = memberNames.length
+                ? `Group context: this chat includes ${memberNames.join(', ')}. Keep replies anchored to the current topic and the member asking the question.`
+                : 'Group context: this is a group chat. Keep replies anchored to the current topic and the person asking the question.';
+
             // Typing starts BEFORE the API call
             await startTyping(sock, chatId);
 
@@ -1075,7 +1103,8 @@ export default {
                     `• \`.chatbot stats\` — API health & memory stats\n` +
                     `• \`.chatbot pardon @user\` — Lift a grudge early\n` +
                     `• \`.chatbot grudges\` — List active grudges in this group\n` +
-                    `• \`.chatbot reset @user\` — Clear a user's conversation history\n` +
+                    `• \`.chatbot reset\` — Clear this group's shared conversation context\n` +
+                    `• \`.chatbot reset @user\` — Clear one user's own conversation history\n` +
                     `• \`.chatbot history @user\` — View a user's stored context\n\n` +
                     `*How it works:*\n` +
                     `When enabled, bot responds when mentioned or replied to.\n` +
@@ -1123,7 +1152,13 @@ export default {
         if (match.startsWith('reset')) {
             const mentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
             if (!mentioned) {
-                return sock.sendMessage(chatId, { text: '❌ Mention the user to reset. Example: `.chatbot reset @username`' }, { quoted: message });
+                // No @mention — clear the shared group-wide thread rather than
+                // erroring. This is the escape hatch for a topic that's gotten
+                // stuck and is bleeding into everyone's replies.
+                await clearGroupHistory(chatId);
+                return sock.sendMessage(chatId, {
+                    text: `✅ *Shared group context cleared.*\n\nThe bot has forgotten what was being discussed in this group. Add \`@user\` (\`.chatbot reset @user\`) to also clear one person's own history.`
+                }, { quoted: message });
             }
             await clearHistory(mentioned, chatId);
             const tag = `@${mentioned.split('@')[0]}`;
