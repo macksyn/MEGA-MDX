@@ -343,7 +343,7 @@ const CHATGPT_API_URL       = process.env.CHATGPT_API_URL ?? 'https://api.malvin
 // Falls back to the key from the API's own docs if CHATGPT_API_KEY isn't set.
 // Swap in your own key via env so you're not sharing rate limits with every
 // other default-key user.
-const CHATGPT_API_KEY       = process.env.CHATGPT_API_KEY ?? 'malvin-y1nmK2jX0yCvtUYishEi1DXRKHmXBPJdsNT3DOIY';
+const CHATGPT_API_KEY       = process.env.CHATGPT_API_KEY ?? 'malvin-2LxgoPMYhJx1KyFHkC0T6acThSq1JoBVnS65cFng';
 const PRIMARY_PROVIDER_NAME = 'chatgpt-luna';
 
 interface ChatGPTAuth {
