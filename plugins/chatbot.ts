@@ -219,7 +219,9 @@ function groupHistoryKey(chatId: string): string {
 
 // Stored shape is now { messages, updatedAt } instead of a bare array, so we
 // can tell how long ago a thread last had a turn added to it.
-interface StoredHistory { messages: string[]; updatedAt: number }
+// gptThread is optional and only ever set on a personal (per-sender) record —
+// see loadGptThread/saveGptThread below. Group records never carry one.
+interface StoredHistory { messages: string[]; updatedAt: number; gptThread?: ChatGPTThread }
 
 function normalizeStoredHistory(raw: any): StoredHistory {
     if (Array.isArray(raw)) {
@@ -233,7 +235,8 @@ function normalizeStoredHistory(raw: any): StoredHistory {
     if (raw && typeof raw === 'object' && Array.isArray(raw.messages)) {
         return {
             messages:  raw.messages,
-            updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now()
+            updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
+            gptThread: raw.gptThread ?? undefined
         };
     }
     return { messages: [], updatedAt: 0 };
@@ -263,7 +266,28 @@ async function saveHistory(senderId: string, chatId: string, messages: string[])
     const key = historyKey(senderId, chatId);
     cacheLastAccessed.set(senderId, Date.now());
     historyCache.set(key, messages);
-    await dbHistory.set(key, { messages, updatedAt: Date.now() } as any);
+    // This write must not clobber a ChatGPT thread saved separately by
+    // saveGptThread (below) under the same key — re-read and carry it forward.
+    const gptThread = normalizeStoredHistory(await dbHistory.get(key)).gptThread;
+    await dbHistory.set(key, { messages, updatedAt: Date.now(), ...(gptThread ? { gptThread } : {}) } as any);
+}
+
+// ── ChatGPT thread continuity ─────────────────────────────────────────────────
+// Stored inside the same personal-history record (keyed by historyKey) so it
+// expires on exactly the same session-gap rule as the rest of that thread —
+// a stale thread just means the next turn starts a fresh ChatGPT conversation.
+async function loadGptThread(senderId: string, chatId: string): Promise<ChatGPTThread | null> {
+    const key = historyKey(senderId, chatId);
+    const { updatedAt, gptThread } = normalizeStoredHistory(await dbHistory.get(key));
+    if (!gptThread) return null;
+    if (Date.now() - updatedAt > SESSION_GAP_MS) return null;
+    return gptThread;
+}
+
+async function saveGptThread(senderId: string, chatId: string, thread: ChatGPTThread): Promise<void> {
+    const key      = historyKey(senderId, chatId);
+    const existing = normalizeStoredHistory(await dbHistory.get(key));
+    await dbHistory.set(key, { ...existing, gptThread: thread, updatedAt: Date.now() } as any);
 }
 
 async function clearHistory(senderId: string, chatId: string): Promise<void> {
@@ -307,25 +331,42 @@ async function saveGroupHistory(chatId: string, messages: string[]): Promise<voi
     // No historyCache entry for group keys — group history is always fetched from DB.
 }
 
-// ── Groq API config ───────────────────────────────────────────────────────────
-// Single provider now: Groq's Compound system (built-in web search + code
-// execution, no more juggling three flaky third-party proxies). We keep a
-// primary/fallback pair so the existing health-tracking/circuit-breaker logic
-// still has something useful to do if the primary compound model is degraded.
+// ── AI provider config ────────────────────────────────────────────────────────
+// Primary: a ChatGPT-backed proxy (malvin) with true multi-turn threading —
+// it returns a chatId + auth blob that gets passed back on the next call to
+// continue the same remote conversation, and it decides on its own when to
+// use its built-in web search. Fallback: Groq's compound-mini, kept so the
+// existing health-tracking/circuit-breaker logic still has something to fall
+// back to if the primary is degraded.
+
+const CHATGPT_API_URL       = process.env.CHATGPT_API_URL ?? 'https://api.malvin.gleeze.com/api/ai/chatgpt';
+// Falls back to the key from the API's own docs if CHATGPT_API_KEY isn't set.
+// Swap in your own key via env so you're not sharing rate limits with every
+// other default-key user.
+const CHATGPT_API_KEY       = process.env.CHATGPT_API_KEY ?? 'malvin-y1nmK2jX0yCvtUYishEi1DXRKHmXBPJdsNT3DOIY';
+const PRIMARY_PROVIDER_NAME = 'chatgpt-luna';
+
+interface ChatGPTAuth {
+    cookie:          string;
+    deviceId:        string;
+    parentMessageId: string;
+}
+
+// Follow-up (continuing) requests POST { prompt, chatId, auth: { cookie,
+// deviceId, parentMessageId } } — the same shape the first response returns,
+// echoed straight back. Confirmed against the API's own follow-up example.
+interface ChatGPTThread {
+    chatId: string;
+    auth:   ChatGPTAuth;
+}
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY ?? '';
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
-const GROQ_MODELS = [
-    {
-        name:  'groq/compound',       // primary — multi-tool-call agentic model
-        model: process.env.GROQ_MODEL ?? 'groq/compound'
-    },
-    {
-        name:  'groq/compound-mini',  // fallback — single-tool-call, lower latency
-        model: process.env.GROQ_FALLBACK_MODEL ?? 'groq/compound-mini'
-    }
-];
+const FALLBACK_MODEL = {
+    name:  'groq/compound-mini',
+    model: process.env.GROQ_FALLBACK_MODEL ?? 'groq/compound-mini'
+};
 
 const API_FAILURE_RESET_MS = 5 * 60 * 1000;
 const API_SKIP_THRESHOLD   = 3;
@@ -352,8 +393,8 @@ const TEMPERATURE_BY_INTENT: Record<ChatIntent, number> = {
 const CLOSING_REMARK_TEMPERATURE = 0.5;
 
 const apiStats: Record<string, { count: number; lastFailAt: number; lastSuccessAt: number }> = {};
-GROQ_MODELS.forEach(m => {
-    apiStats[m.name] = { count: 0, lastFailAt: 0, lastSuccessAt: 0 };
+[PRIMARY_PROVIDER_NAME, FALLBACK_MODEL.name].forEach(name => {
+    apiStats[name] = { count: 0, lastFailAt: 0, lastSuccessAt: 0 };
 });
 
 setInterval(() => {
@@ -727,7 +768,7 @@ function buildContextBlock(
 // ── Single Groq call ──────────────────────────────────────────────────────────
 
 async function callGroq(
-    modelEntry: typeof GROQ_MODELS[number],
+    modelEntry: typeof FALLBACK_MODEL,
     systemPrompt: string,
     contextBlock: string,
     temperature: number,
@@ -775,6 +816,69 @@ async function callGroq(
     }
 }
 
+// ── Single ChatGPT (malvin) call ──────────────────────────────────────────────
+
+async function callChatGPT(
+    prompt: string,
+    thread?: ChatGPTThread
+): Promise<{ text: string; thread: ChatGPTThread | null }> {
+    const controller = new AbortController();
+    // Third-party proxy in front of ChatGPT — give it more room than the
+    // direct Groq call before we give up and fall back.
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    try {
+        const body: Record<string, any> = { prompt };
+        if (thread) {
+            // Confirmed shape — see the note on ChatGPTThread above.
+            body.chatId = thread.chatId;
+            body.auth   = thread.auth;
+        }
+        const url = `${CHATGPT_API_URL}?apikey=${encodeURIComponent(CHATGPT_API_KEY)}`;
+        const response = await fetch(url, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify(body),
+            signal:  controller.signal
+        });
+        clearTimeout(timeoutId);
+        if (!response.ok) {
+            const errBody = await response.text().catch(() => '');
+            throw new Error(`HTTP ${response.status}${errBody ? `: ${errBody.slice(0, 200)}` : ''}`);
+        }
+        const data = await response.json() as any;
+        if (data?.status !== true) {
+            throw new Error(`API returned status:false${data?.msg ? ` — ${data.msg}` : ''}`);
+        }
+        const text = data?.data?.text;
+        if (typeof text !== 'string' || !text.trim()) throw new Error('Empty response from ChatGPT API');
+
+        // Continuation data is best-effort: if it's missing/malformed we still
+        // return the text (the reply still goes out) and just don't persist a
+        // thread — the next turn simply starts a fresh conversation instead
+        // of failing outright.
+        let nextThread: ChatGPTThread | null = null;
+        const nextChatId = data?.data?.chatId;
+        const nextAuth    = data?.data?.auth;
+        if (nextChatId && nextAuth?.cookie && nextAuth?.deviceId && nextAuth?.parentMessageId) {
+            nextThread = {
+                chatId: nextChatId,
+                auth: {
+                    cookie:          nextAuth.cookie,
+                    deviceId:        nextAuth.deviceId,
+                    parentMessageId: nextAuth.parentMessageId
+                }
+            };
+        } else {
+            console.log('[CHATGPT] Response missing continuation data — next turn will start a fresh thread');
+        }
+
+        return { text, thread: nextThread };
+    } catch (err) {
+        clearTimeout(timeoutId);
+        throw err;
+    }
+}
+
 // ── Response cleaner ──────────────────────────────────────────────────────────
 
 function cleanResponse(text: string): string {
@@ -806,8 +910,8 @@ function cleanResponse(text: string): string {
 async function getAIResponse(
     userMessage: string,
     userContext: { messages: string[]; userInfo: Record<string, any> },
-    _chatId: string,
-    _senderId: string
+    chatId: string,
+    senderId: string
 ): Promise<string | null> {
     const { systemPrompt, intent, closingRemark } = buildPrompt(userMessage, userContext.userInfo);
     const temperature = closingRemark ? CLOSING_REMARK_TEMPERATURE : TEMPERATURE_BY_INTENT[intent];
@@ -816,9 +920,11 @@ async function getAIResponse(
     // instruction (which the model can still ignore), and it cuts real cost:
     // acknowledgments/thanks are a big share of chatbot turns in an active
     // group, so this is the single cheapest optimization in this file.
+    // (Groq fallback only — the ChatGPT proxy call below has no token-limit
+    // parameter in its documented request shape.)
     const maxTokens = closingRemark ? 60 : 500;
 
-    const compressed  = compressHistory(userContext.messages, 6);
+    const compressed   = compressHistory(userContext.messages, 6);
     const contextBlock = buildContextBlock(
         compressed.summary || null,
         compressed.recent,
@@ -834,29 +940,41 @@ async function getAIResponse(
         apiStats[name].lastFailAt = Date.now();
     };
 
-    const healthyModels = GROQ_MODELS.filter(m => isApiHealthy(m.name));
-    if (healthyModels.length === 0) {
-        console.error('[GROQ] No healthy models available');
-        return null;
-    }
-
-    // Sequential primary → fallback. Groq is fast enough on its own that
-    // racing multiple models in parallel just burns extra rate-limit quota
-    // for no real latency win — try compound first, fall back to
-    // compound-mini only if the primary actually fails.
-    for (const modelEntry of healthyModels) {
+    // ── Primary: ChatGPT (malvin proxy) ─────────────────────────────────────
+    // Same system prompt + compressed context every turn (keeps the group-
+    // context mixing above intact); the stored chatId/auth just layers the
+    // provider's own thread memory on top as a bonus when one exists.
+    if (isApiHealthy(PRIMARY_PROVIDER_NAME)) {
         try {
-            const result = await callGroq(modelEntry, systemPrompt, contextBlock, temperature, maxTokens);
-            recordSuccess(modelEntry.name);
-            console.log(`[GROQ] ${modelEntry.name} responded (intent=${intent}, temp=${temperature}, closing=${closingRemark}, maxTokens=${maxTokens})`);
+            const existingThread = await loadGptThread(senderId, chatId);
+            const prompt = `${systemPrompt}\n\n${contextBlock}`;
+            const result = await callChatGPT(prompt, existingThread ?? undefined);
+            recordSuccess(PRIMARY_PROVIDER_NAME);
+            if (result.thread) await saveGptThread(senderId, chatId, result.thread);
+            console.log(`[AI] ${PRIMARY_PROVIDER_NAME} responded (intent=${intent}, closing=${closingRemark}, thread=${existingThread ? 'continued' : 'new'})`);
             return cleanResponse(result.text);
         } catch (err: any) {
-            recordFailure(modelEntry.name);
-            console.log(`[GROQ] ${modelEntry.name} failed: ${err?.message}`);
+            recordFailure(PRIMARY_PROVIDER_NAME);
+            console.log(`[AI] ${PRIMARY_PROVIDER_NAME} failed: ${err?.message}`);
+        }
+    } else {
+        console.log(`[AI] Skipping ${PRIMARY_PROVIDER_NAME} — recent failures`);
+    }
+
+    // ── Fallback: Groq compound-mini ────────────────────────────────────────
+    if (isApiHealthy(FALLBACK_MODEL.name)) {
+        try {
+            const result = await callGroq(FALLBACK_MODEL, systemPrompt, contextBlock, temperature, maxTokens);
+            recordSuccess(FALLBACK_MODEL.name);
+            console.log(`[AI] ${FALLBACK_MODEL.name} responded (fallback, intent=${intent}, temp=${temperature}, closing=${closingRemark}, maxTokens=${maxTokens})`);
+            return cleanResponse(result.text);
+        } catch (err: any) {
+            recordFailure(FALLBACK_MODEL.name);
+            console.log(`[AI] ${FALLBACK_MODEL.name} failed: ${err?.message}`);
         }
     }
 
-    console.error('[GROQ] All models failed');
+    console.error('[AI] All providers failed');
     return null;
 }
 
@@ -1173,7 +1291,7 @@ export default {
                 text:
                     `*🤖 CHATBOT SETUP*\n\n` +
                     `*Storage:* ${HAS_DB ? 'Database' : 'File System'}\n` +
-                    `*Model:* Groq Compound (web search + code execution built in)\n\n` +
+                    `*Model:* ChatGPT (multi-turn thread + built-in web search)\n\n` +
                     `*Commands:*\n` +
                     `• \`.chatbot on\` — Enable chatbot\n` +
                     `• \`.chatbot off\` — Disable chatbot\n` +
@@ -1185,7 +1303,7 @@ export default {
                     `• \`.chatbot history @user\` — View a user's stored context\n\n` +
                     `*How it works:*\n` +
                     `When enabled, bot responds when mentioned or replied to.\n` +
-                    `Uses groq/compound first, falls back to groq/compound-mini if it's unhealthy.\n` +
+                    `Uses ChatGPT first, falls back to groq/compound-mini if it's unhealthy.\n` +
                     `A model is skipped automatically after ${API_SKIP_THRESHOLD} failures.\n` +
                     `Insult the bot → it claps back once then ignores you for hours.\n\n` +
                     `*Grudge tiers:*\n` +
@@ -1273,13 +1391,13 @@ export default {
 
         if (match === 'stats') {
             const now      = Date.now();
-            const apiLines = GROQ_MODELS.map(m => {
-                const s        = apiStats[m.name];
+            const apiLines = [PRIMARY_PROVIDER_NAME, FALLBACK_MODEL.name].map(name => {
+                const s        = apiStats[name];
                 const icon     = s.count === 0 ? '✅' : s.count < API_SKIP_THRESHOLD ? '⚠️' : '❌';
-                const skipped  = !isApiHealthy(m.name) ? ' [SKIPPED]' : '';
+                const skipped  = !isApiHealthy(name) ? ' [SKIPPED]' : '';
                 const lastFail = s.lastFailAt  ? `last fail ${Math.round((now - s.lastFailAt)  / 60000)}m ago` : 'no failures recorded';
                 const lastOk   = s.lastSuccessAt ? `last ok ${Math.round((now - s.lastSuccessAt) / 60000)}m ago` : 'never succeeded this session';
-                return `${icon} *${m.name}*${skipped}: ${s.count} failure(s)\n   ${lastFail} · ${lastOk}`;
+                return `${icon} *${name}*${skipped}: ${s.count} failure(s)\n   ${lastFail} · ${lastOk}`;
             }).join('\n');
 
             let totalGrudges = 0;
