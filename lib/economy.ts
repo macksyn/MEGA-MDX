@@ -43,7 +43,7 @@ interface EconomySettings {
   workMin:             number;
   workMax:             number;
   workCooldownMs:      number;
-  mineCooldownMs:      number; // cooldown between !mine attempts
+  mineCooldownMs:      number; // cooldown between !mine attempts (default 24h — see doMine()'s same-day vs. exact-countdown messaging)
   mineMin:             number; // min total coins minted per successful !mine (before the split)
   mineMax:             number; // max total coins minted per successful !mine (before the split)
   mineMinerCutPercent: number; // % (0-100) of each mint that goes to the miner; the rest is credited to the jackpot pool
@@ -60,9 +60,9 @@ const DEFAULT_SETTINGS: EconomySettings = {
   workMin: Number(process.env.ECONOMY_WORK_MIN) || 50,
   workMax: Number(process.env.ECONOMY_WORK_MAX) || 300,
   workCooldownMs: Number(process.env.ECONOMY_WORK_COOLDOWN_MS) || 60 * 60 * 1000, // 1hr
-  mineCooldownMs: Number(process.env.ECONOMY_MINE_COOLDOWN_MS) || 45 * 60 * 1000, // 45min
-  mineMin: Number(process.env.ECONOMY_MINE_MIN) || 50,
-  mineMax: Number(process.env.ECONOMY_MINE_MAX) || 300,
+  mineCooldownMs: Number(process.env.ECONOMY_MINE_COOLDOWN_MS) || 24 * 60 * 60 * 1000, // 24hr
+  mineMin: Number(process.env.ECONOMY_MINE_MIN) || 2,
+  mineMax: Number(process.env.ECONOMY_MINE_MAX) || 50,
   mineMinerCutPercent: Number(process.env.ECONOMY_MINE_MINER_CUT_PERCENT) || 50, // 50/50 split by default
   top3Rewards: [300, 200, 100],
   exchangeFeePercent: Number(process.env.ECONOMY_EXCHANGE_FEE_PERCENT) || 15,
@@ -311,8 +311,8 @@ export async function syncIdentity(userId: string, sock: any, pushName?: string 
   }
 }
 
-export function todayStr(): string {
-  return moment().tz(TZ).format('YYYY-MM-DD');
+export function todayStr(ts: number = Date.now()): string {
+  return moment(ts).tz(TZ).format('YYYY-MM-DD');
 }
 
 // ── Transaction ledger ────────────────────────────────────────────────────────
@@ -846,7 +846,7 @@ export async function doWork(userId: string): Promise<
 // contribution in its own houseStats/jackpot key instead of routing it
 // through contributeToJackpot, and have !reserve show it as a separate line.
 export async function doMine(userId: string): Promise<
-  | { success: false; reason: 'on_cooldown'; remainingMs: number }
+  | { success: false; reason: 'on_cooldown'; remainingMs: number; sameDay: boolean }
   | { success: true; minted: number; minerShare: number; jackpotShare: number }
 > {
   const settings = await getSettings();
@@ -855,14 +855,29 @@ export async function doMine(userId: string): Promise<
   // Same atomic-claim shape as doWork(): check the cooldown AND flip
   // lastMineTs inside one mutateWallet() call so two rapid !mine commands
   // from the same user can't both pass the check before either commits.
+  //
+  // `sameDay` drives which message the plugin shows: if the last successful
+  // mine was on this same TZ calendar day, a vague "come back tomorrow" is
+  // enough — they're not getting through today regardless. If the calendar
+  // day has already turned over (it's "tomorrow" already) but the rolling
+  // 24h window since lastMineTs still hasn't elapsed (e.g. they mined at
+  // 11:58pm and it's 12:03am), that's worth an exact countdown instead,
+  // since they're close. The underlying cooldown itself is a plain rolling
+  // 24h window either way — this only changes the wording, not the gate.
   let onCooldown = false;
   let remainingMs = 0;
+  let sameDay = false;
   await mutateWallet(userId, (w) => {
     const readyAt = w.lastMineTs + settings.mineCooldownMs;
-    if (now < readyAt) { onCooldown = true; remainingMs = readyAt - now; return; }
+    if (now < readyAt) {
+      onCooldown = true;
+      remainingMs = readyAt - now;
+      sameDay = todayStr(w.lastMineTs) === todayStr(now);
+      return;
+    }
     w.lastMineTs = now;
   });
-  if (onCooldown) return { success: false, reason: 'on_cooldown', remainingMs };
+  if (onCooldown) return { success: false, reason: 'on_cooldown', remainingMs, sameDay };
 
   const minted = Math.floor(Math.random() * (settings.mineMax - settings.mineMin + 1)) + settings.mineMin;
   const cutPercent = Math.min(100, Math.max(0, settings.mineMinerCutPercent));

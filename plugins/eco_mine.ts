@@ -32,9 +32,18 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const result = await doMine(userId);
 
   if (!result.success) {
-    // on_cooldown — the only failure mode; minting never requires bank funds
+    if (result.sameDay) {
+      // Still the same calendar day the user last mined — no point showing
+      // an exact countdown, they're not getting through today regardless.
+      return sock.sendMessage(chatId, {
+        text: `⛏️ You've already mined today. Come back tomorrow while the rigs cool down.`,
+        ...channelInfo
+      }, { quoted: message });
+    }
+    // Already a new calendar day, but the 24h window since their last mine
+    // hasn't fully elapsed yet — close enough to be worth an exact countdown.
     return sock.sendMessage(chatId, {
-      text: `⛏️ Your rig's still cooling down. Try again in *${formatDuration(result.remainingMs)}*.`,
+      text: `⛏️ Almost there — the rigs need *${formatDuration(result.remainingMs)}* more to finish cooling down.`,
       ...channelInfo
     }, { quoted: message });
   }
@@ -45,7 +54,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
       `You mined *${formatNumber(result.minted)} coins* total.\n\n` +
       `💰 Your cut: *${formatNumber(result.minerShare)} coins*\n` +
       `🏦 Sent to the jackpot: *${formatNumber(result.jackpotShare)} coins*\n\n` +
-      `_Check *.reserve* to see the bank grow._`,
+      `_Check *.bank* to see the bank grow._`,
     ...channelInfo
   }, { quoted: message });
 }
