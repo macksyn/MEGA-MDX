@@ -17,7 +17,7 @@
 import { withEconomyGuard, formatNumber } from '../lib/economy.js';
 import {
   getJackpotPool, getTodayStats, getSolvencyState, getHouseMood,
-  TARGET_RTP, HARD_CEILING_RTP, EMERGENCY_CEILING_RTP,
+  TARGET_RTP, HARD_CEILING_RTP, EMERGENCY_CEILING_RTP, JACKPOT_SEED,
 } from '../lib/slotMachine.js';
 import isOwnerOrSudo, { cleanJid } from '../lib/isOwner.js';
 import { checkEligibility } from '../lib/loans.js';
@@ -26,8 +26,6 @@ export const command = 'reserve';
 export const aliases = ['jackpot', 'bank'];
 export const category = 'economy-games';
 export const cooldown = 3000;
-
-const JACKPOT_SEED = 500; // mirrors the insured amount in lib/slotMachine.ts
 
 // Vague, ambient flavor only — deliberately doesn't say "odds are better/worse
 // right now" or name the mechanic, so !jackpot can't be used to time bets

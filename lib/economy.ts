@@ -19,7 +19,7 @@ import moment from 'moment-timezone';
 import { createStore } from './pluginStore.js';
 import config from '../config.js';
 import { getMonthlyLeaderboard, isGroupEnabled } from './activitytracker.js';
-import { getJackpotPool, deductFromJackpot, settleWin, recordHouseActivity } from './slotMachine.js';
+import { getJackpotPool, deductFromJackpot, settleWin, recordHouseActivity, contributeToJackpot } from './slotMachine.js';
 import { cleanJid } from './isOwner.js';
 
 const root       = createStore('economy');
@@ -43,6 +43,10 @@ interface EconomySettings {
   workMin:             number;
   workMax:             number;
   workCooldownMs:      number;
+  mineCooldownMs:      number; // cooldown between !mine attempts
+  mineMin:             number; // min total coins minted per successful !mine (before the split)
+  mineMax:             number; // max total coins minted per successful !mine (before the split)
+  mineMinerCutPercent: number; // % (0-100) of each mint that goes to the miner; the rest is credited to the jackpot pool
   top3Rewards:         [number, number, number]; // daily coins for whoever holds rank 1st/2nd/3rd on the monthly activity leaderboard, paid every day they hold that spot
   exchangeFeePercent:  number; // % cut taken from the Groq Coins side of a peer-to-peer !exchange, routed to the fee pool
   exchangeAllowedAmounts: number[]; // whitelist of coin amounts !exchange will accept — keeps amounts predictable and easy to type
@@ -56,6 +60,10 @@ const DEFAULT_SETTINGS: EconomySettings = {
   workMin: Number(process.env.ECONOMY_WORK_MIN) || 50,
   workMax: Number(process.env.ECONOMY_WORK_MAX) || 300,
   workCooldownMs: Number(process.env.ECONOMY_WORK_COOLDOWN_MS) || 60 * 60 * 1000, // 1hr
+  mineCooldownMs: Number(process.env.ECONOMY_MINE_COOLDOWN_MS) || 45 * 60 * 1000, // 45min
+  mineMin: Number(process.env.ECONOMY_MINE_MIN) || 50,
+  mineMax: Number(process.env.ECONOMY_MINE_MAX) || 300,
+  mineMinerCutPercent: Number(process.env.ECONOMY_MINE_MINER_CUT_PERCENT) || 50, // 50/50 split by default
   top3Rewards: [300, 200, 100],
   exchangeFeePercent: Number(process.env.ECONOMY_EXCHANGE_FEE_PERCENT) || 15,
   exchangeAllowedAmounts: [10, 20, 50, 100],
@@ -117,6 +125,7 @@ export interface Wallet {
   dailyStreak: number;
   lastDailyDate: string | null;   // 'YYYY-MM-DD' in TZ
   lastWorkTs: number;
+  lastMineTs: number;
   lifetimeCoinsEarned: number;
   lifetimeGroqCoinsEarned: number;
   exchangeCount: number;
@@ -152,6 +161,7 @@ const EMPTY_WALLET: Wallet = {
   dailyStreak: 0,
   lastDailyDate: null,
   lastWorkTs: 0,
+  lastMineTs: 0,
   lifetimeCoinsEarned: 0,
   lifetimeGroqCoinsEarned: 0,
   exchangeCount: 0,
@@ -313,7 +323,7 @@ export function todayStr(): string {
 // under a generic type rather than silently skipped.
 
 export type TransactionType =
-  | 'attendance' | 'work' | 'top3'
+  | 'attendance' | 'work' | 'mine' | 'top3'
   | 'transfer_out' | 'transfer_in'
   | 'exchange_out' | 'exchange_in'
   | 'convert'
@@ -812,6 +822,72 @@ export async function doWork(userId: string): Promise<
   await logTransaction(userId, { currency: 'coins', amount: reward, balanceAfter: saved.coins, type: 'work' });
 
   return { success: true, reward };
+}
+
+// ── Mine command (mints new coins, split between miner and the jackpot) ──────
+// Unlike doMine's first draft, this does NOT draw from the existing bank —
+// it mints fresh coins the same way doWork() does, then splits that mint
+// between the miner's wallet and the jackpot pool (default 50/50, via
+// mineMinerCutPercent). So each successful !mine both pays the miner AND
+// grows the same reserve that backs !slots/!coinflip/!dice and the loan
+// pool — net POSITIVE for bank health, unlike a command that pays out of
+// the existing reserve.
+//
+// ACCOUNTING NOTE: the jackpot's share is credited via contributeToJackpot()
+// — the same function slotMachine.ts uses for real wagered stakes. That
+// function's own docstring calls the pool "real bank capital... nothing is
+// ever minted from nowhere" and eco_jackpot.ts's admin view computes
+// "Lifetime net" as `pool - JACKPOT_SEED`, on the assumption that ALL pool
+// growth came from wagers. Once !mine feeds it too, that assumption is no
+// longer true — "Lifetime net" becomes wager profit PLUS mined subsidy,
+// blended together with no way to tell them apart after the fact. Fine if
+// you're okay with that number meaning something slightly different now;
+// if you want it to stay a pure wager-profit figure, track the mined
+// contribution in its own houseStats/jackpot key instead of routing it
+// through contributeToJackpot, and have !reserve show it as a separate line.
+export async function doMine(userId: string): Promise<
+  | { success: false; reason: 'on_cooldown'; remainingMs: number }
+  | { success: true; minted: number; minerShare: number; jackpotShare: number }
+> {
+  const settings = await getSettings();
+  const now = Date.now();
+
+  // Same atomic-claim shape as doWork(): check the cooldown AND flip
+  // lastMineTs inside one mutateWallet() call so two rapid !mine commands
+  // from the same user can't both pass the check before either commits.
+  let onCooldown = false;
+  let remainingMs = 0;
+  await mutateWallet(userId, (w) => {
+    const readyAt = w.lastMineTs + settings.mineCooldownMs;
+    if (now < readyAt) { onCooldown = true; remainingMs = readyAt - now; return; }
+    w.lastMineTs = now;
+  });
+  if (onCooldown) return { success: false, reason: 'on_cooldown', remainingMs };
+
+  const minted = Math.floor(Math.random() * (settings.mineMax - settings.mineMin + 1)) + settings.mineMin;
+  const cutPercent = Math.min(100, Math.max(0, settings.mineMinerCutPercent));
+  const minerShareGross = Math.floor(minted * (cutPercent / 100));
+  const jackpotShare = minted - minerShareGross; // remainder, so the two halves always sum to `minted` exactly regardless of rounding
+
+  if (jackpotShare > 0) await contributeToJackpot(jackpotShare);
+
+  // Garnishment applies to the miner's share the same way it applies to
+  // !work income — this is newly minted player income, not a bank
+  // withdrawal, so it goes through the normal credit path.
+  const minerShare = await applyGarnishment(userId, minerShareGross, { type: 'mine', note: `${cutPercent}% miner cut, ${100 - cutPercent}% to jackpot` });
+  const saved = await mutateWallet(userId, (w) => {
+    w.coins += minerShare;
+    if (minerShare > 0) w.lifetimeCoinsEarned += minerShare;
+  });
+  await logTransaction(userId, {
+    currency: 'coins',
+    amount: minerShare,
+    balanceAfter: saved.coins,
+    type: 'mine',
+    note: `mined ${minted} total, ${jackpotShare} to jackpot`,
+  });
+
+  return { success: true, minted, minerShare, jackpotShare };
 }
 
 // ── Top-3-on-the-monthly-leaderboard payout ──────────────────────────────────
