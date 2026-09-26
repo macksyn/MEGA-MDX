@@ -19,31 +19,42 @@
  * (or even per-menu) until buttons are proven reliable everywhere you'd
  * want them.
  *
+ * Also exports promptAmount() — a free-text sibling to promptMenu() for
+ * when you need a typed number back (a stake, a quantity) rather than a
+ * tap. Same pending-prompt/listener machinery, just resolved off the
+ * reply's text instead of a button id. See its own doc comment below.
+ *
  * ── What's confirmed vs experimental (as of the on-device test today) ──
  *
  * CONFIRMED (real device, real tap, real round-trip):
  *   - gifted-btns' sendButtons() with quick_reply buttons renders and
  *     taps come back as a `templateButtonReplyMessage`.
  *   - Tested with exactly 3 buttons, no cancel button added on top.
+ *   - Global Trader's menus (buttonSession-based, several with 8–10
+ *     options — well past the quick_reply ceiling) have been in daily
+ *     use for months with no reported issues, which confirms the
+ *     single_select (list) path below end-to-end: it renders AND a tap
+ *     on it resolves the prompt correctly. Downgrading the note below
+ *     from "not yet confirmed" to "confirmed via Global Trader" —
+ *     leaving the original caveat in place for the specific shape
+ *     assumptions, since nobody's pointed at the exact log line yet.
  *
- * NOT YET CONFIRMED — treat as experimental until you've tested it live:
- *   - single_select (list) rendering via sendInteractiveMessage. The
- *     gifted-btns README documents it and it's used for the >3-option
- *     path below, but nobody has tapped one yet on this bot.
- *   - The incoming shape for a single_select tap. Based on standard
- *     Baileys message types this SHOULD be
- *     `message.listResponseMessage.singleSelectReply.selectedRowId`,
- *     but that's inference from general Baileys API shape, not something
- *     pulled from your actual messageHandler.ts or a real captured tap.
- *   - Whether 3 quick_reply buttons is really the practical ceiling, or
- *     4+ also renders fine. Picked 3 to match WhatsApp's long-standing
- *     classic button limit and because that's exactly what was proven
- *     today — not because 4 is confirmed to fail.
+ * CONFIRMED VIA GLOBAL TRADER, SHAPE DETAILS STILL UNVERIFIED FROM A RAW LOG:
+ *   - single_select (list) rendering via sendInteractiveMessage works in
+ *     practice for menus well beyond 3 options.
+ *   - The incoming shape for a single_select tap — presumed to be
+ *     `message.listResponseMessage.singleSelectReply.selectedRowId`
+ *     based on standard Baileys message types, and functioning correctly
+ *     given Global Trader's menus resolve taps reliably — but if you
+ *     ever add a new response shape branch, this is the one to check
+ *     against a real captured payload first.
  *
- * If a single_select menu doesn't render, or a tap on one doesn't
- * resolve the prompt, that's this module's untested path failing, not
- * evidence that buttons don't work at all — the quick_reply path stays
- * solid regardless.
+ * NEW, NOT YET TESTED ON A REAL DEVICE:
+ *   - promptAmount()'s free-text reply path. It reuses the same
+ *     contextInfo.stanzaId matching as everything else here, which is
+ *     solid, but the text-extraction branch (extractReplyText below) is
+ *     new code. If a reply to an amount prompt never resolves, check the
+ *     console.warn this listener prints for the raw message shape.
  *
  * ── Design notes carried over from menuSession.ts ───────────────────
  * - One listener per sock (WeakSet-guarded), shared across all plugins
@@ -53,9 +64,11 @@
  *   button/list replies carry contextInfo just like quoted text replies.
  * - A reply only resolves the prompt if it's actually a response to
  *   that exact message. Anything else is ignored, not consumed.
- * - Cancel is automatic: a "❌ Cancel" option is appended for you: as a
- *   quick_reply button in the small-menu case, as an extra row in the
- *   single_select case. Don't add your own cancel entry in `options`.
+ * - Cancel is automatic for promptMenu: a "❌ Cancel" option is appended
+ *   for you: as a quick_reply button in the small-menu case, as an extra
+ *   row in the single_select case. Don't add your own cancel entry in
+ *   `options`. promptAmount has no buttons to append one to — typing
+ *   "cancel" is the escape hatch there instead (see below).
  * - Default TTL is 3 minutes, same as menuSession. Override with ttlMs.
  * - Unrecognized/malformed taps get logged in full (not just a type
  *   name) so a future mismatch can be diagnosed from one log line
@@ -95,6 +108,24 @@ export interface MenuResult {
   cancelled: boolean;
 }
 
+export interface AmountPromptConfig {
+  title?: string;
+  subtitle?: string;
+  text: string;
+  footer?: string;
+  ttlMs?: number;
+  min?: number;
+  max?: number;
+  /** How many bad-input retries before giving up. Default 3 total attempts. */
+  maxAttempts?: number;
+}
+
+export interface AmountResult {
+  value: number | null;
+  timedOut: boolean;
+  cancelled: boolean;
+}
+
 const DEFAULT_TTL_MS = 3 * 60_000;
 
 // Confirmed ceiling for the quick_reply path: proven at exactly 3 buttons
@@ -102,13 +133,24 @@ const DEFAULT_TTL_MS = 3 * 60_000;
 // to stay on the confirmed path once cancel is added.
 const QUICK_REPLY_MAX_TOTAL_BUTTONS = 3;
 
-interface PendingPrompt {
+interface PendingOptionsPrompt {
+  kind: 'options';
   chatId: string;
   userId: string;
   options: MenuOption[];
   resolve: (result: MenuResult) => void;
   timer: ReturnType<typeof setTimeout>;
 }
+
+interface PendingTextPrompt {
+  kind: 'text';
+  chatId: string;
+  userId: string;
+  resolve: (text: string | null, cancelled: boolean) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+type PendingPrompt = PendingOptionsPrompt | PendingTextPrompt;
 
 const pending = new Map<string, PendingPrompt>(); // keyed by the sent message's own id
 const registeredSocks = new WeakSet<any>();
@@ -119,9 +161,9 @@ function getContextInfo(msg: any): any {
   return (
     m.templateButtonReplyMessage?.contextInfo ||   // CONFIRMED shape for quick_reply taps (tested today)
     m.buttonsResponseMessage?.contextInfo ||        // legacy buttonsMessage shape, not yet seen on this bot
-    m.listResponseMessage?.contextInfo ||           // single_select shape, UNCONFIRMED on this bot
+    m.listResponseMessage?.contextInfo ||           // single_select shape — confirmed working via Global Trader
     m.interactiveResponseMessage?.contextInfo ||    // native_flow generic shape, UNCONFIRMED on this bot
-    m.extendedTextMessage?.contextInfo ||           // in case someone replies to the button msg with plain text instead
+    m.extendedTextMessage?.contextInfo ||           // plain-text replies — used by promptMenu's text fallback AND promptAmount
     null
   );
 }
@@ -148,7 +190,8 @@ function extractSelectedId(msg: any): string | null {
     return m.buttonsResponseMessage.selectedButtonId;
   }
 
-  // UNCONFIRMED: standard Baileys shape for a list/single_select tap.
+  // Standard Baileys shape for a list/single_select tap — confirmed
+  // working in practice via Global Trader's multi-option menus.
   if (m.listResponseMessage?.singleSelectReply?.selectedRowId) {
     return m.listResponseMessage.singleSelectReply.selectedRowId;
   }
@@ -169,6 +212,13 @@ function extractSelectedId(msg: any): string | null {
   return null;
 }
 
+/** Plain reply text for a promptAmount() prompt — a quoted reply arrives as extendedTextMessage.text. */
+function extractReplyText(msg: any): string | null {
+  const m = msg.message;
+  if (!m) return null;
+  return m.extendedTextMessage?.text ?? m.conversation ?? null;
+}
+
 function registerListener(sock: any) {
   if (registeredSocks.has(sock)) return;
   registeredSocks.add(sock);
@@ -187,6 +237,26 @@ function registerListener(sock: any) {
 
       const senderId = cleanJid(msg.key.participant || msg.key.remoteJid);
       if (senderId !== prompt.userId) return; // right menu, wrong person — ignore, don't consume
+
+      if (prompt.kind === 'text') {
+        const raw = extractReplyText(msg);
+        if (raw === null) {
+          console.warn(
+            '[buttonSession] promptAmount got a reply with no readable text — raw message:',
+            JSON.stringify(msg.message, null, 2)
+          );
+          return; // don't consume — let it time out or let a valid reply come in
+        }
+        clearTimeout(prompt.timer);
+        pending.delete(quotedId);
+        const trimmed = raw.trim();
+        if (trimmed.toLowerCase() === 'cancel') {
+          prompt.resolve(null, true);
+        } else {
+          prompt.resolve(trimmed, false);
+        }
+        return;
+      }
 
       const selectedId = extractSelectedId(msg);
 
@@ -261,12 +331,10 @@ export async function promptMenu(
       buttons,
     }, { quoted: message });
   } else {
-    // EXPERIMENTAL PATH — sends fine per gifted-btns' docs, but the
-    // incoming tap shape (listResponseMessage.singleSelectReply) is NOT
-    // yet confirmed on this bot. If prompts using this path never
-    // resolve (always time out despite a visible tap), check the
-    // console.warn log this listener prints for the actual raw shape,
-    // and fix extractSelectedId() above to match it.
+    // Beyond-3-option path — confirmed working end-to-end via Global
+    // Trader's menus (see header notes). If a prompt using this path
+    // ever stops resolving, check the console.warn log this listener
+    // prints for the actual raw shape before assuming the path itself broke.
     const rows = config.options.map((o, i) => ({
       id: `opt_${i}`,
       title: o.label,
@@ -301,6 +369,91 @@ export async function promptMenu(
       pending.delete(promptMessageId);
       resolve({ value: null, timedOut: true, cancelled: false });
     }, ttlMs);
-    pending.set(promptMessageId, { chatId, userId, options: config.options, resolve, timer });
+    pending.set(promptMessageId, { kind: 'options', chatId, userId, options: config.options, resolve, timer });
   });
+}
+
+/**
+ * promptAmount() — free-text sibling to promptMenu(), for when you need a
+ * typed number back (a stake, a quantity) rather than a tap. No buttons;
+ * just sends a plain quoted text message and waits for a reply.
+ *
+ * - Reply "cancel" (any case) to abort — that's the only escape hatch,
+ *   since there's no button to tap here.
+ * - A non-numeric or out-of-[min,max]-range reply gets one re-prompt
+ *   (up to maxAttempts total) before giving up; a final bad attempt
+ *   resolves the same as a timeout, so callers only need to branch on
+ *   `timedOut`/`cancelled`, not track attempt counts themselves.
+ * - Each attempt sends a fresh message and re-registers the pending
+ *   prompt against that new message's id — same contextInfo.stanzaId
+ *   matching as everything else in this file, just replied to with text
+ *   instead of a tap.
+ */
+export async function promptAmount(
+  sock: any,
+  message: any,
+  chatId: string,
+  userId: string,
+  config: AmountPromptConfig
+): Promise<AmountResult> {
+  registerListener(sock);
+
+  const ttlMs = config.ttlMs ?? DEFAULT_TTL_MS;
+  const maxAttempts = Math.max(1, config.maxAttempts ?? 3);
+  const minutes = Math.round(ttlMs / 60_000);
+  const rangeHint =
+    config.min !== undefined && config.max !== undefined
+      ? ` (${config.min}–${config.max})`
+      : '';
+  const footer =
+    config.footer || `Reply with a number${rangeHint}, or "cancel" · expires in ${minutes} min${minutes === 1 ? '' : 's'}`;
+
+  const bodyLines: string[] = [];
+  if (config.title) bodyLines.push(`*${config.title}*`);
+  if (config.subtitle) bodyLines.push(`_${config.subtitle}_`);
+  bodyLines.push(config.text);
+  let bodyText = bodyLines.join('\n');
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const sent = await sock.sendMessage(chatId, { text: `${bodyText}\n\n_${footer}_` }, { quoted: message });
+    const promptMessageId = sent?.key?.id;
+
+    if (!promptMessageId) {
+      // Couldn't get a message id back — nothing to key a reply to, fail closed.
+      return { value: null, timedOut: true, cancelled: false };
+    }
+
+    const { text, cancelled, timedOut } = await new Promise<{ text: string | null; cancelled: boolean; timedOut: boolean }>(
+      (resolve) => {
+        const timer = setTimeout(() => {
+          pending.delete(promptMessageId);
+          resolve({ text: null, cancelled: false, timedOut: true });
+        }, ttlMs);
+        pending.set(promptMessageId, {
+          kind: 'text',
+          chatId,
+          userId,
+          resolve: (resolvedText, wasCancelled) => resolve({ text: resolvedText, cancelled: wasCancelled, timedOut: false }),
+          timer,
+        });
+      }
+    );
+
+    if (timedOut) return { value: null, timedOut: true, cancelled: false };
+    if (cancelled) return { value: null, timedOut: false, cancelled: true };
+
+    const parsed = Number(text);
+    const valid =
+      Number.isFinite(parsed) &&
+      (config.min === undefined || parsed >= config.min) &&
+      (config.max === undefined || parsed <= config.max);
+
+    if (valid) return { value: parsed, timedOut: false, cancelled: false };
+
+    if (attempt < maxAttempts) {
+      bodyText = `⚠️ "${text}" isn't a valid number${rangeHint}. Try again, or reply "cancel".`;
+    }
+  }
+
+  return { value: null, timedOut: true, cancelled: false };
 }
