@@ -17,6 +17,7 @@
 import { createStore } from './pluginStore.js';
 import { getWallet, addCoins, deductCoins, formatNumber } from './economy.js';
 import { cleanJid } from './isOwner.js';
+import { getJackpotPool, contributeToJackpot, deductFromJackpot, settleWin, recordHouseActivity } from './slotMachine.js';
 
 // ─────────────────────────────────────────────────────────────────────────
 // Config
@@ -93,6 +94,8 @@ export interface Coupon {
   legs: Leg[];
   combinedOdds: number;
   potentialPayout: number;
+  /** What was actually credited on a 'won' coupon — only differs from potentialPayout if the bank's floor capped it. */
+  actualPayout?: number;
   status: CouponStatus;
   placedAt: number;
   settledAt?: number;
@@ -103,45 +106,34 @@ export interface Coupon {
 // ─────────────────────────────────────────────────────────────────────────
 
 const root = createStore('sportybet');
-const couponsByUser = root.table('couponsByUser'); // userId -> Coupon[]
-const reservePool = root.table('reservePool'); // 'balance' -> number
+const couponsByUser = root.table!('couponsByUser'); // userId -> Coupon[]
 
 const MAX_COUPONS_PER_USER = 100;
 
 // ─────────────────────────────────────────────────────────────────────────
-// Reserve pool — funded by every stake at placement, drained by every
-// payout. Mirrors economy.ts's feePool pattern. Real bookmaker odds already
-// carry the bookmaker's margin, so unlike the slot games this pool needs no
-// custom RTP tuning — it's just the bank coupons settle against.
+// Shared community bank — sportybet feeds the SAME jackpot pool that backs
+// slots/coinflip/dice (lib/slotMachine.ts), not a separate pool of its own
+// like Ocean Hunt's. Every stake becomes real pool capital at placement
+// (contributeToJackpot), and every win is drawn back out through the same
+// settleWin()-then-deductFromJackpot() choke point every other game uses —
+// including its floor protection, so a big accumulator can never pay out
+// more than the bank can actually afford. recordHouseActivity keeps
+// !reserve's daily wagered/paid totals honest across bet-day and,
+// separately, whatever later day a coupon actually settles on.
 // ─────────────────────────────────────────────────────────────────────────
 
 export async function getReserveBalance(): Promise<number> {
-  return (await reservePool.get('balance')) || 0;
-}
-
-async function contributeToReserve(amount: number): Promise<number> {
-  if (amount <= 0) return getReserveBalance();
-  const updated = (await getReserveBalance()) + amount;
-  await reservePool.set('balance', updated);
-  return updated;
-}
-
-async function deductFromReserve(amount: number): Promise<number> {
-  if (amount <= 0) return getReserveBalance();
-  const updated = (await getReserveBalance()) - amount;
-  await reservePool.set('balance', updated);
-  if (updated < 0) {
-    // Allowed — a long-shot accumulator can hit before enough stakes have
-    // flowed in, same as slotMachine's emergency RTP tier. Never block the
-    // payout over this; just make it loud.
-    console.error(`[CRITICAL] sportybet reserve pool went negative (${updated}) after a payout of ${amount}`);
-  }
-  return updated;
+  return getJackpotPool();
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Malvin API clients
 // ─────────────────────────────────────────────────────────────────────────
+
+interface MalvinEnvelope<T> {
+  status: boolean;
+  data: T;
+}
 
 async function malvinPost<T>(path: string): Promise<T> {
   const url = `${MALVIN_BASE}${path}${path.includes('?') ? '&' : '?'}apikey=${MALVIN_API_KEY}`;
@@ -151,9 +143,9 @@ async function malvinPost<T>(path: string): Promise<T> {
     body: JSON.stringify({}),
   });
   if (!res.ok) throw new Error(`Malvin API ${path} responded ${res.status}`);
-  const json = await res.json();
+  const json = (await res.json()) as MalvinEnvelope<T>;
   if (!json.status) throw new Error(`Malvin API ${path} returned status:false`);
-  return json.data as T;
+  return json.data;
 }
 
 /** Bettable fixture list — light payload, already filtered to future games. */
@@ -291,7 +283,8 @@ export async function placeCoupon(userId: string, stake: number, picks: PlaceCou
   });
   if (!success) return { success: false, reason: 'insufficient_funds' };
 
-  await contributeToReserve(stake);
+  await contributeToJackpot(stake);
+  await recordHouseActivity(stake, 0);
 
   const legs: Leg[] = picks.map((p) => ({
     id: `leg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -403,19 +396,29 @@ export async function pollAndSettleCoupons(): Promise<{ couponsChecked: number; 
       } else if (allDecided) {
         coupon.combinedOdds = computeCombinedOdds(coupon.legs);
         coupon.potentialPayout = computePotentialPayout(coupon.stake, coupon.legs);
+        let payout = 0;
         try {
-          await deductFromReserve(coupon.potentialPayout);
-          await addCoins(userId, coupon.potentialPayout, {
+          const pool = await getJackpotPool();
+          const settled = settleWin(coupon.potentialPayout, pool); // floor-protected, same as every other game
+          payout = settled.payout;
+          await deductFromJackpot(payout);
+          await recordHouseActivity(0, payout);
+          await addCoins(userId, payout, {
             type: 'sportybet',
-            note: `Sportybet coupon ${coupon.id} won (${coupon.legs.length} leg${coupon.legs.length > 1 ? 's' : ''})`,
+            note:
+              `Sportybet coupon ${coupon.id} won (${coupon.legs.length} leg${coupon.legs.length > 1 ? 's' : ''})` +
+              (settled.capped ? ' — capped, the bank could not cover the full payout' : ''),
           });
           coupon.status = 'won';
+          coupon.actualPayout = payout;
           coupon.settledAt = Date.now();
           couponsSettled++;
         } catch (err) {
-          // Compensate the reserve and leave the coupon 'pending' so the next
-          // poll retries the payout — never silently swallow a won coupon.
-          await contributeToReserve(coupon.potentialPayout).catch(() => {});
+          // Compensate the pool for whatever was actually drawn out (the
+          // capped amount, not the raw potentialPayout), and leave the
+          // coupon 'pending' so the next poll retries — never silently
+          // swallow a won coupon's credit.
+          if (payout > 0) await contributeToJackpot(payout).catch(() => {});
           console.error(`[CRITICAL] sportybet payout failed for coupon ${coupon.id} (user ${userId}):`, err);
         }
       } else {
@@ -457,12 +460,19 @@ export function formatCoupon(coupon: Coupon): string {
     return `${LEG_EMOJI[leg.status]} ${leg.homeTeam} vs ${leg.awayTeam} — ${pick} @ ${leg.oddsAtPlacement}${score}`;
   });
 
+  const wasCapped = coupon.status === 'won' && coupon.actualPayout !== undefined && coupon.actualPayout < coupon.potentialPayout;
+  const payoutLine =
+    coupon.status === 'won'
+      ? `Payout: ${formatNumber(coupon.actualPayout ?? coupon.potentialPayout)} coins` +
+        (wasCapped ? ` _(capped from ${formatNumber(coupon.potentialPayout)} — the bank couldn't cover the full amount)_` : '')
+      : `Potential payout: ${formatNumber(coupon.potentialPayout)} coins`;
+
   return [
     `🎟️ *Coupon ${coupon.id.slice(-6).toUpperCase()}* ${COUPON_EMOJI[coupon.status]} ${coupon.status.toUpperCase()}`,
     ...lines,
     ``,
     `Stake: ${formatNumber(coupon.stake)} coins`,
     `Combined odds: ${coupon.combinedOdds.toFixed(2)}x`,
-    `${coupon.status === 'won' ? 'Payout' : 'Potential payout'}: ${formatNumber(coupon.potentialPayout)} coins`,
+    payoutLine,
   ].join('\n');
 }
