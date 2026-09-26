@@ -302,7 +302,7 @@ async function runFixturesFlow(sock: any, message: any, chatId: string, userId: 
       console.error('[sportybet] failed to load fixtures:', err);
       return sock.sendMessage(chatId, { text: '⚠️ Could not reach the fixtures service right now.', ...channelInfo }, { quoted: message });
     }
-    // Reuse the join purely for its date parsing — no odds tips needed here.
+    // Reuse the join purely to flatten the nested homeTeam/awayTeam objects — no odds tips needed here.
     const withKickoff = joinFixturesWithOdds(fixtures, []).slice(0, 10);
     const text = withKickoff.map((f) => `⚽ ${f.homeTeam} vs ${f.awayTeam}\n   ${formatKickoff(f.kickoff)}`).join('\n\n');
     return sock.sendMessage(
@@ -321,7 +321,10 @@ async function runFixturesFlow(sock: any, message: any, chatId: string, userId: 
   }
   const finished = matches.filter((m) => m.status === 'FINISHED').slice(-10).reverse();
   const text = finished
-    .map((m) => `${m.winner === 'Draw' ? '🤝' : '⚽'} ${m.homeTeam} ${m.score} ${m.awayTeam}`)
+    .map((m) => {
+      const emoji = m.score.winner === 'DRAW' ? '🤝' : '⚽';
+      return `${emoji} ${m.homeTeam.name} ${m.score.fullTime.home} - ${m.score.fullTime.away} ${m.awayTeam.name}`;
+    })
     .join('\n');
   return sock.sendMessage(
     chatId,

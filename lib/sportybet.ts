@@ -10,8 +10,12 @@
  * 1. Add 'sportybet' to the TransactionType union in economy.ts, alongside
  *    the existing 'slots' | 'coinflip' | 'dice', so ledger entries for
  *    stakes/payouts are typed consistently with the other games.
- * 2. Confirm MALVIN_API_KEY below matches however you're already sourcing
- *    the key for the tiktok/exitfeedback Malvin calls elsewhere in the repo.
+ * 2. Set FOOTBALL_DATA_API_TOKEN and ODDS_API_KEY in your environment.
+ *    Malvin is no longer used anywhere in this file — fixtures/results come
+ *    straight from football-data.org (Malvin's /epl/upcoming and
+ *    /epl/matches turned out to be stuck serving stale matchday 1-2 data),
+ *    and odds come straight from The Odds API (richer market access than
+ *    Malvin's h2h-only wrapper allowed).
  */
 
 import { createStore } from './pluginStore.js';
@@ -23,23 +27,55 @@ import { getJackpotPool, contributeToJackpot, deductFromJackpot, settleWin, reco
 // Config
 // ─────────────────────────────────────────────────────────────────────────
 
-const MALVIN_BASE = 'https://api.malvin.gleeze.com/api/sports';
-const MALVIN_API_KEY = process.env.MALVIN_API_KEY || '';
+const FOOTBALL_DATA_BASE = 'https://api.football-data.org/v4';
+const FOOTBALL_DATA_API_TOKEN = process.env.FOOTBALL_DATA_API_TOKEN || '';
+
+const ODDS_API_BASE = 'https://api.the-odds-api.com/v4';
+const ODDS_API_KEY = process.env.ODDS_API_KEY || '';
+
+// football-data.org's limit is per-minute (10/min), so a short cache is plenty.
+// The Odds API's free tier is a flat 500 CREDITS/month instead (cost = markets
+// x regions per call) — sized here for the 3-market state (h2h+totals+btts,
+// 1 region = 3 credits/call): 4 calls/day x 3 credits x 30 days = 360/month,
+// safe under budget with room for manual testing. Odds don't need to be
+// fresher than this for a pre-match-only game anyway.
+const FIXTURES_CACHE_TTL_MS = 60_000;
+const SEASON_MATCHES_CACHE_TTL_MS = 60_000;
+const ODDS_CACHE_TTL_MS = 6 * 60 * 60_000;
 
 export const MIN_STAKE = 10;
 export const MAX_STAKE = 5000;
 export const MAX_LEGS_PER_COUPON = 10;
 
 // ─────────────────────────────────────────────────────────────────────────
-// Raw API shapes (as returned by the three Malvin endpoints)
+// Raw API shapes (as returned by football-data.org and The Odds API directly)
 // ─────────────────────────────────────────────────────────────────────────
 
-interface UpcomingMatch {
+interface FootballDataTeam {
+  id: number;
+  name: string; // official name, e.g. "Arsenal FC"
+  shortName?: string;
+  tla?: string;
+  crest?: string;
+}
+
+/** A match as returned by football-data.org's /v4/competitions/PL/matches. */
+interface FootballDataMatch {
+  id: number;
+  utcDate: string; // ISO 8601 UTC
+  status: string; // SCHEDULED | LIVE | IN_PLAY | PAUSED | FINISHED | POSTPONED | SUSPENDED | CANCELLED
   matchday: number;
-  date: string; // "10/10/2026, 11:30:00 AM" — already UTC, US-locale formatted
-  homeTeam: string; // official name, e.g. "Arsenal FC"
-  awayTeam: string;
-  status: string; // "TIMED" for everything this endpoint returns
+  homeTeam: FootballDataTeam;
+  awayTeam: FootballDataTeam;
+  score: {
+    winner: 'HOME_TEAM' | 'AWAY_TEAM' | 'DRAW' | null;
+    fullTime: { home: number | null; away: number | null };
+  };
+}
+
+interface FootballDataMatchesResponse {
+  competition: { id: number; name: string; code: string };
+  matches: FootballDataMatch[];
 }
 
 interface OddsTip {
@@ -49,15 +85,6 @@ interface OddsTip {
   commenceTime: string; // ISO 8601 UTC
   bookmakers: number;
   bestOdds: Array<{ name: string; price: number }>; // team name or "Draw" -> decimal odds
-}
-
-interface SeasonMatch {
-  matchday: number;
-  status: string; // "FINISHED" confirmed; TIMED/IN_PLAY/POSTPONED/etc. expected but unconfirmed
-  homeTeam: string; // official name, same convention as UpcomingMatch
-  awayTeam: string;
-  score?: string; // "3 - 0", present once played
-  winner?: string; // homeTeam name | awayTeam name | "Draw", present once FINISHED
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -127,50 +154,132 @@ export async function getReserveBalance(): Promise<number> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Malvin API clients
+// Tiny in-memory cache — shared across every user's menu opens and the
+// settlement poller, so several people browsing at once still cost one
+// upstream call per TTL window, not one each.
 // ─────────────────────────────────────────────────────────────────────────
 
-interface MalvinEnvelope<T> {
-  status: boolean;
-  data: T;
+const cache = new Map<string, { value: any; expiresAt: number }>();
+
+async function cached<T>(key: string, ttlMs: number, fetcher: () => Promise<T>): Promise<T> {
+  const hit = cache.get(key);
+  if (hit && hit.expiresAt > Date.now()) return hit.value as T;
+  const value = await fetcher();
+  cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+  return value;
 }
 
-async function malvinPost<T>(path: string): Promise<T> {
-  const url = `${MALVIN_BASE}${path}${path.includes('?') ? '&' : '?'}apikey=${MALVIN_API_KEY}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({}),
+// ─────────────────────────────────────────────────────────────────────────
+// football-data.org client — fixtures & results
+// ─────────────────────────────────────────────────────────────────────────
+
+async function footballDataGet<T>(path: string): Promise<T> {
+  const res = await fetch(`${FOOTBALL_DATA_BASE}${path}`, {
+    headers: { 'X-Auth-Token': FOOTBALL_DATA_API_TOKEN },
   });
-  if (!res.ok) throw new Error(`Malvin API ${path} responded ${res.status}`);
-  const json = (await res.json()) as MalvinEnvelope<T>;
-  if (!json.status) throw new Error(`Malvin API ${path} returned status:false`);
-  return json.data;
+  if (!res.ok) throw new Error(`football-data.org ${path} responded ${res.status}`);
+  return (await res.json()) as T;
 }
 
-/** Bettable fixture list — light payload, already filtered to future games. */
-export async function fetchUpcomingFixtures(): Promise<UpcomingMatch[]> {
-  const data = await malvinPost<{ competition: string; total: number; matches: UpcomingMatch[] }>('/epl/upcoming');
-  return data.matches;
-}
-
-/** Odds for whatever fixtures the odds provider currently covers. */
-export async function fetchOddsTips(): Promise<OddsTip[]> {
-  const data = await malvinPost<{ source: string; total: number; tips: OddsTip[] }>('/betting/odds');
-  return data.tips;
+/** Bettable fixture list — not-yet-played PL matches only. */
+export async function fetchUpcomingFixtures(): Promise<FootballDataMatch[]> {
+  return cached('sportybet:upcoming', FIXTURES_CACHE_TTL_MS, async () => {
+    const data = await footballDataGet<FootballDataMatchesResponse>('/competitions/PL/matches?status=SCHEDULED');
+    return data.matches;
+  });
 }
 
 /** Full-season match list (past/live/scheduled) — the settlement source of truth. */
-export async function fetchAllSeasonMatches(): Promise<SeasonMatch[]> {
-  const data = await malvinPost<{ competition: string; total: number; matches: SeasonMatch[] }>('/epl/matches');
-  return data.matches;
+export async function fetchAllSeasonMatches(): Promise<FootballDataMatch[]> {
+  return cached('sportybet:season', SEASON_MATCHES_CACHE_TTL_MS, async () => {
+    const data = await footballDataGet<FootballDataMatchesResponse>('/competitions/PL/matches');
+    return data.matches;
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// The Odds API client — odds, direct (no more Malvin dependency at all now
+// that fixtures/results and odds both come straight from their real sources)
+//
+// The raw response is one array entry per fixture, each with its own list of
+// UK bookmakers, each bookmaker carrying its own markets/outcomes — nothing
+// is pre-aggregated. bestOdds below is US picking the best (highest) price
+// per outcome across every bookmaker ourselves.
+//
+// One real quirk this confirmed from a live pull: exchange bookmakers
+// (Betfair Exchange, Smarkets) carry a SECOND market, "h2h_lay" — the price
+// to bet AGAINST an outcome, not for it. One live sample had a Nottingham
+// Forest "h2h_lay" price of 80.0 against every normal bookmaker's ~5.0-5.75
+// — picking a "best" price without filtering to key === 'h2h' specifically
+// would have handed out a wildly wrong payout multiplier. Never touch
+// h2h_lay (or any *_lay market) here.
+// ─────────────────────────────────────────────────────────────────────────
+
+interface OddsApiOutcome {
+  name: string; // team name, "Draw", or (for future markets) "Over"/"Under"/"Yes"/"No"
+  price: number;
+  point?: number; // present on line-based markets like totals, e.g. 2.5 for Over/Under 2.5
+}
+
+interface OddsApiMarket {
+  key: string; // 'h2h' is what we want; 'h2h_lay' must be excluded — see note above
+  outcomes: OddsApiOutcome[];
+}
+
+interface OddsApiBookmaker {
+  key: string;
+  title: string;
+  markets: OddsApiMarket[];
+}
+
+interface OddsApiEvent {
+  id: string;
+  commence_time: string; // ISO 8601 UTC
+  home_team: string; // short name, matches Malvin's old naming convention
+  away_team: string;
+  bookmakers: OddsApiBookmaker[];
+}
+
+async function fetchOddsApiEvents(markets: string): Promise<OddsApiEvent[]> {
+  const url = `${ODDS_API_BASE}/sports/soccer_epl/odds/?regions=uk&markets=${markets}&oddsFormat=decimal&apiKey=${ODDS_API_KEY}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`The Odds API responded ${res.status}`);
+  return (await res.json()) as OddsApiEvent[];
+}
+
+/** Best (highest) UK price for each h2h (1X2) outcome, across every bookmaker that offers it. */
+export async function fetchOddsTips(): Promise<OddsTip[]> {
+  return cached('sportybet:odds', ODDS_CACHE_TTL_MS, async () => {
+    const events = await fetchOddsApiEvents('h2h');
+    return events.map((ev): OddsTip => {
+      const best = new Map<string, number>(); // outcome name -> best price seen
+      let bookmakerCount = 0;
+      for (const bm of ev.bookmakers) {
+        const h2h = bm.markets.find((m) => m.key === 'h2h'); // exactly 'h2h' — never 'h2h_lay'
+        if (!h2h) continue;
+        bookmakerCount++;
+        for (const outcome of h2h.outcomes) {
+          const current = best.get(outcome.name);
+          if (current === undefined || outcome.price > current) best.set(outcome.name, outcome.price);
+        }
+      }
+      return {
+        event: `${ev.home_team} vs ${ev.away_team}`,
+        homeTeam: ev.home_team,
+        awayTeam: ev.away_team,
+        commenceTime: ev.commence_time,
+        bookmakers: bookmakerCount,
+        bestOdds: Array.from(best.entries()).map(([name, price]) => ({ name, price })),
+      };
+    });
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Team-name normalization & fixture/odds join
 //
-// /epl/upcoming and /epl/matches use official names ("Arsenal FC",
-// "AFC Bournemouth", "Brighton & Hove Albion FC"); /betting/odds (The Odds
+// football-data.org uses official names ("Arsenal FC", "AFC Bournemouth",
+// "Brighton & Hove Albion FC"); The Odds API uses shorter ones ("Arsenal",
 // API) uses shorter ones ("Arsenal", "Bournemouth", "Brighton and Hove
 // Albion"). Never compare these with === — normalize both sides first.
 // ─────────────────────────────────────────────────────────────────────────
@@ -190,26 +299,11 @@ function sameCalendarDay(isoA: string, isoB: string): boolean {
   return new Date(isoA).toISOString().slice(0, 10) === new Date(isoB).toISOString().slice(0, 10);
 }
 
-/** Parses /epl/upcoming's "10/10/2026, 11:30:00 AM" (already UTC) into an ISO string. */
-function parseUpcomingDate(date: string): string {
-  const [datePart, timePart] = date.split(', ');
-  const [month, day, year] = datePart.split('/').map(Number);
-  const d = new Date(`${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T00:00:00Z`);
-  const match = timePart?.match(/(\d+):(\d+):(\d+)\s*(AM|PM)/i);
-  if (match) {
-    const [, h, m, s, ampm] = match;
-    let hours = Number(h) % 12;
-    if (ampm.toUpperCase() === 'PM') hours += 12;
-    d.setUTCHours(hours, Number(m), Number(s));
-  }
-  return d.toISOString();
-}
-
-export function joinFixturesWithOdds(fixtures: UpcomingMatch[], tips: OddsTip[]): FixtureWithOdds[] {
+export function joinFixturesWithOdds(fixtures: FootballDataMatch[], tips: OddsTip[]): FixtureWithOdds[] {
   return fixtures.map((fx) => {
-    const kickoff = parseUpcomingDate(fx.date);
-    const home = normalizeTeamName(fx.homeTeam);
-    const away = normalizeTeamName(fx.awayTeam);
+    const kickoff = fx.utcDate; // already ISO UTC — football-data.org needs no date parsing
+    const home = normalizeTeamName(fx.homeTeam.name);
+    const away = normalizeTeamName(fx.awayTeam.name);
     const tip = tips.find(
       (t) =>
         normalizeTeamName(t.homeTeam) === home &&
@@ -225,7 +319,7 @@ export function joinFixturesWithOdds(fixtures: UpcomingMatch[], tips: OddsTip[])
       if (homeOdds && awayOdds && drawOdds) odds = { home: homeOdds, draw: drawOdds, away: awayOdds };
     }
 
-    return { homeTeam: fx.homeTeam, awayTeam: fx.awayTeam, kickoff, matchday: fx.matchday, odds };
+    return { homeTeam: fx.homeTeam.name, awayTeam: fx.awayTeam.name, kickoff, matchday: fx.matchday, odds };
   });
 }
 
@@ -330,19 +424,19 @@ export async function getCoupon(userId: string, couponId: string): Promise<Coupo
 
 // ─────────────────────────────────────────────────────────────────────────
 // Settlement — call this from a scheduled poll (same schedules/cron pattern
-// as forex's background watcher). Fetches /epl/matches once per pass and
+// as forex's background watcher). Fetches the full season match list once per pass and
 // checks it against every leg still pending, across every user.
 // ─────────────────────────────────────────────────────────────────────────
 
-function resultOf(match: SeasonMatch): Selection | 'void' | null {
-  if (match.status === 'FINISHED' && match.winner) {
-    if (match.winner === match.homeTeam) return 'home';
-    if (match.winner === match.awayTeam) return 'away';
-    if (match.winner === 'Draw') return 'draw';
-    return null; // unrecognized winner value — leave pending rather than guess
+function resultOf(match: FootballDataMatch): Selection | 'void' | null {
+  if (match.status === 'FINISHED') {
+    if (match.score.winner === 'HOME_TEAM') return 'home';
+    if (match.score.winner === 'AWAY_TEAM') return 'away';
+    if (match.score.winner === 'DRAW') return 'draw';
+    return null; // FINISHED but no winner recorded yet — leave pending rather than guess
   }
-  if (['POSTPONED', 'CANCELLED', 'SUSPENDED'].includes(match.status)) return 'void';
-  return null; // still to be played / in play — leave pending
+  if (['POSTPONED', 'SUSPENDED', 'CANCELLED'].includes(match.status)) return 'void';
+  return null; // SCHEDULED / LIVE / IN_PLAY / PAUSED — still genuinely pending
 }
 
 export async function pollAndSettleCoupons(): Promise<{ couponsChecked: number; couponsSettled: number }> {
@@ -367,7 +461,7 @@ export async function pollAndSettleCoupons(): Promise<{ couponsChecked: number; 
         const home = normalizeTeamName(leg.homeTeam);
         const away = normalizeTeamName(leg.awayTeam);
         const match = seasonMatches.find(
-          (m) => normalizeTeamName(m.homeTeam) === home && normalizeTeamName(m.awayTeam) === away
+          (m) => normalizeTeamName(m.homeTeam.name) === home && normalizeTeamName(m.awayTeam.name) === away
         );
         if (!match) continue; // not in this payload — try again next poll
 
@@ -377,7 +471,7 @@ export async function pollAndSettleCoupons(): Promise<{ couponsChecked: number; 
           leg.status = 'voided';
         } else {
           leg.status = result === leg.selection ? 'won' : 'lost';
-          leg.finalScore = match.score;
+          leg.finalScore = `${match.score.fullTime.home} - ${match.score.fullTime.away}`;
         }
         legsChanged = true;
       }
