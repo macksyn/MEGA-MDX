@@ -36,11 +36,12 @@ function extractUrl(text: string): string | null {
 
 const DETECTORS: Array<{ regex: RegExp; plugin: string; name: string }> = [
     { regex: /(?:vt\.tiktok\.com|vm\.tiktok\.com)/i,       plugin: './tiktok.js',    name: 'TikTok'    },
-    { regex: /(?:x\.com|twitter\.com)/i,            plugin: './twitter.js',   name: 'Twitter' },
+    { regex: /(?:x\.com|twitter\.com)/i,            plugin: './twitter.js',   name: 'Twitter'   },
     { regex: /facebook\.com|fb\.watch/i,            plugin: './facebook.js',  name: 'Facebook'  },
     { regex: /instagram\.com|instagr\.am/i,         plugin: './instagram.js', name: 'Instagram' },
-    { regex: /(?:youtube\.com|youtu\.be)/i,          plugin: './video.js',     name: 'YouTube'   },
+    { regex: /(?:youtube\.com|youtu\.be)/i,         plugin: './video.js',     name: 'YouTube'   },
     { regex: /mega\.nz/i,                           plugin: './mega.js',      name: 'MEGA'      },
+    { regex: /pin\.it/i,                            plugin: './pinterest.js', name: 'Pinterest' },
     { regex: /terabox\.com|1024terabox\.com/i,      plugin: './terabox.js',   name: 'TeraBox'   },
     { regex: /snapchat\.com|snap\.chat/i,           plugin: './snapchat.js',  name: 'Snapchat'  },
     { regex: /spotify\.com/i,                       plugin: './spotify.js',   name: 'Spotify'   },

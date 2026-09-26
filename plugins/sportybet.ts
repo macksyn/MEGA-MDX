@@ -37,7 +37,7 @@ import {
 } from '../lib/sportybet.js';
 
 export const command = 'sportybet';
-export const aliases = ['bet', 'sb'];
+export const aliases = ['bet', 'sb', 'sporty'];
 export const category = 'economy-games';
 export const cooldown = 3000;
 
