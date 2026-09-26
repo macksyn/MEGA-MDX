@@ -141,8 +141,12 @@ export default {
       // Detect media type
       // ─────────────────────────────────────────────
 
-      const contentType =
-        mediaResponse.headers?.['content-type']?.toLowerCase() || '';
+      const rawContentType = mediaResponse.headers?.['content-type'];
+
+const contentType =
+  typeof rawContentType === 'string'
+    ? rawContentType.toLowerCase()
+    : '';
 
       let mediaType: 'image' | 'video' | 'document' = 'document';
 

@@ -524,14 +524,14 @@ function isNegative(text: string): boolean {
 // Add more phrases (e.g. pidgin your group actually uses) to these lists as
 // you notice them.
 const CLOSING_ACK_PHRASES = [
-    'ok', 'okay', 'k', 'kk', 'okie', 'alright', 'aight', 'alr', 'true', 'word', 'bet',
+    'ok', 'okay', 'k', 'kk', 'oh okay', 'alright', 'aight', 'oh ok', 'true', 'thats true', 'bna true',
     'say less', 'fr', 'frfr', 'for real', 'facts', 'deadass', 'yeah', 'yea', 'yeh', 'yh',
-    'yep', 'yup', 'ya', 'mhm', 'nice', 'cool', 'noted', 'got it', 'gotcha', 'i see', 'ic',
-    'makes sense', 'fair enough', 'lol', 'lmao', 'lmaoo', 'lool', 'haha', 'hahaha', 'hehe'
+    'yep', 'yup', 'ya', 'hmm', 'nice', 'cool', 'noted', 'got it', 'gotcha', 'i see', 'hmmm',
+    'makes sense', 'fair enough', 'lol', 'lmao', 'lmaoo', 'lool', 'haha', 'hahaha', 'hehe', 'ttyl', 'ok later', 'later'
 ];
 const CLOSING_THANKS_PHRASES = [
     'thanks', 'thank you', 'thank u', 'thanks a lot', 'thanks alot', 'thanks so much',
-    'thank you so much', 'appreciate it', 'appreciate that', 'i appreciate', 'i appreciate it',
+    'thank you so much', 'ok thanks', 'appreciate it', 'appreciate that', 'i appreciate', 'i appreciate it',
     'i appreciate that', 'tysm', 'ty', 'much appreciated', 'appreciated', 'thank you very much'
 ];
 
