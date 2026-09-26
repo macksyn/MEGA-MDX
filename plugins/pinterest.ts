@@ -18,7 +18,7 @@ const AXIOS_DEFAULTS = {
 
 export default {
   command: 'pinterest',
-  aliases: ['pin', 'pindl', 'pinterestdl'],
+  aliases: ['pindl', 'pinterestdl'],
 
   category: 'download',
 
