@@ -326,7 +326,7 @@ export type TransactionType =
   | 'attendance' | 'work' | 'mine' | 'top3'
   | 'transfer_out' | 'transfer_in'
   | 'exchange_out' | 'exchange_in'
-  | 'convert'
+  | 'convert' | 'sportybet'
   | 'slots' | 'coinflip' | 'dice'
   | 'admin_credit' | 'admin_debit' | 'admin_reset'
   | 'withdrawal_hold' | 'withdrawal_refund'
