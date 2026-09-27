@@ -79,28 +79,32 @@ interface FootballDataMatchesResponse {
 }
 
 interface OddsTip {
-  event: string;
+  eventId: string; // The Odds API's event id — needed later for the per-event BTTS lookup
   homeTeam: string; // short name, e.g. "Arsenal"
   awayTeam: string;
   commenceTime: string; // ISO 8601 UTC
   bookmakers: number;
-  bestOdds: Array<{ name: string; price: number }>; // team name or "Draw" -> decimal odds
+  h2h: { home: number; draw: number; away: number } | null;
+  totals: { point: number; over: number; under: number } | null; // best over/under at whichever line most bookmakers quote
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Domain types
 // ─────────────────────────────────────────────────────────────────────────
 
-export type Selection = 'home' | 'draw' | 'away';
+export type Market = '1x2' | 'totals' | 'btts';
+export type Selection = 'home' | 'draw' | 'away' | 'over' | 'under' | 'yes' | 'no';
 export type LegStatus = 'pending' | 'won' | 'lost' | 'voided';
 export type CouponStatus = 'pending' | 'won' | 'lost';
 
 export interface FixtureWithOdds {
+  eventId: string | null; // null if no Odds API match was found for this fixture yet
   homeTeam: string; // official name — carried through to settlement
   awayTeam: string;
   kickoff: string; // ISO 8601 UTC
   matchday: number;
-  odds: { home: number; draw: number; away: number } | null; // null if no odds match found yet
+  h2h: { home: number; draw: number; away: number } | null;
+  totals: { point: number; over: number; under: number } | null;
 }
 
 export interface Leg {
@@ -108,7 +112,9 @@ export interface Leg {
   homeTeam: string;
   awayTeam: string;
   kickoff: string;
+  market: Market;
   selection: Selection;
+  point?: number; // only for 'totals' — the over/under line, e.g. 2.5
   oddsAtPlacement: number;
   status: LegStatus;
   finalScore?: string;
@@ -203,7 +209,7 @@ export async function fetchAllSeasonMatches(): Promise<FootballDataMatch[]> {
 //
 // The raw response is one array entry per fixture, each with its own list of
 // UK bookmakers, each bookmaker carrying its own markets/outcomes — nothing
-// is pre-aggregated. bestOdds below is US picking the best (highest) price
+// is pre-aggregated. fetchOddsTips below is us picking the best (highest) price
 // per outcome across every bookmaker ourselves.
 //
 // One real quirk this confirmed from a live pull: exchange bookmakers
@@ -247,32 +253,129 @@ async function fetchOddsApiEvents(markets: string): Promise<OddsApiEvent[]> {
   return (await res.json()) as OddsApiEvent[];
 }
 
-/** Best (highest) UK price for each h2h (1X2) outcome, across every bookmaker that offers it. */
+/** Best (highest) UK price for h2h (1X2) and totals (over/under), across every bookmaker offering each. */
 export async function fetchOddsTips(): Promise<OddsTip[]> {
   return cached('sportybet:odds', ODDS_CACHE_TTL_MS, async () => {
-    const events = await fetchOddsApiEvents('h2h');
+    const events = await fetchOddsApiEvents('h2h,totals');
     return events.map((ev): OddsTip => {
-      const best = new Map<string, number>(); // outcome name -> best price seen
+      const bestH2h = new Map<string, number>(); // outcome name -> best price seen
+      const totalsByPoint = new Map<number, { overPrices: number[]; underPrices: number[] }>();
       let bookmakerCount = 0;
+
       for (const bm of ev.bookmakers) {
+        let sawThisBookmaker = false;
+
         const h2h = bm.markets.find((m) => m.key === 'h2h'); // exactly 'h2h' — never 'h2h_lay'
-        if (!h2h) continue;
-        bookmakerCount++;
-        for (const outcome of h2h.outcomes) {
-          const current = best.get(outcome.name);
-          if (current === undefined || outcome.price > current) best.set(outcome.name, outcome.price);
+        if (h2h) {
+          sawThisBookmaker = true;
+          for (const outcome of h2h.outcomes) {
+            const current = bestH2h.get(outcome.name);
+            if (current === undefined || outcome.price > current) bestH2h.set(outcome.name, outcome.price);
+          }
+        }
+
+        const totals = bm.markets.find((m) => m.key === 'totals');
+        if (totals) {
+          sawThisBookmaker = true;
+          for (const outcome of totals.outcomes) {
+            if (outcome.point === undefined) continue;
+            const bucket = totalsByPoint.get(outcome.point) || { overPrices: [], underPrices: [] };
+            if (outcome.name === 'Over') bucket.overPrices.push(outcome.price);
+            else if (outcome.name === 'Under') bucket.underPrices.push(outcome.price);
+            totalsByPoint.set(outcome.point, bucket);
+          }
+        }
+
+        if (sawThisBookmaker) bookmakerCount++;
+      }
+
+      // Bookmakers occasionally disagree on the over/under line itself — go
+      // with whichever point line the most bookmakers actually quoted.
+      let totals: OddsTip['totals'] = null;
+      let bestQuoteCount = 0;
+      for (const [point, bucket] of totalsByPoint) {
+        const quoteCount = bucket.overPrices.length + bucket.underPrices.length;
+        if (quoteCount > bestQuoteCount && bucket.overPrices.length && bucket.underPrices.length) {
+          bestQuoteCount = quoteCount;
+          totals = { point, over: Math.max(...bucket.overPrices), under: Math.max(...bucket.underPrices) };
         }
       }
+
+      const home = bestH2h.get(ev.home_team);
+      const away = bestH2h.get(ev.away_team);
+      const draw = bestH2h.get('Draw');
+
       return {
-        event: `${ev.home_team} vs ${ev.away_team}`,
+        eventId: ev.id,
         homeTeam: ev.home_team,
         awayTeam: ev.away_team,
         commenceTime: ev.commence_time,
         bookmakers: bookmakerCount,
-        bestOdds: Array.from(best.entries()).map(([name, price]) => ({ name, price })),
+        h2h: home !== undefined && away !== undefined && draw !== undefined ? { home, draw, away } : null,
+        totals,
       };
     });
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// BTTS — fetched lazily, per event, only once a player actually opens a
+// specific match. The Odds API doesn't return btts on the bulk /odds call;
+// it needs the per-event endpoint, and coverage varies by bookmaker/event,
+// so this checks availability (1 credit) before ever spending a second
+// credit on the odds themselves. Cached per event so backing out and back
+// in during the same betting session doesn't re-spend credits.
+// ─────────────────────────────────────────────────────────────────────────
+
+const BTTS_CACHE_TTL_MS = 30 * 60_000;
+
+interface OddsApiEventMarketsResponse {
+  bookmakers: Array<{ markets: Array<{ key: string }> }>;
+}
+
+async function fetchAvailableMarketKeys(eventId: string): Promise<Set<string>> {
+  return cached(`sportybet:markets:${eventId}`, BTTS_CACHE_TTL_MS, async () => {
+    const url = `${ODDS_API_BASE}/sports/soccer_epl/events/${eventId}/markets?regions=uk&apiKey=${ODDS_API_KEY}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`The Odds API event-markets responded ${res.status}`);
+    const data = (await res.json()) as OddsApiEventMarketsResponse;
+    const keys = new Set<string>();
+    for (const bm of data.bookmakers ?? []) {
+      for (const m of bm.markets ?? []) keys.add(m.key);
+    }
+    return keys;
+  });
+}
+
+async function fetchBttsOdds(eventId: string): Promise<{ yes: number; no: number } | null> {
+  return cached(`sportybet:btts:${eventId}`, BTTS_CACHE_TTL_MS, async () => {
+    const url = `${ODDS_API_BASE}/sports/soccer_epl/events/${eventId}/odds/?regions=uk&markets=btts&oddsFormat=decimal&apiKey=${ODDS_API_KEY}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`The Odds API BTTS odds responded ${res.status}`);
+    const ev = (await res.json()) as OddsApiEvent;
+    let yes: number | undefined;
+    let no: number | undefined;
+    for (const bm of ev.bookmakers ?? []) {
+      const btts = bm.markets.find((m) => m.key === 'btts');
+      if (!btts) continue;
+      for (const outcome of btts.outcomes) {
+        if (outcome.name === 'Yes' && (yes === undefined || outcome.price > yes)) yes = outcome.price;
+        if (outcome.name === 'No' && (no === undefined || outcome.price > no)) no = outcome.price;
+      }
+    }
+    return yes !== undefined && no !== undefined ? { yes, no } : null;
+  });
+}
+
+/**
+ * Call this after a player picks a specific match, not for every fixture in
+ * a browsing list — it costs 1 credit to check, plus 1 more only if BTTS
+ * turns out to actually be listed for this event.
+ */
+export async function fetchBttsIfAvailable(eventId: string): Promise<{ yes: number; no: number } | null> {
+  const keys = await fetchAvailableMarketKeys(eventId);
+  if (!keys.has('btts')) return null;
+  return fetchBttsOdds(eventId);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -311,15 +414,15 @@ export function joinFixturesWithOdds(fixtures: FootballDataMatch[], tips: OddsTi
         sameCalendarDay(t.commenceTime, kickoff)
     );
 
-    let odds: FixtureWithOdds['odds'] = null;
-    if (tip) {
-      const homeOdds = tip.bestOdds.find((o) => normalizeTeamName(o.name) === home)?.price;
-      const awayOdds = tip.bestOdds.find((o) => normalizeTeamName(o.name) === away)?.price;
-      const drawOdds = tip.bestOdds.find((o) => o.name.toLowerCase() === 'draw')?.price;
-      if (homeOdds && awayOdds && drawOdds) odds = { home: homeOdds, draw: drawOdds, away: awayOdds };
-    }
-
-    return { homeTeam: fx.homeTeam.name, awayTeam: fx.awayTeam.name, kickoff, matchday: fx.matchday, odds };
+    return {
+      eventId: tip?.eventId ?? null,
+      homeTeam: fx.homeTeam.name,
+      awayTeam: fx.awayTeam.name,
+      kickoff,
+      matchday: fx.matchday,
+      h2h: tip?.h2h ?? null,
+      totals: tip?.totals ?? null,
+    };
   });
 }
 
@@ -348,7 +451,9 @@ export interface PlaceCouponPick {
   homeTeam: string;
   awayTeam: string;
   kickoff: string;
+  market: Market;
   selection: Selection;
+  point?: number; // required for 'totals' — the over/under line
   odds: number;
 }
 
@@ -385,7 +490,9 @@ export async function placeCoupon(userId: string, stake: number, picks: PlaceCou
     homeTeam: p.homeTeam,
     awayTeam: p.awayTeam,
     kickoff: p.kickoff,
+    market: p.market,
     selection: p.selection,
+    point: p.point,
     oddsAtPlacement: p.odds,
     status: 'pending',
   }));
@@ -428,15 +535,36 @@ export async function getCoupon(userId: string, couponId: string): Promise<Coupo
 // checks it against every leg still pending, across every user.
 // ─────────────────────────────────────────────────────────────────────────
 
-function resultOf(match: FootballDataMatch): Selection | 'void' | null {
-  if (match.status === 'FINISHED') {
-    if (match.score.winner === 'HOME_TEAM') return 'home';
-    if (match.score.winner === 'AWAY_TEAM') return 'away';
-    if (match.score.winner === 'DRAW') return 'draw';
-    return null; // FINISHED but no winner recorded yet — leave pending rather than guess
-  }
+/**
+ * Resolves one leg against its match, given the leg's own market — 1x2 uses
+ * football-data.org's score.winner directly; totals and btts are computed
+ * from the same score.fullTime goals, no separate data source needed for
+ * either. Returns null while the match still has nothing decided yet.
+ */
+function resolveLegResult(leg: Leg, match: FootballDataMatch): 'won' | 'lost' | 'void' | null {
   if (['POSTPONED', 'SUSPENDED', 'CANCELLED'].includes(match.status)) return 'void';
-  return null; // SCHEDULED / LIVE / IN_PLAY / PAUSED — still genuinely pending
+  if (match.status !== 'FINISHED') return null; // SCHEDULED / LIVE / IN_PLAY / PAUSED — still genuinely pending
+
+  const home = match.score.fullTime.home;
+  const away = match.score.fullTime.away;
+  if (home === null || away === null) return null; // FINISHED but no score recorded yet — leave pending rather than guess
+
+  if (leg.market === '1x2') {
+    if (match.score.winner === 'HOME_TEAM') return leg.selection === 'home' ? 'won' : 'lost';
+    if (match.score.winner === 'AWAY_TEAM') return leg.selection === 'away' ? 'won' : 'lost';
+    if (match.score.winner === 'DRAW') return leg.selection === 'draw' ? 'won' : 'lost';
+    return null; // unrecognized winner value — leave pending rather than guess
+  }
+
+  if (leg.market === 'totals') {
+    const point = leg.point ?? 2.5;
+    const isOver = home + away > point;
+    return (leg.selection === 'over') === isOver ? 'won' : 'lost';
+  }
+
+  // btts
+  const bothScored = home > 0 && away > 0;
+  return (leg.selection === 'yes') === bothScored ? 'won' : 'lost';
 }
 
 export async function pollAndSettleCoupons(): Promise<{ couponsChecked: number; couponsSettled: number }> {
@@ -465,12 +593,12 @@ export async function pollAndSettleCoupons(): Promise<{ couponsChecked: number; 
         );
         if (!match) continue; // not in this payload — try again next poll
 
-        const result = resultOf(match);
+        const result = resolveLegResult(leg, match);
         if (result === null) continue; // still genuinely pending
         if (result === 'void') {
           leg.status = 'voided';
         } else {
-          leg.status = result === leg.selection ? 'won' : 'lost';
+          leg.status = result; // 'won' | 'lost'
           leg.finalScore = `${match.score.fullTime.home} - ${match.score.fullTime.away}`;
         }
         legsChanged = true;
@@ -547,9 +675,16 @@ const COUPON_EMOJI: Record<CouponStatus, string> = {
   lost: '🔴',
 };
 
+/** Shared with plugins/sportybet.ts's slip preview so a leg reads the same way everywhere. */
+export function legPickLabel(leg: { market: Market; selection: Selection; homeTeam: string; awayTeam: string; point?: number }): string {
+  if (leg.market === '1x2') return leg.selection === 'home' ? leg.homeTeam : leg.selection === 'away' ? leg.awayTeam : 'Draw';
+  if (leg.market === 'totals') return `${leg.selection === 'over' ? 'Over' : 'Under'} ${leg.point}`;
+  return leg.selection === 'yes' ? 'BTTS: Yes' : 'BTTS: No';
+}
+
 export function formatCoupon(coupon: Coupon): string {
   const lines = coupon.legs.map((leg) => {
-    const pick = leg.selection === 'home' ? leg.homeTeam : leg.selection === 'away' ? leg.awayTeam : 'Draw';
+    const pick = legPickLabel(leg);
     const score = leg.finalScore ? ` (${leg.finalScore})` : '';
     return `${LEG_EMOJI[leg.status]} ${leg.homeTeam} vs ${leg.awayTeam} — ${pick} @ ${leg.oddsAtPlacement}${score}`;
   });
