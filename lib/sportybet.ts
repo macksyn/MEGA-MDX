@@ -402,6 +402,63 @@ function sameCalendarDay(isoA: string, isoB: string): boolean {
   return new Date(isoA).toISOString().slice(0, 10) === new Date(isoB).toISOString().slice(0, 10);
 }
 
+// Only for clubs where stripping FC/AFC alone doesn't land on the name
+// people actually use — either because it's a genuinely different nickname
+// (Wolverhampton Wanderers -> Wolves) or because two clubs would otherwise
+// collide (Manchester United AND Manchester City would both reduce to just
+// "Manchester", which would make fixtures/bets ambiguous — a real bug, not
+// just a style nitpick). Anything not listed here falls through to the
+// FC/AFC-stripped official name, which is already fine on its own
+// (Arsenal, Chelsea, Everton, Brentford, Fulham, etc.).
+const CLUB_SHORT_NAME_OVERRIDES: Record<string, string> = {
+  'manchester united': 'Man United',
+  'manchester city': 'Man City',
+  'wolverhampton wanderers': 'Wolves',
+  'west ham united': 'West Ham',
+  'west bromwich albion': 'West Brom',
+  'sheffield united': 'Sheffield Utd',
+  'sheffield wednesday': 'Sheffield Wed',
+  'nottingham forest': "Nott'm Forest",
+  'newcastle united': 'Newcastle',
+  'leeds united': 'Leeds',
+  'leicester city': 'Leicester',
+  'norwich city': 'Norwich',
+  'stoke city': 'Stoke',
+  'swansea city': 'Swansea',
+  'cardiff city': 'Cardiff',
+  'hull city': 'Hull',
+  'ipswich town': 'Ipswich',
+  'luton town': 'Luton',
+  'coventry city': 'Coventry',
+  'tottenham hotspur': 'Tottenham',
+  'brighton hove albion': 'Brighton',
+  'birmingham city': 'Birmingham',
+  'queens park rangers': 'QPR',
+  'wigan athletic': 'Wigan',
+  'blackburn rovers': 'Blackburn',
+  'preston north end': 'Preston',
+  'huddersfield town': 'Huddersfield',
+  'derby county': 'Derby',
+};
+
+/**
+ * Short, casual display name for a club — "Tottenham" not "Tottenham
+ * Hotspur FC", "Brighton" not "Brighton & Hove Albion FC". DISPLAY ONLY:
+ * call this at render time; never store its output. Settlement and coupon
+ * matching always run on the full official name (leg.homeTeam/awayTeam,
+ * FixtureWithOdds.homeTeam/awayTeam) via normalizeTeamName above — shortening
+ * those in place would silently break the join against football-data.org's
+ * results by settlement time.
+ */
+export function shortClubName(officialName: string): string {
+  const stripped = officialName
+    .replace(/^AFC\s+/i, '')
+    .replace(/\s+(AFC|FC)$/i, '')
+    .trim();
+  const key = stripped.toLowerCase().replace(/&/g, '').replace(/\s+/g, ' ').trim();
+  return CLUB_SHORT_NAME_OVERRIDES[key] || stripped;
+}
+
 export function joinFixturesWithOdds(fixtures: FootballDataMatch[], tips: OddsTip[]): FixtureWithOdds[] {
   return fixtures.map((fx) => {
     const kickoff = fx.utcDate; // already ISO UTC — football-data.org needs no date parsing
@@ -677,7 +734,9 @@ const COUPON_EMOJI: Record<CouponStatus, string> = {
 
 /** Shared with plugins/sportybet.ts's slip preview so a leg reads the same way everywhere. */
 export function legPickLabel(leg: { market: Market; selection: Selection; homeTeam: string; awayTeam: string; point?: number }): string {
-  if (leg.market === '1x2') return leg.selection === 'home' ? leg.homeTeam : leg.selection === 'away' ? leg.awayTeam : 'Draw';
+  if (leg.market === '1x2') {
+    return leg.selection === 'home' ? shortClubName(leg.homeTeam) : leg.selection === 'away' ? shortClubName(leg.awayTeam) : 'Draw';
+  }
   if (leg.market === 'totals') return `${leg.selection === 'over' ? 'Over' : 'Under'} ${leg.point}`;
   return leg.selection === 'yes' ? 'BTTS: Yes' : 'BTTS: No';
 }
@@ -686,7 +745,7 @@ export function formatCoupon(coupon: Coupon): string {
   const lines = coupon.legs.map((leg) => {
     const pick = legPickLabel(leg);
     const score = leg.finalScore ? ` (${leg.finalScore})` : '';
-    return `${LEG_EMOJI[leg.status]} ${leg.homeTeam} vs ${leg.awayTeam} — ${pick} @ ${leg.oddsAtPlacement}${score}`;
+    return `${LEG_EMOJI[leg.status]} ${shortClubName(leg.homeTeam)} vs ${shortClubName(leg.awayTeam)} — ${pick} @ ${leg.oddsAtPlacement}${score}`;
   });
 
   const wasCapped = coupon.status === 'won' && coupon.actualPayout !== undefined && coupon.actualPayout < coupon.potentialPayout;
