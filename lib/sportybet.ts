@@ -426,7 +426,6 @@ const CLUB_SHORT_NAME_OVERRIDES: Record<string, string> = {
   'stoke city': 'Stoke',
   'swansea city': 'Swansea',
   'cardiff city': 'Cardiff',
-  'hull city': 'Hull',
   'ipswich town': 'Ipswich',
   'luton town': 'Luton',
   'coventry city': 'Coventry',
