@@ -34,6 +34,7 @@ import {
   fetchBttsIfAvailable,
   joinFixturesWithOdds,
   normalizeTeamName,
+  shortClubName,
   computePotentialPayout,
   placeCoupon,
   getUserCoupons,
@@ -80,7 +81,7 @@ function marketLabel(market: Market): string {
 }
 
 function buildSlipPreview(picks: PlaceCouponPick[]): string {
-  return picks.map((p, i) => `${i + 1}. ${p.homeTeam} vs ${p.awayTeam} — ${legPickLabel(p)} @ ${p.odds}`).join('\n');
+  return picks.map((p, i) => `${i + 1}. ${shortClubName(p.homeTeam)} vs ${shortClubName(p.awayTeam)} — ${legPickLabel(p)} @ ${p.odds}`).join('\n');
 }
 
 function sameMatch(pick: { homeTeam: string; awayTeam: string }, fixture: { homeTeam: string; awayTeam: string }): boolean {
@@ -217,9 +218,9 @@ async function runSelectionPicker(
 
   if (market === '1x2') {
     options = [
-      { label: `🏠 ${fixture.homeTeam}`, value: 'home', description: `@ ${fixture.h2h!.home}` },
+      { label: `🏠 ${shortClubName(fixture.homeTeam)}`, value: 'home', description: `@ ${fixture.h2h!.home}` },
       { label: '🤝 Draw', value: 'draw', description: `@ ${fixture.h2h!.draw}` },
-      { label: `✈️ ${fixture.awayTeam}`, value: 'away', description: `@ ${fixture.h2h!.away}` },
+      { label: `✈️ ${shortClubName(fixture.awayTeam)}`, value: 'away', description: `@ ${fixture.h2h!.away}` },
     ];
   } else if (market === 'totals') {
     options = [
@@ -234,7 +235,7 @@ async function runSelectionPicker(
   }
 
   const result = await promptMenu(sock, message, chatId, userId, {
-    title: `${fixture.homeTeam} vs ${fixture.awayTeam}`,
+    title: `${shortClubName(fixture.homeTeam)} vs ${shortClubName(fixture.awayTeam)}`,
     text: marketLabel(market),
     options,
     cancelLabel: 'Back',
@@ -294,7 +295,7 @@ async function runMarketPicker(
   if (bttsOdds) options.push({ label: '🎯 Both Teams to Score', value: 'btts' });
 
   const result = await promptMenu(sock, message, chatId, userId, {
-    title: `${fixture.homeTeam} vs ${fixture.awayTeam}`,
+    title: `${shortClubName(fixture.homeTeam)} vs ${shortClubName(fixture.awayTeam)}`,
     text: `${formatKickoff(fixture.kickoff)}\nPick a market to bet on.`,
     options,
     cancelLabel: 'Back',
@@ -333,7 +334,7 @@ async function runFixturePicker(
   const result = await promptMenu(sock, message, chatId, userId, {
     title: picks.length ? `⚽ Add another match (${picks.length}/${MAX_LEGS_PER_COUPON} picked)` : '⚽ Pick a match',
     text: more > 0 ? `Showing the next ${page.length} of ${remaining.length} fixtures.` : 'Choose a fixture to bet on.',
-    options: page.map((f, i) => ({ label: `${f.homeTeam} vs ${f.awayTeam}`, value: String(i), description: formatKickoff(f.kickoff) })),
+    options: page.map((f, i) => ({ label: `${shortClubName(f.homeTeam)} vs ${shortClubName(f.awayTeam)}`, value: String(i), description: formatKickoff(f.kickoff) })),
     cancelLabel: 'Back',
   });
 
@@ -440,7 +441,7 @@ async function runFixtures(sock: any, message: any, chatId: string, userId: stri
     }
     // Reuse the join purely to flatten the nested homeTeam/awayTeam objects — no odds tips needed here.
     const withKickoff = joinFixturesWithOdds(fixtures, []).slice(0, 10);
-    const text = withKickoff.map((f) => `⚽ ${f.homeTeam} vs ${f.awayTeam}\n   ${formatKickoff(f.kickoff)}`).join('\n\n');
+    const text = withKickoff.map((f) => `⚽ ${shortClubName(f.homeTeam)} vs ${shortClubName(f.awayTeam)}\n   ${formatKickoff(f.kickoff)}`).join('\n\n');
     return sock.sendMessage(
       chatId,
       { text: `📆 *Upcoming Fixtures*\n\n${text || 'No upcoming fixtures found.'}`, ...channelInfo },
@@ -459,7 +460,7 @@ async function runFixtures(sock: any, message: any, chatId: string, userId: stri
   const text = finished
     .map((m) => {
       const emoji = m.score.winner === 'DRAW' ? '🤝' : '⚽';
-      return `${emoji} ${m.homeTeam.name} ${m.score.fullTime.home} - ${m.score.fullTime.away} ${m.awayTeam.name}`;
+      return `${emoji} ${shortClubName(m.homeTeam.name)} ${m.score.fullTime.home} - ${m.score.fullTime.away} ${shortClubName(m.awayTeam.name)}`;
     })
     .join('\n');
   return sock.sendMessage(
