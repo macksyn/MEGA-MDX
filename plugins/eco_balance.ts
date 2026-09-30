@@ -53,12 +53,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
   const statsBlock =
     `🪙 Coins: *${formatNumber(wallet.coins)}*\n` +
-    `💲 Groq Coins: *${formatNumber(wallet.groqCoins)}*\n` +
-    `${levelStatus}\n` +
-    `🔄 Exchanges (lifetime): *${formatNumber(wallet.exchangeCount)}*\n` +
-    `🔄 Exchanges (last 7d): *${formatNumber(rollingCount)}* / ${levelInfo.rollingRequired}\n` +
-    `📈 ${levelInfo.bar} ${levelInfo.progressPercent}%\n\n` +
-    `➡️ _Next: *${levelInfo.nextLevelName || 'Max'}* at ${formatNumber(levelInfo.next)} exchanges_ `;
+    `💲 Groq Coins: *${formatNumber(wallet.groqCoins)}*\n`;
 
   // Viewing someone else's balance never offered the statement button
   // (strictly self-only, even for owner/sudo) — keep that as a plain
