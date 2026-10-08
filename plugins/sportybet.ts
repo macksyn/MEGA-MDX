@@ -582,13 +582,18 @@ async function runFixtures(sock: any, message: any, chatId: string, userId: stri
     console.error('[sportybet] failed to load results:', err);
     return sock.sendMessage(chatId, { text: '⚠️ Could not reach the results service right now.', ...channelInfo }, { quoted: message });
   }
-  const finished = matches.filter((m) => m.status === 'FINISHED').slice(-10).reverse();
+  // Newest first, sorted by kickoff rather than trusting the API's ordering.
+  const finished = matches
+    .filter((m) => m.status === 'FINISHED')
+    .sort((a, b) => new Date(b.utcDate).getTime() - new Date(a.utcDate).getTime())
+    .slice(0, 10);
   const text = finished
     .map((m) => {
       const emoji = m.score.winner === 'DRAW' ? '🤝' : '⚽';
-      return `${emoji} ${shortClubName(m.homeTeam.name)} ${m.score.fullTime.home} - ${m.score.fullTime.away} ${shortClubName(m.awayTeam.name)}`;
+      // Same date/time line the Upcoming Fixtures list uses (WAT).
+      return `${emoji} ${shortClubName(m.homeTeam.name)} ${m.score.fullTime.home} - ${m.score.fullTime.away} ${shortClubName(m.awayTeam.name)}\n   ${formatKickoff(m.utcDate)}`;
     })
-    .join('\n');
+    .join('\n\n');
   return sock.sendMessage(
     chatId,
     { text: `🏁 *Recent Results*\n\n${text || 'No finished matches yet.'}`, ...channelInfo },
