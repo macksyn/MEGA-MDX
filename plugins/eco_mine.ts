@@ -53,7 +53,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
       `⛏️ *MINING RESULT* ⛏️\n\n` +
       `You mined *${formatNumber(result.minted)} coins* total.\n\n` +
       `💰 Your cut: *${formatNumber(result.minerShare)} coins*\n` +
-      `🏦 Sent to the jackpot: *${formatNumber(result.jackpotShare)} coins*\n\n` +
+      `🏦 Sent to the bank: *${formatNumber(result.jackpotShare)} coins*\n\n` +
       `_Check *.bank* to see the bank grow._`,
     ...channelInfo
   }, { quoted: message });

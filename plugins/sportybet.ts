@@ -18,11 +18,16 @@
  *   return outcome;
  *
  * A coupon can hold more than one leg (accumulator: all legs must win,
- * odds multiply) across three markets — Match Winner (1x2), Total Goals
- * (over/under), and Both Teams to Score (btts, only offered when the odds
- * provider actually lists it for that match). Settlement itself runs
- * elsewhere on a schedule (pollAndSettleCoupons in lib/sportybet.ts) — this
- * file only ever reads/displays coupon state.
+ * odds multiply), one leg per match. Markets: Match Winner, Total Goals
+ * (ladder of lines), Both Teams to Score, Double Chance, Draw No Bet and Team
+ * Goals (ladder per team), plus — behind a "More markets" button — the 1st-half
+ * markets (BTTS, Double Chance) and Half-time/Full-time. Only markets the odds
+ * provider actually prices for a match are ever shown. Prices for everything
+ * beyond Match Winner are fetched when a match is OPENED (core) or when "More
+ * markets" is tapped (extra), never for the whole fixture list — that's what
+ * keeps the 500-credit month intact. Settlement itself runs elsewhere on a
+ * schedule (pollAndSettleCoupons in lib/sportybet.ts) — this file only ever
+ * reads/displays coupon state.
  */
 import { withEconomyGuard, formatNumber, getWallet } from '../lib/economy.js';
 import { promptMenu, promptAmount } from '../lib/buttonSession.js';
@@ -31,7 +36,12 @@ import {
   fetchUpcomingFixtures,
   fetchOddsTips,
   fetchAllSeasonMatches,
-  fetchBttsIfAvailable,
+  fetchCoreMarkets,
+  fetchExtraMarkets,
+  getCachedExtraMarkets,
+  availableMarkets,
+  getMarketOptions,
+  isCreditBudgetError,
   joinFixturesWithOdds,
   normalizeTeamName,
   shortClubName,
@@ -43,10 +53,13 @@ import {
   MIN_STAKE,
   MAX_STAKE,
   MAX_LEGS_PER_COUPON,
+  BETTING_CUTOFF_MS,
   type FixtureWithOdds,
   type PlaceCouponPick,
   type Market,
-  type Selection,
+  type MarketOption,
+  type EventMarkets,
+  type TeamSide,
   type Coupon,
 } from '../lib/sportybet.js';
 
@@ -75,10 +88,39 @@ function formatDateShort(ts: number): string {
 }
 
 function marketLabel(market: Market): string {
-  if (market === '1x2') return 'Match Winner';
-  if (market === 'totals') return 'Total Goals';
-  return 'Both Teams to Score';
+  switch (market) {
+    case '1x2':
+      return 'Match Winner';
+    case 'totals':
+      return 'Total Goals';
+    case 'team_totals':
+      return 'Team Goals';
+    case 'btts':
+      return 'Both Teams to Score';
+    case 'btts_h1':
+      return '1st Half — Both Teams to Score';
+    case 'draw_no_bet':
+      return "Draw No Bet — stake back if it's a draw";
+    case 'double_chance':
+      return 'Double Chance';
+    case 'double_chance_h1':
+      return '1st Half — Double Chance';
+    case 'halftime_fulltime':
+      return 'Half-time / Full-time — pick both results';
+  }
 }
+
+const MARKET_MENU_LABEL: Record<Market, string> = {
+  '1x2': '⚽ Match Winner',
+  totals: '🥅 Total Goals',
+  btts: '🎯 Both Teams to Score',
+  double_chance: '🛡️ Double Chance',
+  draw_no_bet: '🔁 Draw No Bet',
+  team_totals: '🏟️ Team Goals',
+  btts_h1: '🎯 1st Half BTTS',
+  double_chance_h1: '🛡️ 1st Half Double Chance',
+  halftime_fulltime: '⏱️ Half-time / Full-time',
+};
 
 function buildSlipPreview(picks: PlaceCouponPick[]): string {
   return picks.map((p, i) => `${i + 1}. ${shortClubName(p.homeTeam)} vs ${shortClubName(p.awayTeam)} — ${legPickLabel(p)} @ ${p.odds}`).join('\n');
@@ -103,6 +145,8 @@ function placeCouponErrorMessage(reason: string): string {
       return `You don't have enough coins for that stake.`;
     case 'no_legs':
       return `No matches were picked.`;
+    case 'betting_closed':
+      return `Betting has closed on one of those matches — it's about to kick off or already has.`;
     default:
       return `Something went wrong placing that bet — try again.`;
   }
@@ -202,6 +246,34 @@ async function runAddOrStake(
   return outcome;
 }
 
+/** Button text for one selection inside a market. Over/under rows read "Over 2.5"; the price goes in the description. */
+function optionLabel(market: Market, o: MarketOption, fixture: FixtureWithOdds): string {
+  const home = shortClubName(fixture.homeTeam);
+  const away = shortClubName(fixture.awayTeam);
+
+  switch (market) {
+    case '1x2':
+      return o.selection === 'home' ? `🏠 ${home}` : o.selection === 'away' ? `✈️ ${away}` : '🤝 Draw';
+    case 'draw_no_bet':
+      return o.selection === 'home' ? `🏠 ${home}` : `✈️ ${away}`;
+    case 'totals':
+    case 'team_totals':
+      return `${o.selection === 'over' ? '⬆️ Over' : '⬇️ Under'} ${o.point}`;
+    case 'btts':
+    case 'btts_h1':
+      return o.selection === 'yes' ? '✅ Yes' : '❌ No';
+    case 'double_chance':
+    case 'double_chance_h1':
+      // The "1st half" part is already in the screen title, so label it as a plain double chance.
+      return `🛡️ ${legPickLabel({ market: 'double_chance', selection: o.selection, homeTeam: fixture.homeTeam, awayTeam: fixture.awayTeam })}`;
+    case 'halftime_fulltime': {
+      const [ht, ft] = String(o.selection).split('/');
+      const side = (c: string) => (c === '1' ? home : c === '2' ? away : 'Draw');
+      return `⏱️ ${side(ht)} / ${side(ft)}`;
+    }
+  }
+}
+
 async function runSelectionPicker(
   sock: any,
   message: any,
@@ -212,31 +284,72 @@ async function runSelectionPicker(
   picks: PlaceCouponPick[],
   fixture: FixtureWithOdds,
   market: Market,
-  bttsOdds: { yes: number; no: number } | null
+  em: EventMarkets,
+  team?: TeamSide
 ) {
-  let options: { label: string; value: string; description?: string }[];
+  const opts = getMarketOptions(market, fixture, em, team);
+  if (!opts.length) return 'back'; // nothing priced here after all — step back rather than show an empty menu
 
-  if (market === '1x2') {
-    options = [
-      { label: `🏠 ${shortClubName(fixture.homeTeam)}`, value: 'home', description: `@ ${fixture.h2h!.home}` },
-      { label: '🤝 Draw', value: 'draw', description: `@ ${fixture.h2h!.draw}` },
-      { label: `✈️ ${shortClubName(fixture.awayTeam)}`, value: 'away', description: `@ ${fixture.h2h!.away}` },
-    ];
-  } else if (market === 'totals') {
-    options = [
-      { label: `⬆️ Over ${fixture.totals!.point}`, value: 'over', description: `@ ${fixture.totals!.over}` },
-      { label: `⬇️ Under ${fixture.totals!.point}`, value: 'under', description: `@ ${fixture.totals!.under}` },
-    ];
-  } else {
-    options = [
-      { label: '✅ Yes', value: 'yes', description: `@ ${bttsOdds!.yes}` },
-      { label: '❌ No', value: 'no', description: `@ ${bttsOdds!.no}` },
-    ];
+  const textLines = [marketLabel(market)];
+  if (market === 'team_totals' && team) {
+    textLines.push(`${shortClubName(team === 'home' ? fixture.homeTeam : fixture.awayTeam)} goals`);
   }
+  if (market === 'halftime_fulltime') textLines.push('First name = leading at half-time, second = winning at full-time.');
 
   const result = await promptMenu(sock, message, chatId, userId, {
     title: `${shortClubName(fixture.homeTeam)} vs ${shortClubName(fixture.awayTeam)}`,
-    text: marketLabel(market),
+    text: textLines.join('\n'),
+    options: opts.map((o, i) => ({
+      label: optionLabel(market, o, fixture),
+      value: String(i),
+      description: `@ ${o.odds}`,
+    })),
+    cancelLabel: 'Back',
+  });
+
+  if (result.cancelled) return 'back';
+  if (result.timedOut || !result.value) return;
+
+  const chosen = opts[Number(result.value)];
+  if (!chosen) return;
+
+  const newPick: PlaceCouponPick = {
+    homeTeam: fixture.homeTeam,
+    awayTeam: fixture.awayTeam,
+    kickoff: fixture.kickoff,
+    market,
+    selection: chosen.selection,
+    point: chosen.point,
+    team: chosen.team,
+    odds: chosen.odds,
+  };
+
+  const outcome = await runAddOrStake(sock, message, chatId, userId, channelInfo, joined, [...picks, newPick]);
+  if (outcome === 'back') {
+    return runSelectionPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, market, em, team);
+  }
+  return outcome;
+}
+
+/** Team Goals needs one extra hop: which team's goals are we betting on? */
+async function runTeamTotalsPicker(
+  sock: any,
+  message: any,
+  chatId: string,
+  userId: string,
+  channelInfo: any,
+  joined: FixtureWithOdds[],
+  picks: PlaceCouponPick[],
+  fixture: FixtureWithOdds,
+  em: EventMarkets
+) {
+  const options: { label: string; value: string; description?: string }[] = [];
+  if (em.team_totals?.home.length) options.push({ label: `🏠 ${shortClubName(fixture.homeTeam)}`, value: 'home', description: 'Goals scored by this team' });
+  if (em.team_totals?.away.length) options.push({ label: `✈️ ${shortClubName(fixture.awayTeam)}`, value: 'away', description: 'Goals scored by this team' });
+
+  const result = await promptMenu(sock, message, chatId, userId, {
+    title: `${shortClubName(fixture.homeTeam)} vs ${shortClubName(fixture.awayTeam)}`,
+    text: "Which team's goals?",
     options,
     cancelLabel: 'Back',
   });
@@ -244,28 +357,8 @@ async function runSelectionPicker(
   if (result.cancelled) return 'back';
   if (result.timedOut || !result.value) return;
 
-  const selection = result.value as Selection;
-  const odds =
-    market === '1x2'
-      ? fixture.h2h![selection as 'home' | 'draw' | 'away']
-      : market === 'totals'
-      ? fixture.totals![selection as 'over' | 'under']
-      : bttsOdds![selection as 'yes' | 'no'];
-
-  const newPick: PlaceCouponPick = {
-    homeTeam: fixture.homeTeam,
-    awayTeam: fixture.awayTeam,
-    kickoff: fixture.kickoff,
-    market,
-    selection,
-    point: market === 'totals' ? fixture.totals!.point : undefined,
-    odds,
-  };
-
-  const outcome = await runAddOrStake(sock, message, chatId, userId, channelInfo, joined, [...picks, newPick]);
-  if (outcome === 'back') {
-    return runSelectionPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, market, bttsOdds);
-  }
+  const outcome = await runSelectionPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, 'team_totals', em, result.value as TeamSide);
+  if (outcome === 'back') return runTeamTotalsPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, em);
   return outcome;
 }
 
@@ -279,24 +372,39 @@ async function runMarketPicker(
   picks: PlaceCouponPick[],
   fixture: FixtureWithOdds
 ) {
-  const options: { label: string; value: Market; description?: string }[] = [{ label: '⚽ Match Winner', value: '1x2' }];
-  if (fixture.totals) options.push({ label: '🥅 Total Goals', value: 'totals', description: `O/U ${fixture.totals.point}` });
+  // Prices beyond 1X2 are bought here, for THIS match only, and cached for 24h
+  // (so Back / re-opening is free). Core markets load automatically; the extra
+  // 1st-half / HT-FT bundle only loads when the player taps "More markets".
+  let core: EventMarkets = {};
+  let coreLoaded = false;
+  let paused = false;
+  let extra: EventMarkets | null = null;
 
-  // Cheap (1 credit) availability check, only for this one match, only when
-  // it's actually opened — never pre-fetched for the whole fixture list.
-  let bttsOdds: { yes: number; no: number } | null = null;
   if (fixture.eventId) {
     try {
-      bttsOdds = await fetchBttsIfAvailable(fixture.eventId);
+      core = await fetchCoreMarkets(fixture.eventId);
+      coreLoaded = true;
     } catch (err) {
-      console.error('[sportybet] BTTS availability check failed:', err);
+      if (isCreditBudgetError(err)) paused = true;
+      console.warn('[sportybet] extra markets unavailable for this match:', err instanceof Error ? err.message : err);
     }
+    extra = await getCachedExtraMarkets(fixture.eventId);
   }
-  if (bttsOdds) options.push({ label: '🎯 Both Teams to Score', value: 'btts' });
+
+  const em: EventMarkets = { ...core, ...(extra ?? {}) };
+  const options: { label: string; value: string; description?: string }[] = availableMarkets(fixture, em).map((m) => ({
+    label: MARKET_MENU_LABEL[m],
+    value: m,
+    description: m === 'totals' && em.totals?.length ? `Lines ${em.totals[0].point}–${em.totals[em.totals.length - 1].point}` : undefined,
+  }));
+
+  if (fixture.eventId && coreLoaded && extra === null) {
+    options.push({ label: '➕ More markets', value: 'more', description: '1st half & half-time/full-time' });
+  }
 
   const result = await promptMenu(sock, message, chatId, userId, {
     title: `${shortClubName(fixture.homeTeam)} vs ${shortClubName(fixture.awayTeam)}`,
-    text: `${formatKickoff(fixture.kickoff)}\nPick a market to bet on.`,
+    text: `${formatKickoff(fixture.kickoff)}\nPick a market to bet on.${paused ? '\n\nℹ️ Extra markets are unavailable right now.' : ''}`,
     options,
     cancelLabel: 'Back',
   });
@@ -304,8 +412,24 @@ async function runMarketPicker(
   if (result.cancelled) return 'back';
   if (result.timedOut || !result.value) return;
 
+  if (result.value === 'more') {
+    try {
+      const fetched = await fetchExtraMarkets(fixture.eventId!);
+      if (!Object.keys(fetched).length) {
+        await sock.sendMessage(chatId, { text: 'ℹ️ No extra markets are listed for this match.', ...channelInfo }, { quoted: message });
+      }
+    } catch (err) {
+      console.warn('[sportybet] extra markets failed:', err instanceof Error ? err.message : err);
+      await sock.sendMessage(chatId, { text: '⚠️ Could not load more markets right now.', ...channelInfo }, { quoted: message });
+    }
+    return runMarketPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture);
+  }
+
   const market = result.value as Market;
-  const outcome = await runSelectionPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, market, bttsOdds);
+  const outcome =
+    market === 'team_totals'
+      ? await runTeamTotalsPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, em)
+      : await runSelectionPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, market, em);
   if (outcome === 'back') return runMarketPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture);
   return outcome;
 }
@@ -363,7 +487,9 @@ async function runPlaceBet(sock: any, message: any, chatId: string, userId: stri
     return;
   }
 
-  const joined = joinFixturesWithOdds(fixtures, tips).filter((f) => f.h2h);
+  // Pre-match only: hide anything already inside the betting cutoff (same rule placeCoupon enforces).
+  const cutoff = Date.now() + BETTING_CUTOFF_MS;
+  const joined = joinFixturesWithOdds(fixtures, tips).filter((f) => f.h2h && new Date(f.kickoff).getTime() > cutoff);
   if (!joined.length) {
     await sock.sendMessage(
       chatId,

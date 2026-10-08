@@ -34,14 +34,47 @@ const ODDS_API_BASE = 'https://api.the-odds-api.com/v4';
 const ODDS_API_KEY = process.env.ODDS_API_KEY || '';
 
 // football-data.org's limit is per-minute (10/min), so a short cache is plenty.
-// The Odds API's free tier is a flat 500 CREDITS/month instead (cost = markets
-// x regions per call) — sized here for the 3-market state (h2h+totals+btts,
-// 1 region = 3 credits/call): 4 calls/day x 3 credits x 30 days = 360/month,
-// safe under budget with room for manual testing. Odds don't need to be
-// fresher than this for a pre-match-only game anyway.
+//
+// The Odds API's free tier is a flat 500 CREDITS/month instead. What a call costs:
+//   bulk  /sports/soccer_epl/odds ........ markets x regions
+//   event /events/{id}/odds .............. UNIQUE MARKETS ACTUALLY RETURNED x regions
+//   event /events/{id}/markets ........... 1  (no longer used — see below)
+// Because the event endpoint only bills for markets that come back, asking for
+// a market the UK books don't list is free. That makes the old per-match
+// "/markets availability check" (1 credit) pure waste: we just request the
+// bundle and see what's returned.
+//
+// Spend plan (1 region = uk):
+//   bulk h2h, 8h cache ................... <= 3 calls/day x 1 credit  = <= 90/month
+//   CORE bundle (<= 5 markets) ........... <= 5 credits per match, once per 24h,
+//                                          only when a player opens that match
+//   EXTRA bundle (<= 3 markets) .......... <= 3 credits per match, only if a player
+//                                          taps "More markets"
+//   reserve .............................. 40 credits per-match fetches never touch
+// ~38 EPL matches a month, so even if every one is opened (and half also tap
+// "More markets") that's roughly 38x5 + 19x3 = ~250, plus <= 90 bulk = ~340 of 500.
+// All odds caches are also persisted to the plugin store, so a bot restart
+// never re-buys odds that are still fresh.
 const FIXTURES_CACHE_TTL_MS = 60_000;
 const SEASON_MATCHES_CACHE_TTL_MS = 60_000;
-const ODDS_CACHE_TTL_MS = 6 * 60 * 60_000;
+const ODDS_CACHE_TTL_MS = 8 * 60 * 60_000; // bulk h2h
+const EVENT_ODDS_CACHE_TTL_MS = 24 * 60 * 60_000; // per-match market bundles
+
+/** Per-match fetches refuse to run if they could dip the account below this. Bulk h2h may use it. */
+const ODDS_CREDIT_RESERVE = 40;
+
+// Market bundles requested from /events/{id}/odds. The alternate_* ladders also
+// contain the main line, so the plain `totals` / `team_totals` keys are not
+// requested (one credit each saved per match). If a one-off curl on a real match
+// shows the ladder missing the main line, add the plain key back here.
+const CORE_MARKET_KEYS = ['btts', 'double_chance', 'draw_no_bet', 'alternate_totals', 'alternate_team_totals'] as const;
+const EXTRA_MARKET_KEYS = ['btts_h1', 'double_chance_h1', 'halftime_fulltime'] as const;
+
+/** Bets close this long before kickoff — pre-match only, and half-time markets must never be bettable mid-game. */
+export const BETTING_CUTOFF_MS = 5 * 60_000;
+
+/** Max over/under lines offered per ladder — 5 lines x 2 sides = 10 buttons, the proven menu ceiling. */
+const MAX_LADDER_LINES = 5;
 
 export const MIN_STAKE = 10;
 export const MAX_STAKE = 5000;
@@ -70,6 +103,8 @@ interface FootballDataMatch {
   score: {
     winner: 'HOME_TEAM' | 'AWAY_TEAM' | 'DRAW' | null;
     fullTime: { home: number | null; away: number | null };
+    /** Needed by the 1st-half markets (btts_h1, double_chance_h1, halftime_fulltime). */
+    halfTime?: { home: number | null; away: number | null };
   };
 }
 
@@ -85,15 +120,29 @@ interface OddsTip {
   commenceTime: string; // ISO 8601 UTC
   bookmakers: number;
   h2h: { home: number; draw: number; away: number } | null;
-  totals: { point: number; over: number; under: number } | null; // best over/under at whichever line most bookmakers quote
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Domain types
 // ─────────────────────────────────────────────────────────────────────────
 
-export type Market = '1x2' | 'totals' | 'btts';
-export type Selection = 'home' | 'draw' | 'away' | 'over' | 'under' | 'yes' | 'no';
+export type Market =
+  | '1x2'
+  | 'totals' // over/under total goals — any line from the alternate_totals ladder
+  | 'btts'
+  | 'draw_no_bet'
+  | 'double_chance'
+  | 'team_totals' // over/under ONE team's goals — any line from alternate_team_totals
+  | 'btts_h1'
+  | 'double_chance_h1'
+  | 'halftime_fulltime';
+
+export type TeamSide = 'home' | 'away';
+/** 1X = home or draw, 12 = home or away (no draw), X2 = draw or away. */
+export type DoubleChanceSel = '1x' | '12' | 'x2';
+/** "<half-time result>/<full-time result>", each 1 = home, x = draw, 2 = away. */
+export type HtFtSel = '1/1' | '1/x' | '1/2' | 'x/1' | 'x/x' | 'x/2' | '2/1' | '2/x' | '2/2';
+export type Selection = 'home' | 'draw' | 'away' | 'over' | 'under' | 'yes' | 'no' | DoubleChanceSel | HtFtSel;
 export type LegStatus = 'pending' | 'won' | 'lost' | 'voided';
 export type CouponStatus = 'pending' | 'won' | 'lost';
 
@@ -104,7 +153,6 @@ export interface FixtureWithOdds {
   kickoff: string; // ISO 8601 UTC
   matchday: number;
   h2h: { home: number; draw: number; away: number } | null;
-  totals: { point: number; over: number; under: number } | null;
 }
 
 export interface Leg {
@@ -114,7 +162,8 @@ export interface Leg {
   kickoff: string;
   market: Market;
   selection: Selection;
-  point?: number; // only for 'totals' — the over/under line, e.g. 2.5
+  point?: number; // only for 'totals' / 'team_totals' — the over/under line, e.g. 2.5
+  team?: TeamSide; // only for 'team_totals' — whose goals the line applies to
   oddsAtPlacement: number;
   status: LegStatus;
   finalScore?: string;
@@ -207,28 +256,39 @@ export async function fetchAllSeasonMatches(): Promise<FootballDataMatch[]> {
 // The Odds API client — odds, direct (no more Malvin dependency at all now
 // that fixtures/results and odds both come straight from their real sources)
 //
+// Two kinds of call, deliberately split to protect the 500-credit month:
+//
+//  1. BULK  /odds?markets=h2h — one call prices EVERY upcoming fixture's 1X2
+//     (1 credit). That's all the fixture list needs.
+//  2. EVENT /events/{id}/odds?markets=... — everything else (BTTS, double
+//     chance, draw no bet, goal ladders, team ladders, 1st-half markets,
+//     HT/FT). Fetched lazily, ONLY when a player opens that specific match,
+//     in two bundles (core / extra) so the extra markets are only paid for
+//     when someone actually asks for them. Billed per market RETURNED.
+//
 // The raw response is one array entry per fixture, each with its own list of
 // UK bookmakers, each bookmaker carrying its own markets/outcomes — nothing
-// is pre-aggregated. fetchOddsTips below is us picking the best (highest) price
-// per outcome across every bookmaker ourselves.
+// is pre-aggregated. Everything below that says "best price" is us picking
+// the highest price per outcome across bookmakers ourselves.
 //
 // One real quirk this confirmed from a live pull: exchange bookmakers
 // (Betfair Exchange, Smarkets) carry a SECOND market, "h2h_lay" — the price
 // to bet AGAINST an outcome, not for it. One live sample had a Nottingham
 // Forest "h2h_lay" price of 80.0 against every normal bookmaker's ~5.0-5.75
 // — picking a "best" price without filtering to key === 'h2h' specifically
-// would have handed out a wildly wrong payout multiplier. Never touch
-// h2h_lay (or any *_lay market) here.
+// would have handed out a wildly wrong payout multiplier. Every lookup below
+// matches market keys EXACTLY; never touch h2h_lay (or any *_lay market).
 // ─────────────────────────────────────────────────────────────────────────
 
 interface OddsApiOutcome {
-  name: string; // team name, "Draw", or (for future markets) "Over"/"Under"/"Yes"/"No"
+  name: string; // team name, "Draw", "Over"/"Under", "Yes"/"No", or a combo like "Arsenal or Draw"
   price: number;
-  point?: number; // present on line-based markets like totals, e.g. 2.5 for Over/Under 2.5
+  point?: number; // present on line-based markets, e.g. 2.5 for Over/Under 2.5
+  description?: string; // for team_totals-style markets: which team the line belongs to
 }
 
 interface OddsApiMarket {
-  key: string; // 'h2h' is what we want; 'h2h_lay' must be excluded — see note above
+  key: string; // exact match only — 'h2h' is wanted, 'h2h_lay' must be excluded
   outcomes: OddsApiOutcome[];
 }
 
@@ -246,58 +306,150 @@ interface OddsApiEvent {
   bookmakers: OddsApiBookmaker[];
 }
 
+// ── Persistent cache + credit accounting ─────────────────────────────────
+//
+// The in-memory `cache` above dies with the process; odds are the one thing
+// that costs real credits, so they also live in the plugin store. A restart
+// (or a crash loop while developing) no longer re-buys odds that are still
+// fresh.
+
+const oddsCacheTable = root.table!('oddsCache'); // key -> { value, expiresAt }
+const oddsMetaTable = root.table!('oddsApiMeta'); // 'usage' -> { remaining, at }
+
+interface CacheEntry {
+  value: any;
+  expiresAt: number;
+}
+
+const inflight = new Map<string, Promise<any>>();
+
+/** Fresh cached value (memory, then store) or null. Never fetches, never spends credits. */
+async function peekPersisted<T>(key: string): Promise<T | null> {
+  const mem = cache.get(key);
+  if (mem && mem.expiresAt > Date.now()) return mem.value as T;
+  try {
+    const stored = (await oddsCacheTable.get(key)) as CacheEntry | null | undefined;
+    if (stored && stored.expiresAt > Date.now()) {
+      cache.set(key, stored);
+      return stored.value as T;
+    }
+  } catch (err) {
+    console.error('[sportybet] odds cache read failed:', err);
+  }
+  return null;
+}
+
+/**
+ * Memory -> store -> fetch. Concurrent callers for the same key share ONE
+ * fetch (two players opening the same match in the same second must not buy
+ * its odds twice).
+ */
+async function persistentCached<T>(key: string, ttlMs: number, fetcher: () => Promise<T>): Promise<T> {
+  const running = inflight.get(key);
+  if (running) return running as Promise<T>;
+
+  const hit = await peekPersisted<T>(key);
+  if (hit !== null) return hit;
+
+  const raced = inflight.get(key); // another caller may have started while we awaited the store
+  if (raced) return raced as Promise<T>;
+
+  const promise = (async () => {
+    const value = await fetcher();
+    const entry: CacheEntry = { value, expiresAt: Date.now() + ttlMs };
+    cache.set(key, entry);
+    try {
+      await oddsCacheTable.set(key, entry);
+    } catch (err) {
+      console.error('[sportybet] odds cache write failed:', err);
+    }
+    return value;
+  })().finally(() => inflight.delete(key));
+
+  inflight.set(key, promise);
+  return promise;
+}
+
+let knownRemaining: number | null = null;
+
+async function getKnownRemaining(): Promise<number | null> {
+  if (knownRemaining !== null) return knownRemaining;
+  try {
+    const meta = (await oddsMetaTable.get('usage')) as { remaining?: number } | null | undefined;
+    if (meta && typeof meta.remaining === 'number') knownRemaining = meta.remaining;
+  } catch {
+    /* no meta yet — treat as unknown */
+  }
+  return knownRemaining;
+}
+
+/** Reads The Odds API's own usage headers after every call, logs the real cost, and remembers what's left. */
+async function recordUsage(res: Response, label: string): Promise<void> {
+  const rawRemaining = res.headers.get('x-requests-remaining');
+  const rawLast = res.headers.get('x-requests-last');
+  // Number(null) is 0 — only trust a header that is actually present.
+  const remaining = rawRemaining !== null && rawRemaining.trim() !== '' ? Number(rawRemaining) : NaN;
+  const last = rawLast !== null && rawLast.trim() !== '' ? Number(rawLast) : NaN;
+
+  if (Number.isFinite(remaining)) {
+    knownRemaining = remaining;
+    try {
+      await oddsMetaTable.set('usage', { remaining, at: Date.now() });
+    } catch {
+      /* best effort */
+    }
+  }
+  console.log(
+    `[sportybet] odds-api ${label}: cost=${Number.isFinite(last) ? last : '?'} remaining=${Number.isFinite(remaining) ? remaining : '?'}`
+  );
+}
+
+export class CreditBudgetError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CreditBudgetError';
+  }
+}
+
+export function isCreditBudgetError(err: unknown): boolean {
+  return err instanceof Error && err.name === 'CreditBudgetError';
+}
+
+/** Per-match fetches stop while the account is within ODDS_CREDIT_RESERVE of empty, so the bulk fixture list keeps working. */
+async function assertCreditBudget(worstCaseCost: number): Promise<void> {
+  const remaining = await getKnownRemaining();
+  if (remaining !== null && remaining - worstCaseCost < ODDS_CREDIT_RESERVE) {
+    throw new CreditBudgetError(
+      `Odds API credits low (${remaining} left, reserve ${ODDS_CREDIT_RESERVE}) — per-match fetch skipped`
+    );
+  }
+}
+
+// ── Bulk h2h (1 credit) ──────────────────────────────────────────────────
+
 async function fetchOddsApiEvents(markets: string): Promise<OddsApiEvent[]> {
   const url = `${ODDS_API_BASE}/sports/soccer_epl/odds/?regions=uk&markets=${markets}&oddsFormat=decimal&apiKey=${ODDS_API_KEY}`;
   const res = await fetch(url);
+  await recordUsage(res, `bulk ${markets}`);
   if (!res.ok) throw new Error(`The Odds API responded ${res.status}`);
   return (await res.json()) as OddsApiEvent[];
 }
 
-/** Best (highest) UK price for h2h (1X2) and totals (over/under), across every bookmaker offering each. */
+/** Best (highest) UK price for h2h (1X2), across every bookmaker offering it. */
 export async function fetchOddsTips(): Promise<OddsTip[]> {
-  return cached('sportybet:odds', ODDS_CACHE_TTL_MS, async () => {
-    const events = await fetchOddsApiEvents('h2h,totals');
+  return persistentCached<OddsTip[]>('bulk_h2h', ODDS_CACHE_TTL_MS, async () => {
+    const events = await fetchOddsApiEvents('h2h');
     return events.map((ev): OddsTip => {
       const bestH2h = new Map<string, number>(); // outcome name -> best price seen
-      const totalsByPoint = new Map<number, { overPrices: number[]; underPrices: number[] }>();
       let bookmakerCount = 0;
 
       for (const bm of ev.bookmakers) {
-        let sawThisBookmaker = false;
-
         const h2h = bm.markets.find((m) => m.key === 'h2h'); // exactly 'h2h' — never 'h2h_lay'
-        if (h2h) {
-          sawThisBookmaker = true;
-          for (const outcome of h2h.outcomes) {
-            const current = bestH2h.get(outcome.name);
-            if (current === undefined || outcome.price > current) bestH2h.set(outcome.name, outcome.price);
-          }
-        }
-
-        const totals = bm.markets.find((m) => m.key === 'totals');
-        if (totals) {
-          sawThisBookmaker = true;
-          for (const outcome of totals.outcomes) {
-            if (outcome.point === undefined) continue;
-            const bucket = totalsByPoint.get(outcome.point) || { overPrices: [], underPrices: [] };
-            if (outcome.name === 'Over') bucket.overPrices.push(outcome.price);
-            else if (outcome.name === 'Under') bucket.underPrices.push(outcome.price);
-            totalsByPoint.set(outcome.point, bucket);
-          }
-        }
-
-        if (sawThisBookmaker) bookmakerCount++;
-      }
-
-      // Bookmakers occasionally disagree on the over/under line itself — go
-      // with whichever point line the most bookmakers actually quoted.
-      let totals: OddsTip['totals'] = null;
-      let bestQuoteCount = 0;
-      for (const [point, bucket] of totalsByPoint) {
-        const quoteCount = bucket.overPrices.length + bucket.underPrices.length;
-        if (quoteCount > bestQuoteCount && bucket.overPrices.length && bucket.underPrices.length) {
-          bestQuoteCount = quoteCount;
-          totals = { point, over: Math.max(...bucket.overPrices), under: Math.max(...bucket.underPrices) };
+        if (!h2h) continue;
+        bookmakerCount++;
+        for (const outcome of h2h.outcomes) {
+          const current = bestH2h.get(outcome.name);
+          if (current === undefined || outcome.price > current) bestH2h.set(outcome.name, outcome.price);
         }
       }
 
@@ -312,70 +464,359 @@ export async function fetchOddsTips(): Promise<OddsTip[]> {
         commenceTime: ev.commence_time,
         bookmakers: bookmakerCount,
         h2h: home !== undefined && away !== undefined && draw !== undefined ? { home, draw, away } : null,
-        totals,
       };
     });
   });
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// BTTS — fetched lazily, per event, only once a player actually opens a
-// specific match. The Odds API doesn't return btts on the bulk /odds call;
-// it needs the per-event endpoint, and coverage varies by bookmaker/event,
-// so this checks availability (1 credit) before ever spending a second
-// credit on the odds themselves. Cached per event so backing out and back
-// in during the same betting session doesn't re-spend credits.
-// ─────────────────────────────────────────────────────────────────────────
+// ── Per-match markets (billed per market returned) ───────────────────────
 
-const BTTS_CACHE_TTL_MS = 30 * 60_000;
-
-interface OddsApiEventMarketsResponse {
-  bookmakers: Array<{ markets: Array<{ key: string }> }>;
+export interface TotalsLine {
+  point: number;
+  over: number;
+  under: number;
 }
 
-async function fetchAvailableMarketKeys(eventId: string): Promise<Set<string>> {
-  return cached(`sportybet:markets:${eventId}`, BTTS_CACHE_TTL_MS, async () => {
-    const url = `${ODDS_API_BASE}/sports/soccer_epl/events/${eventId}/markets?regions=uk&apiKey=${ODDS_API_KEY}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`The Odds API event-markets responded ${res.status}`);
-    const data = (await res.json()) as OddsApiEventMarketsResponse;
-    const keys = new Set<string>();
-    for (const bm of data.bookmakers ?? []) {
-      for (const m of bm.markets ?? []) keys.add(m.key);
-    }
-    return keys;
-  });
+/** Everything priced for ONE match beyond 1X2. Any key can be absent — the books simply may not list it. */
+export interface EventMarkets {
+  btts?: { yes: number; no: number };
+  btts_h1?: { yes: number; no: number };
+  draw_no_bet?: { home: number; away: number };
+  double_chance?: Record<DoubleChanceSel, number>;
+  double_chance_h1?: Record<DoubleChanceSel, number>;
+  totals?: TotalsLine[]; // total-goals ladder, ascending by line
+  team_totals?: { home: TotalsLine[]; away: TotalsLine[] };
+  halftime_fulltime?: Partial<Record<HtFtSel, number>>;
 }
 
-async function fetchBttsOdds(eventId: string): Promise<{ yes: number; no: number } | null> {
-  return cached(`sportybet:btts:${eventId}`, BTTS_CACHE_TTL_MS, async () => {
-    const url = `${ODDS_API_BASE}/sports/soccer_epl/events/${eventId}/odds/?regions=uk&markets=btts&oddsFormat=decimal&apiKey=${ODDS_API_KEY}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`The Odds API BTTS odds responded ${res.status}`);
-    const ev = (await res.json()) as OddsApiEvent;
-    let yes: number | undefined;
-    let no: number | undefined;
-    for (const bm of ev.bookmakers ?? []) {
-      const btts = bm.markets.find((m) => m.key === 'btts');
-      if (!btts) continue;
-      for (const outcome of btts.outcomes) {
-        if (outcome.name === 'Yes' && (yes === undefined || outcome.price > yes)) yes = outcome.price;
-        if (outcome.name === 'No' && (no === undefined || outcome.price > no)) no = outcome.price;
-      }
-    }
-    return yes !== undefined && no !== undefined ? { yes, no } : null;
-  });
+const DOUBLE_CHANCE_ORDER: DoubleChanceSel[] = ['1x', '12', 'x2'];
+const HTFT_ORDER: HtFtSel[] = ['1/1', '1/x', '1/2', 'x/1', 'x/x', 'x/2', '2/1', '2/x', '2/2'];
+
+function sameTeam(a: string | undefined, b: string): boolean {
+  return !!a && normalizeTeamName(a) === normalizeTeamName(b);
 }
 
 /**
- * Call this after a player picks a specific match, not for every fixture in
- * a browsing list — it costs 1 credit to check, plus 1 more only if BTTS
- * turns out to actually be listed for this event.
+ * Best price with a guard against one wild outlier: with 3+ quotes, anything
+ * more than 1.5x the median is ignored. Alternate lines are often priced by
+ * only a handful of books, and a single stale/odd quote must not become the
+ * payout multiplier (same lesson as the h2h_lay incident above).
  */
-export async function fetchBttsIfAvailable(eventId: string): Promise<{ yes: number; no: number } | null> {
-  const keys = await fetchAvailableMarketKeys(eventId);
-  if (!keys.has('btts')) return null;
-  return fetchBttsOdds(eventId);
+function robustBest(prices: number[]): number | undefined {
+  if (!prices.length) return undefined;
+  if (prices.length < 3) return Math.max(...prices);
+  const sorted = [...prices].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  return Math.max(...prices.filter((p) => p <= median * 1.5));
+}
+
+/** Every outcome of ONE exact market key, pooled across all bookmakers. */
+function outcomesFor(ev: OddsApiEvent, marketKey: string): OddsApiOutcome[] {
+  const all: OddsApiOutcome[] = [];
+  for (const bm of ev.bookmakers ?? []) {
+    const market = (bm.markets ?? []).find((m) => m.key === marketKey);
+    if (market) all.push(...market.outcomes);
+  }
+  return all;
+}
+
+/** Groups outcomes into named buckets (null = skip) and returns the robust best price per bucket. */
+function bestByBucket(outcomes: OddsApiOutcome[], bucketOf: (o: OddsApiOutcome) => string | null): Map<string, number> {
+  const prices = new Map<string, number[]>();
+  for (const o of outcomes) {
+    const bucket = bucketOf(o);
+    if (bucket === null) continue;
+    const list = prices.get(bucket);
+    if (list) list.push(o.price);
+    else prices.set(bucket, [o.price]);
+  }
+  const best = new Map<string, number>();
+  for (const [bucket, list] of prices) {
+    const value = robustBest(list);
+    if (value !== undefined) best.set(bucket, value);
+  }
+  return best;
+}
+
+function warnUnparsed(eventLabel: string, marketKey: string, names: Set<string>): void {
+  if (names.size) console.warn(`[sportybet] ${eventLabel} ${marketKey}: unrecognized outcome names ignored: ${[...names].join(' | ')}`);
+}
+
+function parseYesNo(outcomes: OddsApiOutcome[]): { yes: number; no: number } | undefined {
+  const best = bestByBucket(outcomes, (o) => {
+    const n = o.name.trim().toLowerCase();
+    return n === 'yes' ? 'yes' : n === 'no' ? 'no' : null;
+  });
+  const yes = best.get('yes');
+  const no = best.get('no');
+  return yes !== undefined && no !== undefined ? { yes, no } : undefined;
+}
+
+function parseDrawNoBet(outcomes: OddsApiOutcome[], home: string, away: string): { home: number; away: number } | undefined {
+  const best = bestByBucket(outcomes, (o) => (sameTeam(o.name, home) ? 'home' : sameTeam(o.name, away) ? 'away' : null));
+  const h = best.get('home');
+  const a = best.get('away');
+  return h !== undefined && a !== undefined ? { home: h, away: a } : undefined;
+}
+
+/**
+ * Double-chance outcome names aren't guaranteed to be in any one shape
+ * ("Arsenal or Draw", "Draw or Chelsea", "Home or Draw", "1X"), so classify by
+ * WHICH of {home, draw, away} the name mentions rather than by exact string.
+ */
+export function classifyDoubleChance(name: string, home: string, away: string): DoubleChanceSel | null {
+  const n = normalizeTeamName(name);
+  if (n === '1x' || n === '12' || n === 'x2') return n;
+  const hasDraw = /\bdraw\b|\btie\b/.test(n);
+  const hasHome = n.includes(normalizeTeamName(home)) || /\bhome\b/.test(n);
+  const hasAway = n.includes(normalizeTeamName(away)) || /\baway\b/.test(n);
+  if (hasDraw && hasHome && !hasAway) return '1x';
+  if (hasDraw && hasAway && !hasHome) return 'x2';
+  if (hasHome && hasAway && !hasDraw) return '12';
+  return null;
+}
+
+function parseDoubleChance(
+  outcomes: OddsApiOutcome[],
+  home: string,
+  away: string,
+  warn: Set<string>
+): Record<DoubleChanceSel, number> | undefined {
+  const best = bestByBucket(outcomes, (o) => {
+    const c = classifyDoubleChance(o.name, home, away);
+    if (!c) warn.add(o.name);
+    return c;
+  });
+  const a = best.get('1x');
+  const b = best.get('12');
+  const c = best.get('x2');
+  return a !== undefined && b !== undefined && c !== undefined ? { '1x': a, '12': b, x2: c } : undefined;
+}
+
+/** "Arsenal/Draw" (or "Arsenal - Draw") -> 'x/...' style selection; null if either half isn't recognisable. */
+export function parseHtFtName(name: string, home: string, away: string): HtFtSel | null {
+  const parts = name.split(/\s*\/\s*|\s+-\s+/);
+  if (parts.length !== 2) return null;
+  const code = (p: string): '1' | 'x' | '2' | null => {
+    const t = p.trim().toLowerCase();
+    if (sameTeam(p, home) || t === 'home') return '1';
+    if (sameTeam(p, away) || t === 'away') return '2';
+    if (t === 'draw' || t === 'x' || t === 'tie') return 'x';
+    return null;
+  };
+  const ht = code(parts[0]);
+  const ft = code(parts[1]);
+  return ht && ft ? (`${ht}/${ft}` as HtFtSel) : null;
+}
+
+function parseHtFt(outcomes: OddsApiOutcome[], home: string, away: string, warn: Set<string>): Partial<Record<HtFtSel, number>> | undefined {
+  const best = bestByBucket(outcomes, (o) => {
+    const sel = parseHtFtName(o.name, home, away);
+    if (!sel) warn.add(o.name);
+    return sel;
+  });
+  // A complete 9-way market or nothing — a half-priced HT/FT book would be a trap.
+  if (best.size < HTFT_ORDER.length) return undefined;
+  const out: Partial<Record<HtFtSel, number>> = {};
+  for (const sel of HTFT_ORDER) out[sel] = best.get(sel);
+  return out;
+}
+
+/** Keeps at most MAX_LADDER_LINES lines, centred on the "main" line (the one whose over/under prices are closest to even). */
+function trimLadder(lines: TotalsLine[]): TotalsLine[] {
+  const sorted = [...lines].sort((a, b) => a.point - b.point);
+  if (sorted.length <= MAX_LADDER_LINES) return sorted;
+  const main = sorted.reduce((best, l) => (Math.abs(l.over - l.under) < Math.abs(best.over - best.under) ? l : best));
+  return [...sorted]
+    .sort((a, b) => Math.abs(a.point - main.point) - Math.abs(b.point - main.point) || a.point - b.point)
+    .slice(0, MAX_LADDER_LINES)
+    .sort((a, b) => a.point - b.point);
+}
+
+function parseLadder(outcomes: OddsApiOutcome[]): TotalsLine[] {
+  const best = bestByBucket(outcomes, (o) => {
+    if (o.point === undefined) return null;
+    const side = o.name.trim().toLowerCase();
+    return side === 'over' || side === 'under' ? `${o.point}|${side}` : null;
+  });
+  const points = new Set<number>();
+  for (const bucket of best.keys()) points.add(Number(bucket.split('|')[0]));
+
+  const lines: TotalsLine[] = [];
+  for (const point of points) {
+    if (!Number.isInteger(point * 2)) continue; // quarter lines settle as half-win/half-loss — not supported
+    const over = best.get(`${point}|over`);
+    const under = best.get(`${point}|under`);
+    if (over !== undefined && under !== undefined) lines.push({ point, over, under });
+  }
+  return trimLadder(lines);
+}
+
+/** Pure: raw event JSON -> EventMarkets. Exported so it can be tested without spending a credit. */
+export function parseEventMarkets(ev: OddsApiEvent, keys: readonly string[]): EventMarkets {
+  const home = ev.home_team;
+  const away = ev.away_team;
+  const label = `${home} v ${away}`;
+  const out: EventMarkets = {};
+
+  for (const key of keys) {
+    const outcomes = outcomesFor(ev, key);
+    if (!outcomes.length) continue;
+    const unparsed = new Set<string>();
+
+    switch (key) {
+      case 'btts': {
+        const v = parseYesNo(outcomes);
+        if (v) out.btts = v;
+        break;
+      }
+      case 'btts_h1': {
+        const v = parseYesNo(outcomes);
+        if (v) out.btts_h1 = v;
+        break;
+      }
+      case 'draw_no_bet': {
+        const v = parseDrawNoBet(outcomes, home, away);
+        if (v) out.draw_no_bet = v;
+        break;
+      }
+      case 'double_chance': {
+        const v = parseDoubleChance(outcomes, home, away, unparsed);
+        if (v) out.double_chance = v;
+        break;
+      }
+      case 'double_chance_h1': {
+        const v = parseDoubleChance(outcomes, home, away, unparsed);
+        if (v) out.double_chance_h1 = v;
+        break;
+      }
+      case 'alternate_totals': {
+        const ladder = parseLadder(outcomes);
+        if (ladder.length) out.totals = ladder;
+        break;
+      }
+      case 'alternate_team_totals': {
+        // The team a line belongs to rides in outcome.description.
+        const homeLines = parseLadder(outcomes.filter((o) => sameTeam(o.description, home)));
+        const awayLines = parseLadder(outcomes.filter((o) => sameTeam(o.description, away)));
+        if (homeLines.length || awayLines.length) out.team_totals = { home: homeLines, away: awayLines };
+        else console.warn(`[sportybet] ${label} ${key}: no outcome carried a recognisable team in "description" — market skipped`);
+        break;
+      }
+      case 'halftime_fulltime': {
+        const v = parseHtFt(outcomes, home, away, unparsed);
+        if (v) out.halftime_fulltime = v;
+        break;
+      }
+    }
+    warnUnparsed(label, key, unparsed);
+  }
+  return out;
+}
+
+async function fetchEventBundle(eventId: string, keys: readonly string[], tag: 'core' | 'extra'): Promise<EventMarkets> {
+  return persistentCached<EventMarkets>(`evodds_${eventId}_${tag}`, EVENT_ODDS_CACHE_TTL_MS, async () => {
+    await assertCreditBudget(keys.length); // worst case: every requested market comes back
+    const url = `${ODDS_API_BASE}/sports/soccer_epl/events/${eventId}/odds/?regions=uk&markets=${keys.join(',')}&oddsFormat=decimal&apiKey=${ODDS_API_KEY}`;
+    const res = await fetch(url);
+    await recordUsage(res, `event ${eventId} ${tag}`);
+    if (!res.ok) throw new Error(`The Odds API event odds (${tag}) responded ${res.status}`);
+    const ev = (await res.json()) as OddsApiEvent;
+
+    const returned = new Set<string>();
+    for (const bm of ev.bookmakers ?? []) for (const m of bm.markets ?? []) returned.add(m.key);
+    const parsed = parseEventMarkets(ev, keys);
+    console.log(
+      `[sportybet] event ${eventId} ${tag}: books returned [${[...returned].join(', ') || 'nothing'}] -> offering [${Object.keys(parsed).join(', ') || 'nothing'}]`
+    );
+    return parsed;
+  });
+}
+
+/** CORE bundle (btts, double chance, draw no bet, goal ladders). <= 5 credits, cached 24h. Call when a match is opened. */
+export function fetchCoreMarkets(eventId: string): Promise<EventMarkets> {
+  return fetchEventBundle(eventId, CORE_MARKET_KEYS, 'core');
+}
+
+/** EXTRA bundle (1st-half BTTS / double chance, HT/FT). <= 3 credits, cached 24h. Call ONLY on an explicit "More markets" tap. */
+export function fetchExtraMarkets(eventId: string): Promise<EventMarkets> {
+  return fetchEventBundle(eventId, EXTRA_MARKET_KEYS, 'extra');
+}
+
+/** The EXTRA bundle if it's already been bought and is still fresh — never spends a credit. null = not fetched yet. */
+export function getCachedExtraMarkets(eventId: string): Promise<EventMarkets | null> {
+  return peekPersisted<EventMarkets>(`evodds_${eventId}_extra`);
+}
+
+// ── Turning EventMarkets into pick-able options (shared by the UI) ───────
+
+export interface MarketOption {
+  selection: Selection;
+  point?: number;
+  team?: TeamSide;
+  odds: number;
+}
+
+/** Markets that actually have prices for this fixture, most popular first. */
+export function availableMarkets(fixture: FixtureWithOdds, em: EventMarkets): Market[] {
+  const markets: Market[] = [];
+  if (fixture.h2h) markets.push('1x2');
+  if (em.totals?.length) markets.push('totals');
+  if (em.btts) markets.push('btts');
+  if (em.double_chance) markets.push('double_chance');
+  if (em.draw_no_bet) markets.push('draw_no_bet');
+  if (em.team_totals && (em.team_totals.home.length || em.team_totals.away.length)) markets.push('team_totals');
+  if (em.btts_h1) markets.push('btts_h1');
+  if (em.double_chance_h1) markets.push('double_chance_h1');
+  if (em.halftime_fulltime) markets.push('halftime_fulltime');
+  return markets;
+}
+
+/** The individual selections (with their odds) a player can pick inside one market. */
+export function getMarketOptions(market: Market, fixture: FixtureWithOdds, em: EventMarkets, team?: TeamSide): MarketOption[] {
+  const ladder = (lines: TotalsLine[] = [], side?: TeamSide): MarketOption[] =>
+    lines.flatMap((l): MarketOption[] => [
+      { selection: 'over', point: l.point, team: side, odds: l.over },
+      { selection: 'under', point: l.point, team: side, odds: l.under },
+    ]);
+  const yesNo = (v?: { yes: number; no: number }): MarketOption[] =>
+    v ? [{ selection: 'yes', odds: v.yes }, { selection: 'no', odds: v.no }] : [];
+  const doubleChance = (v?: Record<DoubleChanceSel, number>): MarketOption[] =>
+    v ? DOUBLE_CHANCE_ORDER.map((sel): MarketOption => ({ selection: sel, odds: v[sel] })) : [];
+
+  switch (market) {
+    case '1x2':
+      return fixture.h2h
+        ? [
+            { selection: 'home', odds: fixture.h2h.home },
+            { selection: 'draw', odds: fixture.h2h.draw },
+            { selection: 'away', odds: fixture.h2h.away },
+          ]
+        : [];
+    case 'totals':
+      return ladder(em.totals);
+    case 'team_totals':
+      return team ? ladder(em.team_totals?.[team], team) : [];
+    case 'btts':
+      return yesNo(em.btts);
+    case 'btts_h1':
+      return yesNo(em.btts_h1);
+    case 'draw_no_bet':
+      return em.draw_no_bet
+        ? [
+            { selection: 'home', odds: em.draw_no_bet.home },
+            { selection: 'away', odds: em.draw_no_bet.away },
+          ]
+        : [];
+    case 'double_chance':
+      return doubleChance(em.double_chance);
+    case 'double_chance_h1':
+      return doubleChance(em.double_chance_h1);
+    case 'halftime_fulltime':
+      return HTFT_ORDER.filter((sel) => em.halftime_fulltime?.[sel] !== undefined).map(
+        (sel): MarketOption => ({ selection: sel, odds: em.halftime_fulltime![sel]! })
+      );
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -477,7 +918,6 @@ export function joinFixturesWithOdds(fixtures: FootballDataMatch[], tips: OddsTi
       kickoff,
       matchday: fx.matchday,
       h2h: tip?.h2h ?? null,
-      totals: tip?.totals ?? null,
     };
   });
 }
@@ -509,7 +949,8 @@ export interface PlaceCouponPick {
   kickoff: string;
   market: Market;
   selection: Selection;
-  point?: number; // required for 'totals' — the over/under line
+  point?: number; // required for 'totals' / 'team_totals' — the over/under line
+  team?: TeamSide; // required for 'team_totals'
   odds: number;
 }
 
@@ -517,7 +958,7 @@ export type PlaceCouponResult =
   | { success: true; coupon: Coupon }
   | {
       success: false;
-      reason: 'invalid_stake' | 'too_many_legs' | 'duplicate_match' | 'insufficient_funds' | 'no_legs';
+      reason: 'invalid_stake' | 'too_many_legs' | 'duplicate_match' | 'insufficient_funds' | 'no_legs' | 'betting_closed';
     };
 
 export async function placeCoupon(userId: string, stake: number, picks: PlaceCouponPick[]): Promise<PlaceCouponResult> {
@@ -530,6 +971,13 @@ export async function placeCoupon(userId: string, stake: number, picks: PlaceCou
 
   const matchKeys = picks.map((p) => `${normalizeTeamName(p.homeTeam)}|${normalizeTeamName(p.awayTeam)}`);
   if (new Set(matchKeys).size !== matchKeys.length) return { success: false, reason: 'duplicate_match' };
+
+  // Pre-match only: refuse anything at/after the cutoff, checked BEFORE any coins move. This is
+  // also what keeps the 1st-half markets from ever being bettable once the match is under way.
+  const now = Date.now();
+  if (picks.some((p) => new Date(p.kickoff).getTime() - now < BETTING_CUTOFF_MS)) {
+    return { success: false, reason: 'betting_closed' };
+  }
 
   const legCount = picks.length;
   const { success } = await deductCoins(uid, stake, {
@@ -549,6 +997,7 @@ export async function placeCoupon(userId: string, stake: number, picks: PlaceCou
     market: p.market,
     selection: p.selection,
     point: p.point,
+    team: p.team,
     oddsAtPlacement: p.odds,
     status: 'pending',
   }));
@@ -591,13 +1040,39 @@ export async function getCoupon(userId: string, couponId: string): Promise<Coupo
 // checks it against every leg still pending, across every user.
 // ─────────────────────────────────────────────────────────────────────────
 
+const HALF_TIME_MARKETS: ReadonlySet<Market> = new Set<Market>(['btts_h1', 'double_chance_h1', 'halftime_fulltime']);
+
+/** '1' home ahead, '2' away ahead, 'x' level. */
+function resultCode(home: number, away: number): '1' | 'x' | '2' {
+  return home > away ? '1' : home < away ? '2' : 'x';
+}
+
+function doubleChanceWins(selection: Selection, home: number, away: number): boolean {
+  const r = resultCode(home, away);
+  if (selection === '1x') return r !== '2';
+  if (selection === 'x2') return r !== '1';
+  return r !== 'x'; // '12'
+}
+
+/** Over/under on a line. A whole-number line landing exactly on it is a push -> the leg is voided (stake stays in the coupon at 1.00). */
+function settleLine(total: number, point: number, selection: Selection): 'won' | 'lost' | 'void' {
+  if (total === point) return 'void';
+  return (selection === 'over') === (total > point) ? 'won' : 'lost';
+}
+
 /**
  * Resolves one leg against its match, given the leg's own market — 1x2 uses
- * football-data.org's score.winner directly; totals and btts are computed
- * from the same score.fullTime goals, no separate data source needed for
- * either. Returns null while the match still has nothing decided yet.
+ * football-data.org's score.winner directly; every other market is computed
+ * from score.fullTime (and score.halfTime for the 1st-half markets), no
+ * separate data source needed. Returns null while the match still has nothing
+ * decided yet — including a half-time market whose half-time score hasn't been
+ * recorded, which is left pending rather than guessed.
+ *
+ * Void rules: draw no bet on a draw; a whole-number over/under line landing
+ * exactly on the line; postponed/suspended/cancelled matches. A voided leg
+ * drops out of the combined odds exactly like a postponed match already does.
  */
-function resolveLegResult(leg: Leg, match: FootballDataMatch): 'won' | 'lost' | 'void' | null {
+export function resolveLegResult(leg: Leg, match: FootballDataMatch): 'won' | 'lost' | 'void' | null {
   if (['POSTPONED', 'SUSPENDED', 'CANCELLED'].includes(match.status)) return 'void';
   if (match.status !== 'FINISHED') return null; // SCHEDULED / LIVE / IN_PLAY / PAUSED — still genuinely pending
 
@@ -605,22 +1080,60 @@ function resolveLegResult(leg: Leg, match: FootballDataMatch): 'won' | 'lost' | 
   const away = match.score.fullTime.away;
   if (home === null || away === null) return null; // FINISHED but no score recorded yet — leave pending rather than guess
 
-  if (leg.market === '1x2') {
-    if (match.score.winner === 'HOME_TEAM') return leg.selection === 'home' ? 'won' : 'lost';
-    if (match.score.winner === 'AWAY_TEAM') return leg.selection === 'away' ? 'won' : 'lost';
-    if (match.score.winner === 'DRAW') return leg.selection === 'draw' ? 'won' : 'lost';
-    return null; // unrecognized winner value — leave pending rather than guess
+  let htHome: number | null = null;
+  let htAway: number | null = null;
+  if (HALF_TIME_MARKETS.has(leg.market)) {
+    htHome = match.score.halfTime?.home ?? null;
+    htAway = match.score.halfTime?.away ?? null;
+    if (htHome === null || htAway === null) return null;
   }
 
-  if (leg.market === 'totals') {
-    const point = leg.point ?? 2.5;
-    const isOver = home + away > point;
-    return (leg.selection === 'over') === isOver ? 'won' : 'lost';
-  }
+  switch (leg.market) {
+    case '1x2':
+      if (match.score.winner === 'HOME_TEAM') return leg.selection === 'home' ? 'won' : 'lost';
+      if (match.score.winner === 'AWAY_TEAM') return leg.selection === 'away' ? 'won' : 'lost';
+      if (match.score.winner === 'DRAW') return leg.selection === 'draw' ? 'won' : 'lost';
+      return null; // unrecognized winner value — leave pending rather than guess
 
-  // btts
-  const bothScored = home > 0 && away > 0;
-  return (leg.selection === 'yes') === bothScored ? 'won' : 'lost';
+    case 'totals':
+      return settleLine(home + away, leg.point ?? 2.5, leg.selection);
+
+    case 'team_totals':
+      if (!leg.team) return null; // can't tell whose goals — leave pending rather than guess
+      return settleLine(leg.team === 'home' ? home : away, leg.point ?? 1.5, leg.selection);
+
+    case 'btts':
+      return (leg.selection === 'yes') === (home > 0 && away > 0) ? 'won' : 'lost';
+
+    case 'btts_h1':
+      return (leg.selection === 'yes') === (htHome! > 0 && htAway! > 0) ? 'won' : 'lost';
+
+    case 'draw_no_bet':
+      if (home === away) return 'void';
+      return (leg.selection === 'home') === (home > away) ? 'won' : 'lost';
+
+    case 'double_chance':
+      return doubleChanceWins(leg.selection, home, away) ? 'won' : 'lost';
+
+    case 'double_chance_h1':
+      return doubleChanceWins(leg.selection, htHome!, htAway!) ? 'won' : 'lost';
+
+    case 'halftime_fulltime': {
+      const [ht, ft] = leg.selection.split('/');
+      return resultCode(htHome!, htAway!) === ht && resultCode(home, away) === ft ? 'won' : 'lost';
+    }
+
+    default:
+      return null; // a market this build doesn't know how to settle — leave pending rather than guess
+  }
+}
+
+/** "2 - 1", plus the half-time score for 1st-half markets so My Bets shows what the leg was judged on. */
+function formatFinalScore(leg: Leg, match: FootballDataMatch): string {
+  const base = `${match.score.fullTime.home} - ${match.score.fullTime.away}`;
+  const ht = match.score.halfTime;
+  if (HALF_TIME_MARKETS.has(leg.market) && ht && ht.home !== null && ht.away !== null) return `${base}, HT ${ht.home} - ${ht.away}`;
+  return base;
 }
 
 export async function pollAndSettleCoupons(): Promise<{ couponsChecked: number; couponsSettled: number }> {
@@ -651,12 +1164,10 @@ export async function pollAndSettleCoupons(): Promise<{ couponsChecked: number; 
 
         const result = resolveLegResult(leg, match);
         if (result === null) continue; // still genuinely pending
-        if (result === 'void') {
-          leg.status = 'voided';
-        } else {
-          leg.status = result; // 'won' | 'lost'
-          leg.finalScore = `${match.score.fullTime.home} - ${match.score.fullTime.away}`;
-        }
+        leg.status = result === 'void' ? 'voided' : result; // 'won' | 'lost' | 'voided'
+        // A finished match shows its score even on a voided leg (draw no bet on a draw, a pushed line).
+        // A postponed/cancelled match has no score to show.
+        if (match.status === 'FINISHED' && match.score.fullTime.home !== null) leg.finalScore = formatFinalScore(leg, match);
         legsChanged = true;
       }
 
@@ -731,13 +1242,54 @@ const COUPON_EMOJI: Record<CouponStatus, string> = {
   lost: '🔴',
 };
 
+/** Short side name for a 1/x/2 code — "Arsenal", "Draw", "Man City". */
+function sideName(code: string, home: string, away: string): string {
+  return code === '1' ? home : code === '2' ? away : 'Draw';
+}
+
+function doubleChanceLabel(selection: Selection, home: string, away: string): string {
+  if (selection === '1x') return `${home} or Draw`;
+  if (selection === 'x2') return `Draw or ${away}`;
+  return `${home} or ${away}`;
+}
+
 /** Shared with plugins/sportybet.ts's slip preview so a leg reads the same way everywhere. */
-export function legPickLabel(leg: { market: Market; selection: Selection; homeTeam: string; awayTeam: string; point?: number }): string {
-  if (leg.market === '1x2') {
-    return leg.selection === 'home' ? shortClubName(leg.homeTeam) : leg.selection === 'away' ? shortClubName(leg.awayTeam) : 'Draw';
+export function legPickLabel(leg: {
+  market: Market;
+  selection: Selection;
+  homeTeam: string;
+  awayTeam: string;
+  point?: number;
+  team?: TeamSide;
+}): string {
+  const home = shortClubName(leg.homeTeam);
+  const away = shortClubName(leg.awayTeam);
+  const overUnder = `${leg.selection === 'over' ? 'Over' : 'Under'} ${leg.point}`;
+
+  switch (leg.market) {
+    case '1x2':
+      return leg.selection === 'home' ? home : leg.selection === 'away' ? away : 'Draw';
+    case 'totals':
+      return overUnder;
+    case 'team_totals':
+      return `${leg.team === 'away' ? away : home} ${overUnder}`;
+    case 'btts':
+      return leg.selection === 'yes' ? 'BTTS: Yes' : 'BTTS: No';
+    case 'btts_h1':
+      return leg.selection === 'yes' ? '1H BTTS: Yes' : '1H BTTS: No';
+    case 'draw_no_bet':
+      return `${leg.selection === 'home' ? home : away} (Draw No Bet)`;
+    case 'double_chance':
+      return doubleChanceLabel(leg.selection, home, away);
+    case 'double_chance_h1':
+      return `1H ${doubleChanceLabel(leg.selection, home, away)}`;
+    case 'halftime_fulltime': {
+      const [ht, ft] = leg.selection.split('/');
+      return `HT ${sideName(ht, home, away)} · FT ${sideName(ft, home, away)}`;
+    }
+    default:
+      return String(leg.selection);
   }
-  if (leg.market === 'totals') return `${leg.selection === 'over' ? 'Over' : 'Under'} ${leg.point}`;
-  return leg.selection === 'yes' ? 'BTTS: Yes' : 'BTTS: No';
 }
 
 export function formatCoupon(coupon: Coupon): string {
