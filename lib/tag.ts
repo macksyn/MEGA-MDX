@@ -95,3 +95,40 @@ export function fixTags(
 
   return { text, mentions: [...mentions] };
 }
+
+/**
+ * The bot must never tag itself. Removes "@<own id>", "@Groq", "@~Groq 🤖" (and the
+ * trailing space/comma) from the model's reply. Pass the bot's JIDs and display names.
+ * If removing them would leave nothing, the text is returned unchanged.
+ */
+export function removeSelfTags(
+  text: string,
+  self: { ids: string[]; names: (string | undefined | null)[] }
+): string {
+  const tail = '[,:;\\-–]?[ \\t]*';
+  let out = text;
+
+  // names: "~Groq 🤖" -> also "Groq 🤖" and "Groq"; longest first
+  const names = new Set<string>();
+  for (const raw of self.names) {
+    const n = (raw || '').trim().replace(/^~+/, '').trim();
+    if (!n) continue;
+    names.add(n);
+    const core = n.replace(/[^\p{L}\p{N}_']+$/u, '').trim();
+    if (core.length >= 2) names.add(core);
+  }
+  for (const n of [...names].sort((a, b) => b.length - a.length)) {
+    out = out.replace(new RegExp(`@~?${esc(n)}(?![\\w])${tail}`, 'gi'), '');
+  }
+
+  // ids: 555000111222, 555000111222:12, 555000111222@lid, with or without a leading @
+  const digits = [...new Set(self.ids.map(bare).filter(d => /^\d{6,20}$/.test(d)))];
+  if (digits.length) {
+    out = out.replace(
+      new RegExp(`(?<!\\d)@?(?:${digits.join('|')})(?::\\d+)?(?:@(?:lid|s\\.whatsapp\\.net))?(?!\\d)${tail}`, 'g'),
+      ''
+    );
+  }
+  out = out.trim();
+  return out || text;
+}
