@@ -9,6 +9,7 @@ import {
     getThawMessage,
     type GrudgeRecord
 } from '../lib/grudge.js';
+import { fixTags, tag, toJid, type Taggable } from '../lib/tag.js';
 import { classifyIntent, compressHistory, extractPreferences, extractQuotedContext, getClarificationHint, getConfidenceLevel, getIntentInstruction, summarizeGroupHistory, summarizeProfile, type ChatIntent } from '../lib/intentRouter.js';
 
 const MONGO_URL    = process.env.MONGO_URL;
@@ -51,6 +52,38 @@ async function getCachedGroupMeta(sock: any, chatId: string): Promise<any> {
 // group-participants.update so kicks/joins are reflected without waiting for TTL)
 export function invalidateGroupMetaCache(chatId: string): void {
     groupMetaCache.delete(chatId);
+}
+
+// ── Tag helpers: who can the bot name / @tag in this chat? ───────────────────
+// Builds { id, phone, name } for every group member (plus anyone @mentioned in
+// the incoming message) so fixTags() can turn raw LIDs / phone numbers / "@Name"
+// in the AI's reply into real, clickable tags. A member with no known name is
+// still tag-able — they just never get shown to the model by LID.
+function getKnownName(sock: any, id: string): string | undefined {
+    const num      = id.split('@')[0].split(':')[0];
+    const contacts = sock.store?.contacts || {};
+    const c        = contacts[id] || contacts[`${num}@s.whatsapp.net`] || contacts[`${num}@lid`];
+    return profileCache.get(id)?.name || c?.notify || c?.name || c?.pushName || undefined;
+}
+
+function buildTaggables(sock: any, groupMeta: any, extraJids: string[] = []): Taggable[] {
+    const seen   = new Set<string>();
+    const people: Taggable[] = [];
+    const add = (id: string | undefined, phoneJid?: string) => {
+        if (!id) return;
+        const key = id.split('@')[0].split(':')[0];
+        if (seen.has(key)) return;
+        seen.add(key);
+        const pn = phoneJid || (id.endsWith('@s.whatsapp.net') ? id : undefined);
+        people.push({
+            id,
+            phone: pn ? pn.split('@')[0].split(':')[0] : undefined,
+            name:  getKnownName(sock, id)
+        });
+    };
+    for (const p of groupMeta?.participants || []) add(p?.id, p?.phoneNumber);
+    for (const j of extraJids) add(j);
+    return people;
 }
 
 // ── OPT 2: per-connection botJids cache ──────────────────────────────────────
@@ -1208,12 +1241,14 @@ export async function handleChatbotResponse(
             // still clears it immediately on group-participants.update so
             // kicks/joins are reflected promptly.
             const groupMeta = await getCachedGroupMeta(sock, chatId);
-            const memberNames = (groupMeta?.participants || [])
-                .map((p: any) => p?.notify || p?.name || p?.subject || p?.id)
-                .filter(Boolean)
+            const people = buildTaggables(sock, groupMeta, [...allMentioned, senderId]);
+            // Only real names go to the model — never raw IDs/LIDs (that's what it was echoing back).
+            const memberNames = people
+                .map(p => p.name)
+                .filter((n): n is string => !!n)
                 .slice(0, 10);
             const groupLabel = memberNames.length
-                ? `Group context: this chat includes ${memberNames.join(', ')}. Keep replies anchored to the current topic and the member asking the question.`
+                ? `Group context: this chat includes ${memberNames.join(', ')}. Keep replies anchored to the current topic and the member asking the question. To tag a member write @ followed by their name exactly as listed. Never write phone numbers or long ID numbers.`
                 : 'Group context: this is a group chat. Keep replies anchored to the current topic and the person asking the question.';
 
             // Typing starts BEFORE the API call
@@ -1239,10 +1274,11 @@ export async function handleChatbotResponse(
 
             // ── BUG FIX #2: send the message FIRST, save history only after
             //    successful delivery — prevents persisting undelivered bot turns. ──
-            await sock.sendMessage(chatId, { text: response }, { quoted: message });
+            const { text: replyText, mentions: replyMentions } = fixTags(response, people);
+            await sock.sendMessage(chatId, { text: replyText, mentions: replyMentions }, { quoted: message });
 
             // Build updated history threads
-            const userTurn     = `User (${senderId.split('@')[0]}): ${cleanedMessage.length > HISTORY_TURN_CHAR_LIMIT ? cleanedMessage.slice(0, HISTORY_TURN_CHAR_LIMIT) + '...' : cleanedMessage}`;
+            const userTurn     = `User (${profile.name || getKnownName(sock, senderId) || 'member'}): ${cleanedMessage.length > HISTORY_TURN_CHAR_LIMIT ? cleanedMessage.slice(0, HISTORY_TURN_CHAR_LIMIT) + '...' : cleanedMessage}`;
             const botTurn      = `Bot: ${response.length > HISTORY_TURN_CHAR_LIMIT ? response.slice(0, HISTORY_TURN_CHAR_LIMIT) + '...' : response}`;
             const sharedThread   = [...sharedMessages, userTurn, botTurn].slice(-8);
             const personalThread = [...userMessages,   userTurn, botTurn].slice(-8);
@@ -1340,8 +1376,8 @@ export default {
                 return sock.sendMessage(chatId, { text: '❌ Mention the user to pardon. Example: `.chatbot pardon @username`' }, { quoted: message });
             }
             await clearGrudge(chatId, mentioned, profileCache);
-            const tag = `@${mentioned.split('@')[0]}`;
-            return sock.sendMessage(chatId, { text: `✅ Grudge cleared for ${tag}. They can talk to me again.`, mentions: [mentioned] }, { quoted: message });
+            const userTag = tag(mentioned);
+            return sock.sendMessage(chatId, { text: `✅ Grudge cleared for ${userTag}. They can talk to me again.`, mentions: [toJid(mentioned)] }, { quoted: message });
         }
 
         if (match.startsWith('reset')) {
@@ -1356,8 +1392,8 @@ export default {
                 }, { quoted: message });
             }
             await clearHistory(mentioned, chatId);
-            const tag = `@${mentioned.split('@')[0]}`;
-            return sock.sendMessage(chatId, { text: `✅ Conversation history cleared for ${tag}. Fresh start 🧹`, mentions: [mentioned] }, { quoted: message });
+            const userTag = tag(mentioned);
+            return sock.sendMessage(chatId, { text: `✅ Conversation history cleared for ${userTag}. Fresh start 🧹`, mentions: [toJid(mentioned)] }, { quoted: message });
         }
 
         if (match.startsWith('history')) {
@@ -1367,9 +1403,9 @@ export default {
             }
             const hist = await loadHistory(mentioned, chatId);
             if (hist.length === 0) {
-                return sock.sendMessage(chatId, { text: `📭 No conversation history stored for @${mentioned.split('@')[0]}`, mentions: [mentioned] }, { quoted: message });
+                return sock.sendMessage(chatId, { text: `📭 No conversation history stored for ${tag(mentioned)}`, mentions: [toJid(mentioned)] }, { quoted: message });
             }
-            return sock.sendMessage(chatId, { text: `*📜 HISTORY FOR @${mentioned.split('@')[0]}*\n\n${hist.join('\n')}\n\n_(${hist.length} entries)_`, mentions: [mentioned] }, { quoted: message });
+            return sock.sendMessage(chatId, { text: `*📜 HISTORY FOR ${tag(mentioned)}*\n\n${hist.join('\n')}\n\n_(${hist.length} entries)_`, mentions: [toJid(mentioned)] }, { quoted: message });
         }
 
         if (match === 'grudges') {
@@ -1380,7 +1416,7 @@ export default {
                 if (g && g.active && now < g.expiresAt) {
                     const hoursLeft = ((g.expiresAt - now) / 3600000).toFixed(1);
                     const name      = profile.name || uid.split('@')[0];
-                    entries.push(`• @${uid.split('@')[0]} (${name}) — ${hoursLeft}h left [${g.severity}, strike ${g.strikes}]`);
+                    entries.push(`• ${tag(uid)} (${name}) — ${hoursLeft}h left [${g.severity}, strike ${g.strikes}]`);
                 }
             }
             if (entries.length === 0) {
