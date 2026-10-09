@@ -204,19 +204,19 @@ export async function handleLinkDetection(sock: any, chatId: string, message: an
 
         if (linkPatterns.whatsappGroup.test(userMessage)) {
             shouldAct = true;
-            linkType = 'WhatsApp Group';
+            linkType = 'WhatsApp Group Links';
         } else if (linkPatterns.whatsappChannel.test(userMessage)) {
             shouldAct = true;
-            linkType = 'WhatsApp Channel';
+            linkType = 'WhatsApp Channel Links';
         } else if (linkPatterns.telegram.test(userMessage)) {
             shouldAct = true;
-            linkType = 'Telegram';
+            linkType = 'Telegram Links';
         } else if (linkPatterns.allLinks.test(userMessage)) {
             const domain = extractDomain(userMessage);
             const domainAllowed = !!domain && (config.allowedDomains || []).some(d => domain.endsWith(d));
             if (!domainAllowed) {
                 shouldAct = true;
-                linkType = 'External Link';
+                linkType = 'External Links';
             }
         }
 
@@ -246,7 +246,7 @@ export async function handleLinkDetection(sock: any, chatId: string, message: an
 
         if (action === 'warn') {
             await sock.sendMessage(chatId, {
-                text: `⚠️ *Warning!!!*\n\n@${senderId.split('@')[0]}, posting ${linkType} links is not allowed here!`,
+                text: `⚠️ *Warning!!!*\n\n@${senderId.split('@')[0]}, posting ${linkType} are not allowed here!`,
                 mentions: [senderId]
             });
             return;
