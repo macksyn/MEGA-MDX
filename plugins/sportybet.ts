@@ -543,6 +543,182 @@ async function runMyBets(sock: any, message: any, chatId: string, userId: string
 // Fixtures & Results
 // ─────────────────────────────────────────────────────────────────────────
 
+// ── BEGIN scoreboard ─────────────────────────────────────────────────────
+// Text "scoreboard" in the style of a sports app: a TODAY banner pinned on
+// top (always present — "No match Today" when empty), then matches grouped
+// under date headers with a match count. Each date's matches sit in a
+// monospace block so team names flank a centred score/kick-off time, with
+// the status ("Ended" / "LIVE" / "HT") on a small line above the score.
+//
+// Everything is grouped by the WAT calendar day (UTC+1) so a late kick-off
+// never lands under the wrong date for Nigerian players.
+
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+/** Roughly how many matches each feed shows (the last date group is always shown whole). */
+const FEED_MATCH_TARGET = 10;
+/** Longest club name drawn in a row — keeps each line narrow enough not to wrap on a phone. */
+const MAX_NAME_WIDTH = 14;
+const RULE = '━━━━━━━━━━━━━━━━━━━━';
+
+type FeedState = 'upcoming' | 'live' | 'halftime' | 'ended' | 'off';
+
+interface FeedRow {
+  home: string;
+  away: string;
+  slot: string; // centre column: score, or kick-off time
+  label?: string; // small status line above the slot
+}
+
+/** WAT calendar day as "YYYY-MM-DD" — safe to compare as strings. */
+function watDayKey(ts: number): string {
+  return new Date(ts + WAT_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+/** 24-hour WAT clock, e.g. "19:30". */
+function formatClock(iso: string): string {
+  const d = new Date(new Date(iso).getTime() + WAT_OFFSET_MS);
+  return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+}
+
+/** "Saturday, 03 October" (with "Tomorrow · " / "Yesterday · " in front where it applies). */
+function dayHeading(key: string, todayKey: string): string {
+  const d = new Date(`${key}T00:00:00Z`);
+  const diffDays = Math.round((d.getTime() - new Date(`${todayKey}T00:00:00Z`).getTime()) / 86_400_000);
+  const base = `${DAY_NAMES[d.getUTCDay()]}, ${String(d.getUTCDate()).padStart(2, '0')} ${MONTH_NAMES[d.getUTCMonth()]}`;
+  if (diffDays === 1) return `Tomorrow · ${base}`;
+  if (diffDays === -1) return `Yesterday · ${base}`;
+  return base;
+}
+
+function matchCount(n: number): string {
+  return `${n} ${n === 1 ? 'Match' : 'Matches'}`;
+}
+
+/** Collapses football-data.org's many statuses into the five this view cares about. */
+function feedState(status: string): FeedState {
+  switch (status) {
+    case 'FINISHED':
+    case 'AWARDED':
+      return 'ended';
+    case 'IN_PLAY':
+    case 'LIVE':
+      return 'live';
+    case 'PAUSED':
+      return 'halftime';
+    case 'SCHEDULED':
+    case 'TIMED':
+      return 'upcoming';
+    default:
+      return 'off'; // POSTPONED / SUSPENDED / CANCELLED
+  }
+}
+
+function clip(name: string): string {
+  return name.length > MAX_NAME_WIDTH ? `${name.slice(0, MAX_NAME_WIDTH - 1)}…` : name;
+}
+
+function center(text: string, width: number): string {
+  const total = Math.max(0, width - text.length);
+  const left = Math.floor(total / 2);
+  return ' '.repeat(left) + text + ' '.repeat(total - left);
+}
+
+function toFeedRow(m: any): FeedRow {
+  const home = clip(shortClubName(m.homeTeam.name));
+  const away = clip(shortClubName(m.awayTeam.name));
+  const score = `${m.score?.fullTime?.home ?? 0} - ${m.score?.fullTime?.away ?? 0}`;
+
+  switch (feedState(m.status)) {
+    case 'ended':
+      return { home, away, slot: score, label: 'Ended' };
+    case 'live':
+      return { home, away, slot: score, label: 'LIVE' };
+    case 'halftime':
+      return { home, away, slot: score, label: 'HT' };
+    case 'upcoming':
+      return { home, away, slot: formatClock(m.utcDate) };
+    default: {
+      const label = m.status === 'POSTPONED' ? 'Postponed' : m.status === 'SUSPENDED' ? 'Suspended' : m.status === 'CANCELLED' ? 'Cancelled' : 'Off';
+      return { home, away, slot: 'vs', label };
+    }
+  }
+}
+
+/** One monospace block for a date: home name right-aligned, away name left-aligned, score in the middle. */
+function renderRows(rows: FeedRow[]): string {
+  const colW = Math.max(...rows.flatMap((r) => [r.home.length, r.away.length]));
+  const slotW = Math.max(5, ...rows.map((r) => r.slot.length));
+  const lines: string[] = [];
+
+  for (const r of rows) {
+    if (r.label) {
+      const pad = Math.max(0, colW + 1 + Math.floor((slotW - r.label.length) / 2));
+      lines.push(' '.repeat(pad) + r.label);
+    }
+    lines.push(`${r.home.padStart(colW)} ${center(r.slot, slotW)} ${r.away}`);
+    lines.push('');
+  }
+  lines.pop(); // drop the trailing spacer
+  return '```\n' + lines.join('\n') + '\n```';
+}
+
+/** The TODAY banner — visually different from the plain date headers below it, and never skipped. */
+function renderToday(todayKey: string, todays: any[]): string {
+  const hasLive = todays.some((m) => ['live', 'halftime'].includes(feedState(m.status)));
+  const sub = dayHeading(todayKey, todayKey);
+  const head = `${RULE}\n${hasLive ? '🔴' : '🔥'} *TODAY* · _${sub}${todays.length ? ` · ${matchCount(todays.length)}` : ''}_\n${RULE}`;
+  if (!todays.length) return `${head}\n📭 No match Today`;
+  return `${head}\n${renderRows(todays.map(toFeedRow))}`;
+}
+
+function renderDay(key: string, todayKey: string, matches: any[]): string {
+  return `📆 *${dayHeading(key, todayKey)}* _(${matchCount(matches.length)})_\n${renderRows(matches.map(toFeedRow))}`;
+}
+
+/**
+ * Builds the whole message. TODAY (every match kicking off today, whatever its
+ * state) is always on top. Below it: 'upcoming' lists the next dates soonest-first,
+ * 'results' lists finished dates newest-first.
+ */
+function buildFeedText(allMatches: any[], mode: 'upcoming' | 'results', now: number = Date.now()): string {
+  const todayKey = watDayKey(now);
+
+  const byDay = new Map<string, any[]>();
+  for (const m of allMatches) {
+    const key = watDayKey(new Date(m.utcDate).getTime());
+    if (!byDay.has(key)) byDay.set(key, []);
+    byDay.get(key)!.push(m);
+  }
+  for (const list of byDay.values()) list.sort((a, b) => new Date(a.utcDate).getTime() - new Date(b.utcDate).getTime());
+
+  const keys = [...byDay.keys()].filter((k) => (mode === 'upcoming' ? k > todayKey : k < todayKey)).sort();
+  if (mode === 'results') keys.reverse();
+
+  const keep = (m: any) => {
+    const state = feedState(m.status);
+    return mode === 'upcoming' ? state === 'upcoming' || state === 'off' : state === 'ended';
+  };
+
+  const sections: string[] = [];
+  let count = 0;
+  for (const key of keys) {
+    const dayMatches = byDay.get(key)!.filter(keep);
+    if (!dayMatches.length) continue;
+    sections.push(renderDay(key, todayKey, dayMatches));
+    count += dayMatches.length;
+    if (count >= FEED_MATCH_TARGET) break;
+  }
+
+  const title = mode === 'upcoming' ? '📆 Upcoming Fixtures' : '🏁 Recent Results';
+  const body = sections.length ? sections.join('\n\n') : mode === 'upcoming' ? '_No upcoming fixtures found._' : '_No finished matches yet._';
+  const footer = mode === 'upcoming' ? '\n\n🕒 _Kick-off times are in WAT_' : '';
+
+  return `⚽ *PREMIER LEAGUE*\n_${title}_\n\n${renderToday(todayKey, byDay.get(todayKey) ?? [])}\n\n${body}${footer}`;
+}
+// ── END scoreboard ───────────────────────────────────────────────────────
+
 async function runFixtures(sock: any, message: any, chatId: string, userId: string, channelInfo: any) {
   const result = await promptMenu(sock, message, chatId, userId, {
     title: '📅 Fixtures & Results',
@@ -557,48 +733,18 @@ async function runFixtures(sock: any, message: any, chatId: string, userId: stri
   if (result.cancelled) return 'back';
   if (result.timedOut || !result.value) return;
 
-  if (result.value === 'upcoming') {
-    let fixtures;
-    try {
-      fixtures = await fetchUpcomingFixtures();
-    } catch (err) {
-      console.error('[sportybet] failed to load fixtures:', err);
-      return sock.sendMessage(chatId, { text: '⚠️ Could not reach the fixtures service right now.', ...channelInfo }, { quoted: message });
-    }
-    // Reuse the join purely to flatten the nested homeTeam/awayTeam objects — no odds tips needed here.
-    const withKickoff = joinFixturesWithOdds(fixtures, []).slice(0, 10);
-    const text = withKickoff.map((f) => `⚽ ${shortClubName(f.homeTeam)} vs ${shortClubName(f.awayTeam)}\n   ${formatKickoff(f.kickoff)}`).join('\n\n');
-    return sock.sendMessage(
-      chatId,
-      { text: `📆 *Upcoming Fixtures*\n\n${text || 'No upcoming fixtures found.'}`, ...channelInfo },
-      { quoted: message }
-    );
-  }
-
+  // One cached full-season call feeds both views AND the TODAY banner, so
+  // live / finished-today / kicking-off-today matches are all covered.
   let matches;
   try {
     matches = await fetchAllSeasonMatches();
   } catch (err) {
-    console.error('[sportybet] failed to load results:', err);
-    return sock.sendMessage(chatId, { text: '⚠️ Could not reach the results service right now.', ...channelInfo }, { quoted: message });
+    console.error('[sportybet] failed to load fixtures/results:', err);
+    return sock.sendMessage(chatId, { text: '⚠️ Could not reach the fixtures service right now.', ...channelInfo }, { quoted: message });
   }
-  // Newest first, sorted by kickoff rather than trusting the API's ordering.
-  const finished = matches
-    .filter((m) => m.status === 'FINISHED')
-    .sort((a, b) => new Date(b.utcDate).getTime() - new Date(a.utcDate).getTime())
-    .slice(0, 10);
-  const text = finished
-    .map((m) => {
-      const emoji = m.score.winner === 'DRAW' ? '🤝' : '⚽';
-      // Same date/time line the Upcoming Fixtures list uses (WAT).
-      return `${emoji} ${shortClubName(m.homeTeam.name)} ${m.score.fullTime.home} - ${m.score.fullTime.away} ${shortClubName(m.awayTeam.name)}\n   ${formatKickoff(m.utcDate)}`;
-    })
-    .join('\n\n');
-  return sock.sendMessage(
-    chatId,
-    { text: `🏁 *Recent Results*\n\n${text || 'No finished matches yet.'}`, ...channelInfo },
-    { quoted: message }
-  );
+
+  const mode = result.value === 'upcoming' ? 'upcoming' : 'results';
+  return sock.sendMessage(chatId, { text: buildFeedText(matches, mode), ...channelInfo }, { quoted: message });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
