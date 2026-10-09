@@ -22,6 +22,7 @@ const db        = createStore('chatbot');
 const dbUsers   = db.table!('users');
 const dbHistory = db.table!('history');
 const dbConfig  = db.table!('config');
+const dbMembers = db.table!('members');
 
 const profileCache = new Map<string, Record<string, any>>();
 const historyCache = new Map<string, string[]>();
@@ -55,33 +56,79 @@ export function invalidateGroupMetaCache(chatId: string): void {
 }
 
 // ── Tag helpers: who can the bot name / @tag in this chat? ───────────────────
-// Builds { id, phone, name } for every group member (plus anyone @mentioned in
-// the incoming message) so fixTags() can turn raw LIDs / phone numbers / "@Name"
-// in the AI's reply into real, clickable tags. A member with no known name is
-// still tag-able — they just never get shown to the model by LID.
-function getKnownName(sock: any, id: string): string | undefined {
-    const num      = id.split('@')[0].split(':')[0];
+// The model writes "@Name"; fixTags() turns that into a real tag — but only if we
+// can map the name back to a JID. WhatsApp never gives us names for silent members,
+// and a name seen in turn 1 is gone by turn 5. So every name we ever learn (from an
+// @mention, a pushName, a contact) is remembered per group in a small directory
+// and reused on every later turn.
+interface MemberEntry { id: string; names: string[] }
+const memberDirCache = new Map<string, Record<string, MemberEntry>>();
+const bareId = (jid: string) => jid.split('@')[0].split(':')[0];
+
+async function loadMemberDir(chatId: string): Promise<Record<string, MemberEntry>> {
+    const cached = memberDirCache.get(chatId);
+    if (cached) return cached;
+    let dir: Record<string, MemberEntry> = {};
+    try { dir = ((await dbMembers.get(chatId)) as any) || {}; } catch (_) {}
+    memberDirCache.set(chatId, dir);
+    return dir;
+}
+
+/** Remember "this JID is called <name>" for this group. Call it for any message you see. */
+export async function rememberMember(chatId: string, jid: string | undefined, ...names: (string | null | undefined)[]): Promise<void> {
+    if (!jid) return;
+    const clean = names.map(n => (n || '').trim()).filter(n => n.length >= 2 && n.length <= 40);
+    if (clean.length === 0) return;
+    const dir   = await loadMemberDir(chatId);
+    const key   = bareId(jid);
+    const entry = dir[key] || { id: jid, names: [] };
+    const before = JSON.stringify(entry);
+    entry.id = jid;
+    for (const n of [...clean].reverse()) {
+        if (!entry.names.some(x => x.toLowerCase() === n.toLowerCase())) entry.names.unshift(n);
+    }
+    entry.names = entry.names.slice(0, 4);
+    if (JSON.stringify(entry) === before) return;
+    dir[key] = entry;
+    try { await dbMembers.set(chatId, dir as any); } catch (_) {}
+}
+
+function liveName(sock: any, id: string): string | undefined {
+    const num      = bareId(id);
     const contacts = sock.store?.contacts || {};
     const c        = contacts[id] || contacts[`${num}@s.whatsapp.net`] || contacts[`${num}@lid`];
     return profileCache.get(id)?.name || c?.notify || c?.name || c?.pushName || undefined;
 }
 
-function buildTaggables(sock: any, groupMeta: any, extraJids: string[] = []): Taggable[] {
+async function buildTaggables(sock: any, chatId: string, groupMeta: any, extraJids: string[] = []): Promise<Taggable[]> {
+    const dir    = await loadMemberDir(chatId);
     const seen   = new Set<string>();
     const people: Taggable[] = [];
-    const add = (id: string | undefined, phoneJid?: string) => {
+
+    const add = (id: string | undefined, lid?: string, phoneJid?: string) => {
         if (!id) return;
-        const key = id.split('@')[0].split(':')[0];
-        if (seen.has(key)) return;
-        seen.add(key);
-        const pn = phoneJid || (id.endsWith('@s.whatsapp.net') ? id : undefined);
+        const ids = [id, lid, phoneJid].filter(Boolean).map(j => bareId(j as string));
+        if (ids.some(k => seen.has(k))) return;
+        ids.forEach(k => seen.add(k));
+
+        // Prefer the JID WhatsApp itself handed us in a mention/message (proven to render as a tag).
+        const known = ids.map(k => dir[k]).find(Boolean);
+        const canon = known?.id || id;
+        const pn    = phoneJid || (id.endsWith('@s.whatsapp.net') ? id : undefined);
+        const names = [liveName(sock, canon), liveName(sock, id), ...(known?.names || [])]
+            .filter((n): n is string => !!n);
+        const uniq  = [...new Set(names)];
+
         people.push({
-            id,
-            phone: pn ? pn.split('@')[0].split(':')[0] : undefined,
-            name:  getKnownName(sock, id)
+            id:      canon,
+            phone:   pn ? bareId(pn) : undefined,
+            name:    uniq[0],
+            aliases: uniq.slice(1),
+            alt:     ids.filter(k => k !== bareId(canon))
         });
     };
-    for (const p of groupMeta?.participants || []) add(p?.id, p?.phoneNumber);
+
+    for (const p of groupMeta?.participants || []) add(p?.id, p?.lid, p?.phoneNumber);
     for (const j of extraJids) add(j);
     return people;
 }
@@ -1060,13 +1107,15 @@ export async function handleChatbotResponse(
         // Resolve @mentions to display names
         const allMentioned: string[] = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
         const contacts = (sock as any).store?.contacts || {};
+        const memberDir = await loadMemberDir(chatId);
         for (const jid of allMentioned) {
             const numPart  = jid.split('@')[0].split(':')[0];
             const isBotJid = botJids.some((b: string) => b.split('@')[0].split(':')[0] === numPart);
             if (isBotJid) continue;
             const contact     = contacts[jid] || contacts[`${numPart}@s.whatsapp.net`] || contacts[`${numPart}@lid`];
-            const displayName = contact?.notify || contact?.name || contact?.pushName;
+            const displayName = contact?.notify || contact?.name || contact?.pushName || memberDir[numPart]?.names?.[0];
             if (displayName) {
+                await rememberMember(chatId, jid, displayName);
                 cleanedMessage = cleanedMessage.replace(new RegExp(`@${numPart}`, 'g'), `@${displayName}`);
             }
         }
@@ -1126,6 +1175,7 @@ export async function handleChatbotResponse(
             //    state machine so we ask the user directly and confirm before saving.
             const pushName: string | undefined = message.pushName;
             const waFirstName = extractFirstName(pushName);
+            await rememberMember(chatId, senderId, pushName, waFirstName);
 
             if (waFirstName && !profile.name) {
                 // Got a real name from WhatsApp — use it directly, no need to ask
@@ -1241,14 +1291,14 @@ export async function handleChatbotResponse(
             // still clears it immediately on group-participants.update so
             // kicks/joins are reflected promptly.
             const groupMeta = await getCachedGroupMeta(sock, chatId);
-            const people = buildTaggables(sock, groupMeta, [...allMentioned, senderId]);
+            const people = await buildTaggables(sock, chatId, groupMeta, [...allMentioned, senderId]);
             // Only real names go to the model — never raw IDs/LIDs (that's what it was echoing back).
             const memberNames = people
                 .map(p => p.name)
                 .filter((n): n is string => !!n)
                 .slice(0, 10);
             const groupLabel = memberNames.length
-                ? `Group context: this chat includes ${memberNames.join(', ')}. Keep replies anchored to the current topic and the member asking the question. To tag a member write @ followed by their name exactly as listed. Never write phone numbers or long ID numbers.`
+                ? `Group context: this chat includes ${memberNames.join(', ')}. Keep replies anchored to the current topic and the member asking the question. To tag someone ELSE write @ followed by their name exactly as listed. When talking to the person who messaged you, just use their name naturally without @. Never write phone numbers or long ID numbers.`
                 : 'Group context: this is a group chat. Keep replies anchored to the current topic and the person asking the question.';
 
             // Typing starts BEFORE the API call
@@ -1274,11 +1324,16 @@ export async function handleChatbotResponse(
 
             // ── BUG FIX #2: send the message FIRST, save history only after
             //    successful delivery — prevents persisting undelivered bot turns. ──
-            const { text: replyText, mentions: replyMentions } = fixTags(response, people);
+            // The person we're replying to is already notified by the quoted reply, so write their
+            // name plainly instead of tagging them — unless they asked ("tag me", "mention me").
+            const wantsSelfTag = /\b(tag|mention|ping)\s+me\b/i.test(cleanedMessage);
+            const { text: replyText, mentions: replyMentions } = fixTags(
+                response, people, { plainIds: wantsSelfTag ? [] : [senderId] }
+            );
             await sock.sendMessage(chatId, { text: replyText, mentions: replyMentions }, { quoted: message });
 
             // Build updated history threads
-            const userTurn     = `User (${profile.name || getKnownName(sock, senderId) || 'member'}): ${cleanedMessage.length > HISTORY_TURN_CHAR_LIMIT ? cleanedMessage.slice(0, HISTORY_TURN_CHAR_LIMIT) + '...' : cleanedMessage}`;
+            const userTurn     = `User (${profile.name || liveName(sock, senderId) || 'member'}): ${cleanedMessage.length > HISTORY_TURN_CHAR_LIMIT ? cleanedMessage.slice(0, HISTORY_TURN_CHAR_LIMIT) + '...' : cleanedMessage}`;
             const botTurn      = `Bot: ${response.length > HISTORY_TURN_CHAR_LIMIT ? response.slice(0, HISTORY_TURN_CHAR_LIMIT) + '...' : response}`;
             const sharedThread   = [...sharedMessages, userTurn, botTurn].slice(-8);
             const personalThread = [...userMessages,   userTurn, botTurn].slice(-8);
