@@ -9,7 +9,7 @@ import {
     getThawMessage,
     type GrudgeRecord
 } from '../lib/grudge.js';
-import { fixTags, tag, toJid, type Taggable } from '../lib/tag.js';
+import { fixTags, removeSelfTags, tag, toJid, type Taggable } from '../lib/tag.js';
 import { classifyIntent, compressHistory, extractPreferences, extractQuotedContext, getClarificationHint, getConfidenceLevel, getIntentInstruction, summarizeGroupHistory, summarizeProfile, type ChatIntent } from '../lib/intentRouter.js';
 
 const MONGO_URL    = process.env.MONGO_URL;
@@ -100,9 +100,10 @@ function liveName(sock: any, id: string): string | undefined {
     return profileCache.get(id)?.name || c?.notify || c?.name || c?.pushName || undefined;
 }
 
-async function buildTaggables(sock: any, chatId: string, groupMeta: any, extraJids: string[] = []): Promise<Taggable[]> {
+async function buildTaggables(sock: any, chatId: string, groupMeta: any, extraJids: string[] = [], excludeIds: string[] = []): Promise<Taggable[]> {
     const dir    = await loadMemberDir(chatId);
-    const seen   = new Set<string>();
+    // The bot itself is never a tag target — pre-seeding `seen` makes add() skip it everywhere.
+    const seen   = new Set<string>(excludeIds.map(bareId));
     const people: Taggable[] = [];
 
     const add = (id: string | undefined, lid?: string, phoneJid?: string) => {
@@ -1102,7 +1103,13 @@ export async function handleChatbotResponse(
         if (!isBotMentioned && !isReplyToBot) return;
 
         let cleanedMessage = userMessage;
-        if (isBotMentioned) cleanedMessage = cleanedMessage.replace(new RegExp(`@${botNumber}`, 'g'), '').trim();
+        if (isBotMentioned) {
+            // Strip the bot's own @mention in EVERY form (phone number AND lid). Previously only the
+            // phone form was removed, so in LID groups the model saw "@555…" and echoed it back.
+            const selfNums = [...new Set([botNumber, ...botJids.map((b: string) => b.split('@')[0].split(':')[0])])].filter(Boolean);
+            for (const n of selfNums) cleanedMessage = cleanedMessage.replace(new RegExp(`@${n}`, 'g'), '');
+            cleanedMessage = cleanedMessage.replace(/\s{2,}/g, ' ').trim();
+        }
 
         // Resolve @mentions to display names
         const allMentioned: string[] = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
@@ -1291,7 +1298,7 @@ export async function handleChatbotResponse(
             // still clears it immediately on group-participants.update so
             // kicks/joins are reflected promptly.
             const groupMeta = await getCachedGroupMeta(sock, chatId);
-            const people = await buildTaggables(sock, chatId, groupMeta, [...allMentioned, senderId]);
+            const people = await buildTaggables(sock, chatId, groupMeta, [...allMentioned, senderId], botJids);
             // Only real names go to the model — never raw IDs/LIDs (that's what it was echoing back).
             const memberNames = people
                 .map(p => p.name)
@@ -1327,8 +1334,9 @@ export async function handleChatbotResponse(
             // The person we're replying to is already notified by the quoted reply, so write their
             // name plainly instead of tagging them — unless they asked ("tag me", "mention me").
             const wantsSelfTag = /\b(tag|mention|ping)\s+me\b/i.test(cleanedMessage);
+            const selfCleaned = removeSelfTags(response, { ids: botJids, names: [sock.user?.name, 'Groq'] });
             const { text: replyText, mentions: replyMentions } = fixTags(
-                response, people, { plainIds: wantsSelfTag ? [] : [senderId] }
+                selfCleaned, people, { plainIds: wantsSelfTag ? [] : [senderId] }
             );
             await sock.sendMessage(chatId, { text: replyText, mentions: replyMentions }, { quoted: message });
 
