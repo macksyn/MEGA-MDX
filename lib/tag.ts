@@ -4,6 +4,8 @@ export interface Taggable {
   id:     string;    // JID as WhatsApp gave it: 1234@lid or 234801...@s.whatsapp.net
   phone?: string;    // resolved phone number, if known (digits only)
   name?:  string;    // display name, if known
+  aliases?: string[]; // other names this person goes by (pushName, first name, ...)
+  alt?:   string[];  // other numbers that identify the same person (LID <-> phone)
 }
 
 /** Bare number part: '1234:5@lid' -> '1234' (strips server AND device suffix). */
@@ -33,30 +35,50 @@ export function tagList(jids: string[]): { text: string; mentions: string[] } {
 export const withMentions = (text: string, jids: string[]) =>
   ({ text, mentions: [...new Set(jids.map(toJid))] });
 
-const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// Escape for RegExp, and treat straight/curly apostrophes as the same character
+// (models usually type ' even when the WhatsApp name has ’).
+const esc = (s: string) =>
+  s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/['’‘`]/g, "['’‘`]");
 
 /**
  * Repair text written by the AI: turns raw LIDs, phone numbers and "@Name"
  * into proper "@<id>" tags and returns the mentions array to send with it.
  * Idempotent — running it twice changes nothing.
+ *
+ * opts.plainIds: people who must NOT be tagged (e.g. the person the bot is replying
+ * to). "@Alex" / their raw ID is written as plain "Alex" instead, with no mention.
  */
 export function fixTags(
   text: string,
-  people: Taggable[]
+  people: Taggable[],
+  opts: { plainIds?: string[] } = {}
 ): { text: string; mentions: string[] } {
+  const plain    = new Set((opts.plainIds || []).map(bare));
+  const isPlain  = (p: Taggable) => plain.has(bare(p.id));
   const mentions = new Set<string>();
   const byDigits = new Map<string, Taggable>();
 
   for (const p of people) {
     byDigits.set(bare(p.id), p);
     if (p.phone) byDigits.set(p.phone.replace(/\D/g, ''), p);
+    for (const a of p.alt || []) byDigits.set(a.replace(/\D/g, ''), p);
   }
 
-  // 1) "@Name" -> "@<id>"  (longest names first so "Ada Obi" wins over "Ada")
-  const named = people.filter(p => p.name).sort((a, b) => b.name!.length - a.name!.length);
-  for (const p of named) {
-    const re = new RegExp(`@${esc(p.name!)}(?![\\w])`, 'gi');
-    text = text.replace(re, () => { mentions.add(toJid(p.id)); return tag(p.id); });
+  // 1) "@Name" -> "@<id>"  (every known name/alias, longest first so "Ada Obi" wins over "Ada")
+  const names: { name: string; p: Taggable }[] = [];
+  for (const p of people) {
+    for (const n of [p.name, ...(p.aliases || [])]) {
+      if (n && n.trim()) names.push({ name: n.trim(), p });
+    }
+  }
+  names.sort((a, b) => b.name.length - a.name.length);
+  for (const { name, p } of names) {
+    const re = new RegExp(`@${esc(name)}(?![\\w])`, 'gi');
+    text = text.replace(re, () => {
+      if (isPlain(p)) return name;                 // talk TO them, don't ping them
+      mentions.add(toJid(p.id));
+      return tag(p.id);
+    });
   }
 
   // 2) raw LID / phone number (with or without @, :device, @lid, @s.whatsapp.net) -> "@<id>"
@@ -65,6 +87,7 @@ export function fixTags(
     (match, digits: string) => {
       const p = byDigits.get(digits);
       if (!p) return match;
+      if (isPlain(p)) return p.name || 'you';
       mentions.add(toJid(p.id));
       return tag(p.id);
     }
