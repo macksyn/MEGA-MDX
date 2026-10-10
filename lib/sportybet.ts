@@ -1136,7 +1136,51 @@ function formatFinalScore(leg: Leg, match: FootballDataMatch): string {
   return base;
 }
 
+/**
+ * One settlement pass at a time. Safe to call from several places (the built-in
+ * poller below AND any scheduler you already have): an overlapping call returns
+ * straight away instead of racing the running pass and double-crediting a win.
+ */
+let settlementInFlight = false;
+
 export async function pollAndSettleCoupons(): Promise<{ couponsChecked: number; couponsSettled: number }> {
+  if (settlementInFlight) return { couponsChecked: 0, couponsSettled: 0 };
+  settlementInFlight = true;
+  try {
+    return await runSettlementPass();
+  } finally {
+    settlementInFlight = false;
+  }
+}
+
+const SETTLEMENT_POLL_MS = 5 * 60_000;
+
+/**
+ * Starts the background settlement loop (idempotent — calling it twice, or after
+ * a hot reload, never starts a second timer). Runs one pass immediately so
+ * anything that finished while the bot was offline settles on startup.
+ * Costs football-data.org calls only (the season list is cached for 60s);
+ * it never touches The Odds API credits.
+ */
+export function startCouponSettlementPoller(intervalMs: number = SETTLEMENT_POLL_MS): void {
+  const g = globalThis as any;
+  if (g.__sportybetSettlementTimer) return;
+
+  const tick = async () => {
+    try {
+      const { couponsChecked, couponsSettled } = await pollAndSettleCoupons();
+      if (couponsSettled > 0) console.log(`[sportybet] settlement: ${couponsSettled} settled of ${couponsChecked} pending coupon(s)`);
+    } catch (err) {
+      console.error('[sportybet] settlement poll failed:', err);
+    }
+  };
+
+  g.__sportybetSettlementTimer = setInterval(tick, intervalMs);
+  g.__sportybetSettlementTimer.unref?.();
+  void tick();
+}
+
+async function runSettlementPass(): Promise<{ couponsChecked: number; couponsSettled: number }> {
   const [allUsers, seasonMatches] = await Promise.all([
     couponsByUser.getAll() as Promise<Record<string, Coupon[]>>,
     fetchAllSeasonMatches(),
