@@ -469,7 +469,7 @@ const CHATGPT_API_URL       = process.env.CHATGPT_API_URL ?? 'https://api.malvin
 // Set CHATGPT_API_KEY in your environment. There is deliberately no default in the source:
 // a key committed to the repo is shared by everyone who clones it (and shares their rate limits).
 // Without a key the primary provider is simply disabled and the Groq fallback is used.
-const CHATGPT_API_KEY       = process.env.CHATGPT_API_KEY ?? '';
+const CHATGPT_API_KEY       = process.env.MALVIN_API_KEY ?? '';
 const PRIMARY_PROVIDER_NAME = 'chatgpt-luna';
 
 interface ChatGPTAuth {
