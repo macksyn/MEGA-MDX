@@ -2,25 +2,40 @@ import type { BotContext } from '../types.js';
 import axios from 'axios';
 import yts from 'yt-search';
 
-const DL_API = 'https://api.qasimdev.dpdns.org/api/loaderto/download';
-const API_KEY = 'qasim-dev';
+const DL_API = 'https://api.malvintech.co.zw/api/download/savetube';
+const API_KEY = 'malvin-2LxgoPMYhJx1KyFHkC0T6acThSq1JoBVnS65cFng'; // 🔑 put your MalvinTech API key here
 
 const wait = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
 
 interface DownloadData {
-    downloadUrl: string;
+    download_url: string;
     title: string;
+    thumbnail?: string;
+    duration?: string;
+    quality?: string;
 }
 
-const downloadWithRetry = async (url: string, retries = 3): Promise<DownloadData> => {
+const downloadWithRetry = async (
+    url: string,
+    quality: string = '426',
+    retries = 3
+): Promise<DownloadData> => {
     for (let i = 0; i < retries; i++) {
         try {
             const { data } = await axios.get(DL_API, {
-                params: { apiKey: API_KEY, format: '360', url },
+                params: {
+                    url,
+                    type: 'video',
+                    quality,
+                    apikey: API_KEY
+                },
                 timeout: 120000
             });
-            if (data?.data?.downloadUrl) return data.data as DownloadData;
-            throw new Error('No download URL');
+
+            if (data?.status && data?.data?.download_url) {
+                return data.data as DownloadData;
+            }
+            throw new Error(data?.message || 'No download URL');
         } catch (err) {
             if (i === retries - 1) throw err;
             console.log(`Download attempt ${i + 1} failed, retrying in 5s...`);
@@ -66,7 +81,9 @@ export default {
                 videoThumbnail = videos[0].thumbnail;
             }
 
-            const validYT = videoUrl.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|embed\/))([a-zA-Z0-9_-]{11})/);
+            const validYT = videoUrl.match(
+                /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|embed\/))([a-zA-Z0-9_-]{11})/
+            );
             if (!validYT) return sock.sendMessage(
                 chatId,
                 { text: '❌ Not a valid YouTube link!' },
@@ -83,10 +100,10 @@ export default {
                     : `🎬 *${videoTitle || query}*\n⬇️ Downloading... *(may take up to 30s)*`
             }, { quoted: message });
 
-            const videoData = await downloadWithRetry(videoUrl);
+            const videoData = await downloadWithRetry(videoUrl, '426');
 
             await sock.sendMessage(chatId, {
-                video: { url: videoData.downloadUrl },
+                video: { url: videoData.download_url },
                 mimetype: 'video/mp4',
                 fileName: `${videoData.title || videoTitle || 'video'}.mp4`,
                 caption: `🎬 *${videoData.title || videoTitle || 'Video'}*\n\n> _Groq™_*`
@@ -97,7 +114,11 @@ export default {
             const reason = err.response?.status === 408
                 ? 'Download timed out. Try again.'
                 : err.message;
-            await sock.sendMessage(chatId, { text: `❌ Download failed!\nReason: ${reason}` }, { quoted: message });
+            await sock.sendMessage(
+                chatId,
+                { text: `❌ Download failed!\nReason: ${reason}` },
+                { quoted: message }
+            );
         }
     }
 };

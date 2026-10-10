@@ -10,6 +10,7 @@ import {
     type GrudgeRecord
 } from '../lib/grudge.js';
 import { fixTags, removeSelfTags, tag, toJid, type Taggable } from '../lib/tag.js';
+import { cleanLocation, cleanResponse, extractUserInfo } from '../lib/chatText.js';
 import { classifyIntent, compressHistory, extractPreferences, extractQuotedContext, getClarificationHint, getConfidenceLevel, getIntentInstruction, summarizeGroupHistory, summarizeProfile, type ChatIntent } from '../lib/intentRouter.js';
 
 const MONGO_URL    = process.env.MONGO_URL;
@@ -27,7 +28,47 @@ const dbMembers = db.table!('members');
 const profileCache = new Map<string, Record<string, any>>();
 const historyCache = new Map<string, string[]>();
 
-const processingLock = new Set<string>();
+// ── Per-key async mutex ──────────────────────────────────────────────────────
+// This used to be `processingLock = new Set()` that was added to and deleted from but never
+// CHECKED, so nothing was serialized: two quick messages from one person ran in parallel and
+// overwrote each other's history (a stored "User: second question" ended up next to "Bot: reply 1").
+// runExclusive() queues work per key so turns run one at a time, in arrival order.
+// maxQueued caps running+waiting jobs for a key; extra jobs are dropped (flood protection).
+const lockTails = new Map<string, Promise<void>>();
+const lockDepth = new Map<string, number>();
+
+async function runExclusive<T>(
+    key: string,
+    fn: () => Promise<T>,
+    maxQueued: number = Infinity
+): Promise<{ ran: true; value: T } | { ran: false }> {
+    const depth = lockDepth.get(key) ?? 0;
+    if (depth >= maxQueued) return { ran: false };
+    lockDepth.set(key, depth + 1);
+
+    const prev = lockTails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const tail    = new Promise<void>(res => { release = res; });
+    const chained = prev.then(() => tail);
+    lockTails.set(key, chained);
+
+    await prev;
+    try {
+        return { ran: true, value: await fn() };
+    } finally {
+        release();
+        const left = (lockDepth.get(key) ?? 1) - 1;
+        if (left <= 0) {
+            lockDepth.delete(key);
+            if (lockTails.get(key) === chained) lockTails.delete(key);
+        } else {
+            lockDepth.set(key, left);
+        }
+    }
+}
+
+// One person's turns (per chat): the one running + up to 2 waiting. More than that is spam.
+const MAX_QUEUED_TURNS = 3;
 
 // ── OPT 1: groupMetadata TTL cache ───────────────────────────────────────────
 // sock.groupMetadata() is a live WhatsApp network call. Without caching it fires
@@ -383,7 +424,7 @@ async function clearHistory(senderId: string, chatId: string): Promise<void> {
 // bot to drop it necessarily re-mentioned it, which just added a fresh turn
 // back into the same shared thread. .chatbot reset (no @mention) now calls
 // this to clear it immediately. No historyCache entry to clean up here —
-// group history is never cached in memory (see saveGroupHistory).
+// group history is never cached in memory (see appendGroupHistory).
 async function clearGroupHistory(chatId: string): Promise<void> {
     const key = groupHistoryKey(chatId);
     await dbHistory.del(key);
@@ -403,13 +444,17 @@ async function loadGroupHistory(chatId: string): Promise<string[]> {
     return summarizeGroupHistory(messages);
 }
 
-async function saveGroupHistory(chatId: string, messages: string[]): Promise<void> {
+// Appends this exchange to the shared group thread INSIDE a per-chat lock, re-reading the stored
+// thread first. Two members answered at the same time used to overwrite each other (last write
+// won). It also appends to the RAW stored messages — before, the summarised copy returned by
+// loadGroupHistory() was what got saved back, so summaries got re-summarised on every turn.
+async function appendGroupHistory(chatId: string, turns: string[]): Promise<void> {
     const key = groupHistoryKey(chatId);
-    // FIX: store raw messages — no summariseGroupHistory() call here.
-    // loadGroupHistory() handles the summarisation on read.
-    await dbHistory.set(key, { messages, updatedAt: Date.now() } as any);
-    // Also keep the in-memory cache in sync (store raw so load can summarise)
-    // No historyCache entry for group keys — group history is always fetched from DB.
+    await runExclusive(`group:${chatId}`, async () => {
+        const stored = normalizeStoredHistory(await dbHistory.get(key));
+        const live   = stored.messages.length > 0 && Date.now() - stored.updatedAt > GROUP_SESSION_GAP_MS ? [] : stored.messages;
+        await dbHistory.set(key, { messages: [...live, ...turns].slice(-8), updatedAt: Date.now() } as any);
+    });
 }
 
 // ── AI provider config ────────────────────────────────────────────────────────
@@ -421,10 +466,10 @@ async function saveGroupHistory(chatId: string, messages: string[]): Promise<voi
 // back to if the primary is degraded.
 
 const CHATGPT_API_URL       = process.env.CHATGPT_API_URL ?? 'https://api.malvin.gleeze.com/api/ai/chatgpt';
-// Falls back to the key from the API's own docs if CHATGPT_API_KEY isn't set.
-// Swap in your own key via env so you're not sharing rate limits with every
-// other default-key user.
-const CHATGPT_API_KEY       = process.env.CHATGPT_API_KEY ?? 'malvin-2LxgoPMYhJx1KyFHkC0T6acThSq1JoBVnS65cFng';
+// Set CHATGPT_API_KEY in your environment. There is deliberately no default in the source:
+// a key committed to the repo is shared by everyone who clones it (and shares their rate limits).
+// Without a key the primary provider is simply disabled and the Groq fallback is used.
+const CHATGPT_API_KEY       = process.env.CHATGPT_API_KEY ?? '';
 const PRIMARY_PROVIDER_NAME = 'chatgpt-luna';
 
 interface ChatGPTAuth {
@@ -443,6 +488,9 @@ interface ChatGPTThread {
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY ?? '';
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+if (!CHATGPT_API_KEY) console.warn('[CHATBOT] CHATGPT_API_KEY is not set — primary AI provider (chatgpt-luna) is DISABLED.');
+if (!GROQ_API_KEY)    console.warn('[CHATBOT] GROQ_API_KEY is not set — fallback AI provider (groq) is DISABLED.');
 
 const FALLBACK_MODEL = {
     name:  'groq/compound-mini',
@@ -499,7 +547,35 @@ function isApiHealthy(name: string): boolean {
 }
 
 // ── Chatbot config storage ────────────────────────────────────────────────────
+// The hot path used to call dbConfig.getAll() (a full table scan) on EVERY message just to
+// check one chat, and `.chatbot on/off` saved by diffing a whole stale snapshot — so two
+// admins toggling different groups at once could delete each other's setting.
+// Now: single-key get/set/del, plus a short cache for the per-message check.
+const CONFIG_CACHE_TTL_MS = 60 * 1000;
+const enabledCache = new Map<string, { on: boolean; ts: number }>();
 
+async function isChatbotEnabled(chatId: string, fresh = false): Promise<boolean> {
+    const cached = enabledCache.get(chatId);
+    if (!fresh && cached && Date.now() - cached.ts < CONFIG_CACHE_TTL_MS) return cached.on;
+    try {
+        const on = !!(await dbConfig.get(chatId));
+        enabledCache.set(chatId, { on, ts: Date.now() });
+        return on;
+    } catch (error: any) {
+        console.error('Error reading chatbot config:', error.message);
+        return cached?.on ?? false;
+    }
+}
+
+async function setChatbotEnabled(chatId: string, on: boolean): Promise<void> {
+    if (on) await dbConfig.set(chatId, true as any);
+    else    await dbConfig.del(chatId);
+    enabledCache.set(chatId, { on, ts: Date.now() });
+}
+
+// Kept for any other module that imports them (exported on the default export below).
+// Prefer isChatbotEnabled / setChatbotEnabled: saveUserGroupData treats `data` as the COMPLETE
+// desired state, so a stale snapshot still deletes entries added after it was loaded.
 async function loadUserGroupData() {
     try {
         const enabled = await dbConfig.getAll();
@@ -521,6 +597,7 @@ async function saveUserGroupData(data: any) {
                 await dbConfig.del(chatId);
             }
         }
+        enabledCache.clear();
     } catch (error: any) {
         console.error('Error saving chatbot config:', error.message);
     }
@@ -675,39 +752,6 @@ function parseNameFromReply(text: string): string | null {
     return null;
 }
 
-// ── User info extractor ───────────────────────────────────────────────────────
-
-function extractUserInfo(message: string) {
-    const text = message.trim();
-    const info: Record<string, any> = {};
-
-    const namePatterns = [
-        /\bmy\s+name\s+is\s+([a-z][a-z'-]{1,20})/i,
-        /\bi\s+am\s+([a-z][a-z'-]{1,20})\b/i,
-        /\bcall\s+me\s+([a-z][a-z'-]{1,20})\b/i,
-        /\bI'm\s+([a-z][a-z'-]{1,20})\b/i
-    ];
-    for (const pattern of namePatterns) {
-        const match = text.match(pattern);
-        if (match?.[1]) {
-            info.name = match[1].replace(/^./, c => c.toUpperCase());
-            break;
-        }
-    }
-
-    const ageMatch = text.match(/\b(?:i am|i'm|i'm|my age is)\s*(\d{1,3})\b/i)
-        ?? text.match(/\b(\d{1,3})\s*(?:years?|yrs?)\s+old\b/i);
-    if (ageMatch?.[1]) info.age = ageMatch[1];
-
-    const locationMatch = text.match(/\b(?:i live in|i'm from|i'm from|my city is|my country is|i am from)\s+([a-z][a-z ,.-]{1,40})/i)
-        ?? text.match(/\b(?:from|in)\s+([a-z][a-z ,.-]{1,40})\b/i);
-    if (locationMatch?.[1]) {
-        info.location = locationMatch[1].replace(/[.,!?]+$/g, '').trim();
-    }
-
-    return info;
-}
-
 // ── Live query detector ───────────────────────────────────────────────────────
 
 function requiresLiveData(message: string): boolean {
@@ -736,7 +780,7 @@ function buildPrompt(
 
     const extraInfo = [
         info.age      ? `age: ${info.age}`           : '',
-        info.location ? `location: ${info.location}` : ''
+        cleanLocation(info.location) ? `location: ${cleanLocation(info.location)}` : ''
     ].filter(Boolean).join(', ');
     const memoryLine       = summarizeProfile(info);
     const groupContextLine = info.groupContext  ? `Group context: ${info.groupContext} ` : '';
@@ -960,32 +1004,6 @@ async function callChatGPT(
     }
 }
 
-// ── Response cleaner ──────────────────────────────────────────────────────────
-
-function cleanResponse(text: string): string {
-    return text
-        .trim()
-        .replace(/winks/g,                             '😉')
-        .replace(/eye roll/g,                           '🙄')
-        .replace(/shrug/g,                              '🤷')
-        .replace(/raises eyebrow/g,                     '🤨')
-        .replace(/smiles/g,                             '😊')
-        .replace(/laughs/g,                             '😂')
-        .replace(/cries/g,                              '😢')
-        .replace(/thinks/g,                             '🤔')
-        .replace(/sleeps/g,                             '😴')
-        .replace(/google/gi,                            'Groq')
-        .replace(/a large language model/gi,            'just a person')
-        .replace(/Remember:.*$/gm,                      '')
-        .replace(/IMPORTANT:.*$/gm,                     '')
-        .replace(/^(Groq|Bot|AI|Assistant)\s*:\s*/gim, '')
-        .replace(/By the way, to unlock the full functionality of all Apps, enable\s*\[?Gemini Apps Activity\]?[^\n]*/gi, '')
-        .replace(/\[Gemini Apps Activity\]\(https?:\/\/[^)]+\)/gi, '')
-        .replace(/https?:\/\/myactivity\.\S+\/product\/gemini\S*/gi, '')
-        .replace(/\n{2,}/g,  '\n')
-        .trim();
-}
-
 // ── AI call ───────────────────────────────────────────────────────────────────
 
 async function getAIResponse(
@@ -1025,7 +1043,7 @@ async function getAIResponse(
     // Same system prompt + compressed context every turn (keeps the group-
     // context mixing above intact); the stored chatId/auth just layers the
     // provider's own thread memory on top as a bonus when one exists.
-    if (isApiHealthy(PRIMARY_PROVIDER_NAME)) {
+    if (CHATGPT_API_KEY && isApiHealthy(PRIMARY_PROVIDER_NAME)) {
         try {
             const existingThread = await loadGptThread(senderId, chatId);
             const prompt = `${systemPrompt}\n\n${contextBlock}`;
@@ -1038,12 +1056,12 @@ async function getAIResponse(
             recordFailure(PRIMARY_PROVIDER_NAME);
             console.log(`[AI] ${PRIMARY_PROVIDER_NAME} failed: ${err?.message}`);
         }
-    } else {
+    } else if (CHATGPT_API_KEY) {
         console.log(`[AI] Skipping ${PRIMARY_PROVIDER_NAME} — recent failures`);
     }
 
     // ── Fallback: Groq compound-mini ────────────────────────────────────────
-    if (isApiHealthy(FALLBACK_MODEL.name)) {
+    if (GROQ_API_KEY && isApiHealthy(FALLBACK_MODEL.name)) {
         try {
             const result = await callGroq(FALLBACK_MODEL, systemPrompt, contextBlock, temperature, maxTokens);
             recordSuccess(FALLBACK_MODEL.name);
@@ -1068,8 +1086,7 @@ export async function handleChatbotResponse(
     userMessage: string,
     senderId: string
 ) {
-    const data = await loadUserGroupData();
-    if (!data.chatbot[chatId]) return;
+    if (!(await isChatbotEnabled(chatId))) return;
 
     try {
         // ── OPT 2: use pre-resolved botJids (cached at connection time) ─────
@@ -1136,9 +1153,7 @@ export async function handleChatbotResponse(
 
         // ── BUG FIX #1: processing lock is now INSIDE the try so the finally
         //    that removes it is always reachable, even if startTyping() throws. ──
-        try {
-            processingLock.add(senderId);
-
+        const turn = await runExclusive(`${senderId}__${chatId}`, async () => {
             // Insult detection
             const insult = detectInsult(cleanedMessage);
             if (insult.hit) {
@@ -1343,18 +1358,16 @@ export async function handleChatbotResponse(
             // Build updated history threads
             const userTurn     = `User (${profile.name || liveName(sock, senderId) || 'member'}): ${cleanedMessage.length > HISTORY_TURN_CHAR_LIMIT ? cleanedMessage.slice(0, HISTORY_TURN_CHAR_LIMIT) + '...' : cleanedMessage}`;
             const botTurn      = `Bot: ${response.length > HISTORY_TURN_CHAR_LIMIT ? response.slice(0, HISTORY_TURN_CHAR_LIMIT) + '...' : response}`;
-            const sharedThread   = [...sharedMessages, userTurn, botTurn].slice(-8);
-            const personalThread = [...userMessages,   userTurn, botTurn].slice(-8);
+            const personalThread = [...userMessages, userTurn, botTurn].slice(-8);
 
-            // Parallel save — both writes happen simultaneously (optimisation bonus)
             await Promise.all([
-                saveGroupHistory(chatId, sharedThread),
+                appendGroupHistory(chatId, [userTurn, botTurn]),
                 saveHistory(senderId, chatId, personalThread),
             ]);
 
-        } finally {
-            // FIX #1: this finally is guaranteed to run even if startTyping() throws
-            processingLock.delete(senderId);
+        }, MAX_QUEUED_TURNS);
+        if (!turn.ran) {
+            console.log(`[CHATBOT] Dropped a message from ${senderId.split('@')[0]} — ${MAX_QUEUED_TURNS} turns already queued`);
         }
 
     } catch (error: any) {
@@ -1413,23 +1426,19 @@ export default {
             }, { quoted: message });
         }
 
-        const data = await loadUserGroupData();
-
         if (match === 'on') {
-            if (data.chatbot[chatId]) {
+            if (await isChatbotEnabled(chatId, true)) {
                 return sock.sendMessage(chatId, { text: '⚠️ *Chatbot is already enabled for this group*' }, { quoted: message });
             }
-            data.chatbot[chatId] = true;
-            await saveUserGroupData(data);
+            await setChatbotEnabled(chatId, true);
             return sock.sendMessage(chatId, { text: '✅ *Chatbot enabled!*\n\nMention me or reply to my messages to chat.' }, { quoted: message });
         }
 
         if (match === 'off') {
-            if (!data.chatbot[chatId]) {
+            if (!(await isChatbotEnabled(chatId, true))) {
                 return sock.sendMessage(chatId, { text: '⚠️ *Chatbot is already disabled for this group*' }, { quoted: message });
             }
-            delete data.chatbot[chatId];
-            await saveUserGroupData(data);
+            await setChatbotEnabled(chatId, false);
             return sock.sendMessage(chatId, { text: '❌ *Chatbot disabled!*\n\nI will no longer respond to mentions.' }, { quoted: message });
         }
 
@@ -1491,6 +1500,8 @@ export default {
         if (match === 'stats') {
             const now      = Date.now();
             const apiLines = [PRIMARY_PROVIDER_NAME, FALLBACK_MODEL.name].map(name => {
+                if (name === PRIMARY_PROVIDER_NAME && !CHATGPT_API_KEY) return `⛔ *${name}*: disabled (CHATGPT_API_KEY not set)`;
+                if (name === FALLBACK_MODEL.name   && !GROQ_API_KEY)    return `⛔ *${name}*: disabled (GROQ_API_KEY not set)`;
                 const s        = apiStats[name];
                 const icon     = s.count === 0 ? '✅' : s.count < API_SKIP_THRESHOLD ? '⚠️' : '❌';
                 const skipped  = !isApiHealthy(name) ? ' [SKIPPED]' : '';
@@ -1524,5 +1535,7 @@ export default {
 
     handleChatbotResponse,
     loadUserGroupData,
-    saveUserGroupData
+    saveUserGroupData,
+    isChatbotEnabled,
+    setChatbotEnabled
 };
