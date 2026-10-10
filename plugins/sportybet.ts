@@ -36,6 +36,7 @@ import {
   fetchUpcomingFixtures,
   fetchOddsTips,
   fetchAllSeasonMatches,
+  startCouponSettlementPoller,
   fetchCoreMarkets,
   fetchExtraMarkets,
   getCachedExtraMarkets,
@@ -62,6 +63,10 @@ import {
   type TeamSide,
   type Coupon,
 } from '../lib/sportybet.js';
+
+// Settles finished matches onto coupons in the background (every 5 min, plus once on
+// startup). Remove this line if you already schedule pollAndSettleCoupons() elsewhere.
+startCouponSettlementPoller();
 
 export const command = 'sportybet';
 export const aliases = ['bet', 'sb'];
