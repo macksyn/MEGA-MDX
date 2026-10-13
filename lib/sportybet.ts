@@ -272,6 +272,7 @@ export interface Coupon {
 
 const root = createStore('sportybet');
 const couponsByUser = root.table!('couponsByUser'); // userId -> Coupon[]
+const bookingCodesTable = root.table!('bookingCodes'); // booking code -> BookingCode
 
 const MAX_COUPONS_PER_USER = 100;
 
@@ -1413,6 +1414,188 @@ export async function getUserCoupons(userId: string): Promise<Coupon[]> {
 export async function getCoupon(userId: string, couponId: string): Promise<Coupon | null> {
   const list = await getUserCoupons(userId);
   return list.find((c) => c.id === couponId) || null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Booking codes — share a slip, anyone loads it and bets their own stake
+//
+// A code stands for the SELECTIONS only (which match, which market, which pick) —
+// never a stake and never a price. Loading re-prices every selection against today's
+// odds, so a code can't be used to lock in an old, better price. The code is derived from
+// the selections themselves (a hash), so the same slip always gets the same code no matter
+// who shares it or in what order the legs were added. Records are tiny and de-duplicated
+// that way, so nothing needs pruning yet.
+// ─────────────────────────────────────────────────────────────────────────
+
+export interface BookingLeg {
+  league: LeagueId;
+  homeTeam: string; // official football-data.org names — what fixtures and settlement use
+  awayTeam: string;
+  kickoff: string;
+  market: Market;
+  selection: Selection;
+  point?: number;
+  team?: TeamSide;
+  /** The price when the code was made — only used to show "odds changed" on load, never to place a bet. */
+  odds: number;
+}
+
+export interface BookingCode {
+  code: string;
+  key: string; // canonical form of the selections — detects hash collisions
+  legs: BookingLeg[];
+  createdBy: string;
+  createdAt: number;
+}
+
+/** 31 characters: no I, L, O, 0 or 1 — nothing to misread when a code is typed from a screenshot. */
+const BOOKING_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const BOOKING_CODE_LENGTH = 6;
+
+function toBookingLeg(item: PlaceCouponPick | Leg): BookingLeg {
+  return {
+    league: item.league ?? DEFAULT_LEAGUE,
+    homeTeam: item.homeTeam,
+    awayTeam: item.awayTeam,
+    kickoff: item.kickoff,
+    market: item.market,
+    selection: item.selection,
+    point: item.point,
+    team: item.team,
+    odds: 'oddsAtPlacement' in item ? item.oddsAtPlacement : item.odds,
+  };
+}
+
+/** Order-independent identity of a slip: which picks, ignoring prices. */
+function bookingKey(legs: BookingLeg[]): string {
+  return legs
+    .map((l) => [l.league, normalizeTeamName(l.homeTeam), normalizeTeamName(l.awayTeam), l.market, l.selection, l.point ?? '', l.team ?? ''].join('|'))
+    .sort()
+    .join(';');
+}
+
+function bookingCodeFor(key: string, salt: number): string {
+  const digest = createHash('sha256').update(`${key}#${salt}`).digest();
+  let code = '';
+  for (let i = 0; i < BOOKING_CODE_LENGTH; i++) code += BOOKING_ALPHABET[digest[i] % BOOKING_ALPHABET.length];
+  return code;
+}
+
+/** Makes (or re-finds) the booking code for a slip — works on picks being built or on a placed coupon's legs. */
+export async function createBookingCode(userId: string, items: (PlaceCouponPick | Leg)[]): Promise<string> {
+  const legs = items.map(toBookingLeg);
+  if (!legs.length) throw new Error('createBookingCode: nothing to share');
+  const key = bookingKey(legs);
+
+  for (let salt = 0; salt < 20; salt++) {
+    const code = bookingCodeFor(key, salt);
+    const existing = (await bookingCodesTable.get(code)) as BookingCode | null | undefined;
+    if (existing && existing.key !== key) continue; // that code already belongs to a different slip — next salt
+    const record: BookingCode = { code, key, legs, createdBy: existing?.createdBy ?? cleanJid(userId), createdAt: Date.now() };
+    await bookingCodesTable.set(code, record);
+    return code;
+  }
+  throw new Error('createBookingCode: could not find a free code');
+}
+
+/** Cleans what a player typed ("k7m-2qx", " K7M2QX ") into a code, or null if it can't be one. */
+export function parseBookingCode(raw: string): string | null {
+  const code = String(raw ?? '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '');
+  return code.length === BOOKING_CODE_LENGTH && [...code].every((c) => BOOKING_ALPHABET.includes(c)) ? code : null;
+}
+
+export async function getBookingCode(raw: string): Promise<BookingCode | null> {
+  const code = parseBookingCode(raw);
+  if (!code) return null;
+  return ((await bookingCodesTable.get(code)) as BookingCode | null | undefined) ?? null;
+}
+
+export type BookingDropReason = 'started' | 'unavailable' | 'market_unavailable' | 'budget';
+
+export interface RepricedSlip {
+  /** Selections that can be bet on right now, at TODAY's odds; `was` is the price when the code was made. */
+  loaded: { pick: PlaceCouponPick; was: number }[];
+  dropped: { leg: BookingLeg; reason: BookingDropReason }[];
+}
+
+const EXTRA_ONLY_MARKETS: readonly Market[] = ['btts_h1', 'double_chance_h1', 'halftime_fulltime'];
+
+/**
+ * Turns a code's selections back into bettable picks: each is matched to a fixture that can still
+ * be bet on, then re-priced from the live odds. A selection that can't be loaded (match started,
+ * no odds, market no longer offered, or no credit budget to price it) is reported in `dropped`
+ * instead of being silently lost. `joined` should come from the same loader as "Place a Bet".
+ */
+export async function repriceBookingLegs(legs: BookingLeg[], joined: FixtureWithOdds[]): Promise<RepricedSlip> {
+  const loaded: RepricedSlip['loaded'] = [];
+  const dropped: RepricedSlip['dropped'] = [];
+  const marketsByEvent = new Map<string, EventMarkets>();
+  const extraLoaded = new Set<string>();
+  const seenMatches = new Set<string>();
+
+  for (const leg of legs) {
+    const home = normalizeTeamName(leg.homeTeam);
+    const away = normalizeTeamName(leg.awayTeam);
+    const matchKey = `${leg.league}|${home}|${away}`;
+    if (seenMatches.has(matchKey)) continue; // a coupon holds one leg per match
+    seenMatches.add(matchKey);
+
+    const fixture = joined.find((f) => f.league === leg.league && normalizeTeamName(f.homeTeam) === home && normalizeTeamName(f.awayTeam) === away);
+    if (!fixture) {
+      const started = new Date(leg.kickoff).getTime() - Date.now() < BETTING_CUTOFF_MS;
+      dropped.push({ leg, reason: started ? 'started' : 'unavailable' });
+      continue;
+    }
+
+    let em: EventMarkets = {};
+    if (leg.market !== '1x2') {
+      if (!fixture.eventId) {
+        dropped.push({ leg, reason: 'market_unavailable' });
+        continue;
+      }
+      try {
+        const id = fixture.eventId;
+        if (!marketsByEvent.has(id)) marketsByEvent.set(id, await fetchCoreMarkets(id, fixture.league)); // cached 24h — the first loader pays, everyone after is free
+        em = marketsByEvent.get(id)!;
+        if (EXTRA_ONLY_MARKETS.includes(leg.market) && !extraLoaded.has(id)) {
+          const extra = (await getCachedExtraMarkets(id)) ?? (await fetchExtraMarkets(id, fixture.league));
+          em = { ...em, ...extra };
+          marketsByEvent.set(id, em);
+          extraLoaded.add(id);
+        }
+      } catch (err) {
+        dropped.push({ leg, reason: isCreditBudgetError(err) ? 'budget' : 'market_unavailable' });
+        continue;
+      }
+    }
+
+    const option = getMarketOptions(leg.market, fixture, em, leg.team).find(
+      (o) => o.selection === leg.selection && (o.point ?? null) === (leg.point ?? null) && (o.team ?? null) === (leg.team ?? null)
+    );
+    if (!option) {
+      dropped.push({ leg, reason: 'market_unavailable' });
+      continue;
+    }
+
+    loaded.push({
+      was: leg.odds,
+      pick: {
+        league: fixture.league,
+        homeTeam: fixture.homeTeam,
+        awayTeam: fixture.awayTeam,
+        kickoff: fixture.kickoff, // the fixture's CURRENT kick-off, in case the match was moved
+        market: leg.market,
+        selection: option.selection,
+        point: option.point,
+        team: option.team,
+        odds: option.odds,
+      },
+    });
+  }
+
+  return { loaded, dropped };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
