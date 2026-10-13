@@ -35,8 +35,12 @@ import { cleanJid } from '../lib/isOwner.js';
 import {
   fetchUpcomingFixtures,
   fetchOddsTips,
-  fetchAllSeasonMatches,
+  fetchAllLeaguesSeasonMatches,
   startCouponSettlementPoller,
+  LEAGUES,
+  DEFAULT_LEAGUE,
+  getLeague,
+  scoreAfter90,
   fetchCoreMarkets,
   fetchExtraMarkets,
   getCachedExtraMarkets,
@@ -55,6 +59,7 @@ import {
   MAX_STAKE,
   MAX_LEGS_PER_COUPON,
   BETTING_CUTOFF_MS,
+  type LeagueId,
   type FixtureWithOdds,
   type PlaceCouponPick,
   type Market,
@@ -244,7 +249,7 @@ async function runAddOrStake(
 
   const outcome =
     result.value === 'more'
-      ? await runFixturePicker(sock, message, chatId, userId, channelInfo, joined, picks)
+      ? await runLeaguePicker(sock, message, chatId, userId, channelInfo, joined, picks)
       : await runStakeEntry(sock, message, chatId, userId, channelInfo, picks);
 
   if (outcome === 'back') return runAddOrStake(sock, message, chatId, userId, channelInfo, joined, picks);
@@ -319,6 +324,7 @@ async function runSelectionPicker(
   if (!chosen) return;
 
   const newPick: PlaceCouponPick = {
+    league: fixture.league,
     homeTeam: fixture.homeTeam,
     awayTeam: fixture.awayTeam,
     kickoff: fixture.kickoff,
@@ -387,7 +393,7 @@ async function runMarketPicker(
 
   if (fixture.eventId) {
     try {
-      core = await fetchCoreMarkets(fixture.eventId);
+      core = await fetchCoreMarkets(fixture.eventId, fixture.league);
       coreLoaded = true;
     } catch (err) {
       if (isCreditBudgetError(err)) paused = true;
@@ -419,7 +425,7 @@ async function runMarketPicker(
 
   if (result.value === 'more') {
     try {
-      const fetched = await fetchExtraMarkets(fixture.eventId!);
+      const fetched = await fetchExtraMarkets(fixture.eventId!, fixture.league);
       if (!Object.keys(fetched).length) {
         await sock.sendMessage(chatId, { text: 'ℹ️ No extra markets are listed for this match.', ...channelInfo }, { quoted: message });
       }
@@ -439,7 +445,12 @@ async function runMarketPicker(
   return outcome;
 }
 
-async function runFixturePicker(
+/**
+ * Step 1 of a bet (and of every "Add another match"): which league? Only leagues that still
+ * have a bettable match not already in the slip are offered, and with just one left the
+ * picker is skipped. Accumulators can mix leagues freely — each leg remembers its own.
+ */
+async function runLeaguePicker(
   sock: any,
   message: any,
   chatId: string,
@@ -449,19 +460,55 @@ async function runFixturePicker(
   picks: PlaceCouponPick[]
 ) {
   const remaining = joined.filter((f) => !picks.some((p) => sameMatch(p, f)));
+  const offered = LEAGUES.map((league) => ({ league, count: remaining.filter((f) => f.league === league.id).length })).filter((x) => x.count > 0);
+
+  if (offered.length <= 1) return runFixturePicker(sock, message, chatId, userId, channelInfo, joined, picks, offered[0]?.league.id);
+
+  const result = await promptMenu(sock, message, chatId, userId, {
+    title: picks.length ? `⚽ Add another match (${picks.length}/${MAX_LEGS_PER_COUPON} picked)` : '⚽ Pick a league',
+    text: 'Which league do you want to bet on?',
+    options: offered.map(({ league, count }) => ({
+      label: `${league.flag} ${league.name}`,
+      value: league.id,
+      description: `${count} match${count === 1 ? '' : 'es'} with odds`,
+    })),
+    cancelLabel: 'Back',
+  });
+
+  if (result.cancelled) return 'back';
+  if (result.timedOut || !result.value) return;
+
+  const outcome = await runFixturePicker(sock, message, chatId, userId, channelInfo, joined, picks, result.value as LeagueId);
+  if (outcome === 'back') return runLeaguePicker(sock, message, chatId, userId, channelInfo, joined, picks);
+  return outcome;
+}
+
+async function runFixturePicker(
+  sock: any,
+  message: any,
+  chatId: string,
+  userId: string,
+  channelInfo: any,
+  joined: FixtureWithOdds[],
+  picks: PlaceCouponPick[],
+  leagueId?: LeagueId
+) {
+  const remaining = joined.filter((f) => !picks.some((p) => sameMatch(p, f)) && (!leagueId || f.league === leagueId));
 
   if (!remaining.length) {
     // every bettable fixture is already in the slip — nothing left to add
     const outcome = await runStakeEntry(sock, message, chatId, userId, channelInfo, picks);
-    if (outcome === 'back') return runFixturePicker(sock, message, chatId, userId, channelInfo, joined, picks);
+    if (outcome === 'back') return runFixturePicker(sock, message, chatId, userId, channelInfo, joined, picks, leagueId);
     return outcome;
   }
 
   const page = remaining.slice(0, 10); // proven ceiling for the single_select path (Global Trader's max was 10)
   const more = remaining.length - page.length;
+  const league = leagueId ? getLeague(leagueId) : null;
+  const tag = league ? `${league.flag} ${league.name}` : '⚽';
 
   const result = await promptMenu(sock, message, chatId, userId, {
-    title: picks.length ? `⚽ Add another match (${picks.length}/${MAX_LEGS_PER_COUPON} picked)` : '⚽ Pick a match',
+    title: picks.length ? `${tag} · add another (${picks.length}/${MAX_LEGS_PER_COUPON} picked)` : `${tag} · pick a match`,
     text: more > 0 ? `Showing the next ${page.length} of ${remaining.length} fixtures.` : 'Choose a fixture to bet on.',
     options: page.map((f, i) => ({ label: `${shortClubName(f.homeTeam)} vs ${shortClubName(f.awayTeam)}`, value: String(i), description: formatKickoff(f.kickoff) })),
     cancelLabel: 'Back',
@@ -472,18 +519,41 @@ async function runFixturePicker(
 
   const fixture = page[Number(result.value)];
   const outcome = await runMarketPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture);
-  if (outcome === 'back') return runFixturePicker(sock, message, chatId, userId, channelInfo, joined, picks);
+  if (outcome === 'back') return runFixturePicker(sock, message, chatId, userId, channelInfo, joined, picks, leagueId);
   return outcome;
+}
+
+/** Every league's fixtures + 1X2 odds, joined. One league failing never takes the others down. */
+async function loadBettableFixtures(): Promise<{ joined: FixtureWithOdds[]; failed: string[] }> {
+  const results = await Promise.allSettled(
+    LEAGUES.map(async (league) => {
+      const [fixtures, tips] = await Promise.all([fetchUpcomingFixtures(league.id), fetchOddsTips(league.id)]);
+      return joinFixturesWithOdds(fixtures, tips, league.id);
+    })
+  );
+
+  const all: FixtureWithOdds[] = [];
+  const failed: string[] = [];
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') all.push(...r.value);
+    else {
+      console.error(`[sportybet] failed to load ${LEAGUES[i].name} fixtures/odds:`, r.reason);
+      failed.push(LEAGUES[i].name);
+    }
+  });
+
+  // Pre-match only: hide anything already inside the betting cutoff (same rule placeCoupon enforces).
+  const cutoff = Date.now() + BETTING_CUTOFF_MS;
+  const joined = all.filter((f) => f.h2h && new Date(f.kickoff).getTime() > cutoff);
+  return { joined, failed };
 }
 
 async function runPlaceBet(sock: any, message: any, chatId: string, userId: string, channelInfo: any) {
   await sock.sendMessage(chatId, { text: '⏳ Pulling the latest fixtures and odds...', ...channelInfo }, { quoted: message });
 
-  let fixtures, tips;
-  try {
-    [fixtures, tips] = await Promise.all([fetchUpcomingFixtures(), fetchOddsTips()]);
-  } catch (err) {
-    console.error('[sportybet] failed to load fixtures/odds:', err);
+  const { joined, failed } = await loadBettableFixtures();
+
+  if (failed.length === LEAGUES.length) {
     await sock.sendMessage(
       chatId,
       { text: '⚠️ Could not reach the odds service right now — try again shortly.', ...channelInfo },
@@ -491,10 +561,10 @@ async function runPlaceBet(sock: any, message: any, chatId: string, userId: stri
     );
     return;
   }
+  if (failed.length) {
+    await sock.sendMessage(chatId, { text: `⚠️ ${failed.join(', ')} couldn't be loaded right now — showing the rest.`, ...channelInfo }, { quoted: message });
+  }
 
-  // Pre-match only: hide anything already inside the betting cutoff (same rule placeCoupon enforces).
-  const cutoff = Date.now() + BETTING_CUTOFF_MS;
-  const joined = joinFixturesWithOdds(fixtures, tips).filter((f) => f.h2h && new Date(f.kickoff).getTime() > cutoff);
   if (!joined.length) {
     await sock.sendMessage(
       chatId,
@@ -504,7 +574,7 @@ async function runPlaceBet(sock: any, message: any, chatId: string, userId: stri
     return;
   }
 
-  return runFixturePicker(sock, message, chatId, userId, channelInfo, joined, []);
+  return runLeaguePicker(sock, message, chatId, userId, channelInfo, joined, []);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -633,13 +703,18 @@ function center(text: string, width: number): string {
 function toFeedRow(m: any): FeedRow {
   const home = clip(shortClubName(m.homeTeam.name));
   const away = clip(shortClubName(m.awayTeam.name));
-  const score = `${m.score?.fullTime?.home ?? 0} - ${m.score?.fullTime?.away ?? 0}`;
+  const state = feedState(m.status);
+  const duration = m.score?.duration; // knockout only: 'EXTRA_TIME' | 'PENALTY_SHOOTOUT' (absent / 'REGULAR' otherwise)
 
-  switch (feedState(m.status)) {
+  // Finished matches show the 90-minute score — what every bet is settled on — with how it was decided.
+  const reg = state === 'ended' ? scoreAfter90(m) : { home: m.score?.fullTime?.home, away: m.score?.fullTime?.away };
+  const score = `${reg.home ?? 0} - ${reg.away ?? 0}`;
+
+  switch (state) {
     case 'ended':
-      return { home, away, slot: score, label: 'Ended' };
+      return { home, away, slot: score, label: duration === 'EXTRA_TIME' ? 'Ended · AET' : duration === 'PENALTY_SHOOTOUT' ? 'Ended · Pens' : 'Ended' };
     case 'live':
-      return { home, away, slot: score, label: 'LIVE' };
+      return { home, away, slot: score, label: duration === 'EXTRA_TIME' ? 'LIVE · ET' : duration === 'PENALTY_SHOOTOUT' ? 'LIVE · Pens' : 'LIVE' };
     case 'halftime':
       return { home, away, slot: score, label: 'HT' };
     case 'upcoming':
@@ -669,17 +744,28 @@ function renderRows(rows: FeedRow[]): string {
   return '```\n' + lines.join('\n') + '\n```';
 }
 
+/** One date's matches. With showLeagues each league gets its own labelled block (the app's competition cards). */
+function renderMatches(matches: any[], showLeagues: boolean): string {
+  if (!showLeagues) return renderRows(matches.map(toFeedRow));
+  const parts: string[] = [];
+  for (const league of LEAGUES) {
+    const inLeague = matches.filter((m) => (m.league ?? DEFAULT_LEAGUE) === league.id);
+    if (inLeague.length) parts.push(`${league.flag} _${league.name}_\n${renderRows(inLeague.map(toFeedRow))}`);
+  }
+  return parts.join('\n');
+}
+
 /** The TODAY banner — visually different from the plain date headers below it, and never skipped. */
-function renderToday(todayKey: string, todays: any[]): string {
+function renderToday(todayKey: string, todays: any[], showLeagues: boolean): string {
   const hasLive = todays.some((m) => ['live', 'halftime'].includes(feedState(m.status)));
   const sub = dayHeading(todayKey, todayKey);
   const head = `${RULE}\n${hasLive ? '🔴' : '🔥'} *TODAY* · _${sub}${todays.length ? ` · ${matchCount(todays.length)}` : ''}_\n${RULE}`;
   if (!todays.length) return `${head}\n📭 No match Today`;
-  return `${head}\n${renderRows(todays.map(toFeedRow))}`;
+  return `${head}\n${renderMatches(todays, showLeagues)}`;
 }
 
-function renderDay(key: string, todayKey: string, matches: any[]): string {
-  return `📆 *${dayHeading(key, todayKey)}* _(${matchCount(matches.length)})_\n${renderRows(matches.map(toFeedRow))}`;
+function renderDay(key: string, todayKey: string, matches: any[], showLeagues: boolean): string {
+  return `📆 *${dayHeading(key, todayKey)}* _(${matchCount(matches.length)})_\n${renderMatches(matches, showLeagues)}`;
 }
 
 /**
@@ -687,8 +773,10 @@ function renderDay(key: string, todayKey: string, matches: any[]): string {
  * state) is always on top. Below it: 'upcoming' lists the next dates soonest-first,
  * 'results' lists finished dates newest-first.
  */
-function buildFeedText(allMatches: any[], mode: 'upcoming' | 'results', now: number = Date.now()): string {
+function buildFeedText(allMatches: any[], mode: 'upcoming' | 'results', scope: 'all' | LeagueId = 'all', now: number = Date.now()): string {
   const todayKey = watDayKey(now);
+  const showLeagues = scope === 'all';
+  if (!showLeagues) allMatches = allMatches.filter((m) => (m.league ?? DEFAULT_LEAGUE) === scope);
 
   const byDay = new Map<string, any[]>();
   for (const m of allMatches) {
@@ -711,7 +799,7 @@ function buildFeedText(allMatches: any[], mode: 'upcoming' | 'results', now: num
   for (const key of keys) {
     const dayMatches = byDay.get(key)!.filter(keep);
     if (!dayMatches.length) continue;
-    sections.push(renderDay(key, todayKey, dayMatches));
+    sections.push(renderDay(key, todayKey, dayMatches, showLeagues));
     count += dayMatches.length;
     if (count >= FEED_MATCH_TARGET) break;
   }
@@ -720,12 +808,13 @@ function buildFeedText(allMatches: any[], mode: 'upcoming' | 'results', now: num
   const body = sections.length ? sections.join('\n\n') : mode === 'upcoming' ? '_No upcoming fixtures found._' : '_No finished matches yet._';
   const footer = mode === 'upcoming' ? '\n\n🕒 _Kick-off times are in WAT_' : '';
 
-  return `⚽ *PREMIER LEAGUE*\n_${title}_\n\n${renderToday(todayKey, byDay.get(todayKey) ?? [])}\n\n${body}${footer}`;
+  const heading = showLeagues ? '🌍 *ALL LEAGUES*' : `${getLeague(scope).flag} *${getLeague(scope).name.toUpperCase()}*`;
+  return `${heading}\n_${title}_\n\n${renderToday(todayKey, byDay.get(todayKey) ?? [], showLeagues)}\n\n${body}${footer}`;
 }
 // ── END scoreboard ───────────────────────────────────────────────────────
 
 async function runFixtures(sock: any, message: any, chatId: string, userId: string, channelInfo: any) {
-  const result = await promptMenu(sock, message, chatId, userId, {
+  const view = await promptMenu(sock, message, chatId, userId, {
     title: '📅 Fixtures & Results',
     text: 'What would you like to see?',
     options: [
@@ -735,21 +824,38 @@ async function runFixtures(sock: any, message: any, chatId: string, userId: stri
     cancelLabel: 'Back',
   });
 
-  if (result.cancelled) return 'back';
-  if (result.timedOut || !result.value) return;
+  if (view.cancelled) return 'back';
+  if (view.timedOut || !view.value) return;
 
-  // One cached full-season call feeds both views AND the TODAY banner, so
-  // live / finished-today / kicking-off-today matches are all covered.
+  const mode = view.value === 'upcoming' ? 'upcoming' : 'results';
+  const outcome = await runFixturesLeague(sock, message, chatId, userId, channelInfo, mode);
+  if (outcome === 'back') return runFixtures(sock, message, chatId, userId, channelInfo);
+  return outcome;
+}
+
+async function runFixturesLeague(sock: any, message: any, chatId: string, userId: string, channelInfo: any, mode: 'upcoming' | 'results') {
+  const pick = await promptMenu(sock, message, chatId, userId, {
+    title: mode === 'upcoming' ? '📆 Upcoming Fixtures' : '🏁 Recent Results',
+    text: 'Which league?',
+    options: [{ label: '🌍 All Leagues', value: 'all' }, ...LEAGUES.map((l) => ({ label: `${l.flag} ${l.name}`, value: l.id }))],
+    cancelLabel: 'Back',
+  });
+
+  if (pick.cancelled) return 'back';
+  if (pick.timedOut || !pick.value) return;
+
+  // One cached full-season call per league feeds the views AND the TODAY banner, so live /
+  // finished-today / kicking-off-today matches are all covered.
   let matches;
   try {
-    matches = await fetchAllSeasonMatches();
+    matches = await fetchAllLeaguesSeasonMatches();
   } catch (err) {
     console.error('[sportybet] failed to load fixtures/results:', err);
     return sock.sendMessage(chatId, { text: '⚠️ Could not reach the fixtures service right now.', ...channelInfo }, { quoted: message });
   }
 
-  const mode = result.value === 'upcoming' ? 'upcoming' : 'results';
-  return sock.sendMessage(chatId, { text: buildFeedText(matches, mode), ...channelInfo }, { quoted: message });
+  const scope = pick.value === 'all' ? 'all' : (pick.value as LeagueId);
+  return sock.sendMessage(chatId, { text: buildFeedText(matches, mode, scope), ...channelInfo }, { quoted: message });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -759,7 +865,7 @@ async function runFixtures(sock: any, message: any, chatId: string, userId: stri
 async function runMainMenu(sock: any, message: any, chatId: string, userId: string, channelInfo: any) {
   const result = await promptMenu(sock, message, chatId, userId, {
     title: '⚽ SPORTYBET',
-    text: 'Virtual Premier League betting — real odds, your coins.',
+    text: 'Virtual football betting — Premier League, La Liga & Champions League. Real odds, your coins.',
     options: [
       { label: '💰 Place a Bet', value: 'place' },
       { label: '🎫 My Bets', value: 'mybets' },
