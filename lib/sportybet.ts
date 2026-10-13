@@ -224,7 +224,7 @@ export type DoubleChanceSel = '1x' | '12' | 'x2';
 export type HtFtSel = '1/1' | '1/x' | '1/2' | 'x/1' | 'x/x' | 'x/2' | '2/1' | '2/x' | '2/2';
 export type Selection = 'home' | 'draw' | 'away' | 'over' | 'under' | 'yes' | 'no' | DoubleChanceSel | HtFtSel;
 export type LegStatus = 'pending' | 'won' | 'lost' | 'voided';
-export type CouponStatus = 'pending' | 'won' | 'lost';
+export type CouponStatus = 'pending' | 'won' | 'lost' | 'cashed_out';
 
 export interface FixtureWithOdds {
   league: LeagueId;
@@ -264,6 +264,9 @@ export interface Coupon {
   status: CouponStatus;
   placedAt: number;
   settledAt?: number;
+  /** Set when the player took a cash-out instead of waiting for the legs. */
+  cashOutAmount?: number;
+  cashedOutAt?: number;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -273,6 +276,24 @@ export interface Coupon {
 const root = createStore('sportybet');
 const couponsByUser = root.table!('couponsByUser'); // userId -> Coupon[]
 const bookingCodesTable = root.table!('bookingCodes'); // booking code -> BookingCode
+
+/**
+ * Placing a bet, settling a coupon and cashing one out all do "read the coupons, change them, write
+ * them back". Without a lock a slow settlement pass could write back an old copy and silently
+ * undo a cash-out (or drop a bet placed a moment earlier) — and a cashed-out coupon coming back
+ * as 'pending' could be paid a second time when its legs win. Everything that writes coupons
+ * takes this lock; network calls stay OUTSIDE it. (One bot process — the same assumption the
+ * rest of the economy makes.)
+ */
+let couponLockTail: Promise<unknown> = Promise.resolve();
+function withCouponLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = couponLockTail.then(fn, fn);
+  couponLockTail = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
 
 const MAX_COUPONS_PER_USER = 100;
 
@@ -456,17 +477,25 @@ const oddsMetaTable = root.table!('oddsApiMeta'); // 'usage_<key hash>' -> { rem
 interface CacheEntry {
   value: any;
   expiresAt: number;
+  at?: number; // when it was fetched (older entries: expiresAt - the ttl it was written with)
+}
+
+/** Optional per-call freshness: treat a cached value older than maxAgeMs as missing, even if its normal ttl hasn't run out. */
+interface FreshnessOpts {
+  maxAgeMs?: number;
 }
 
 const inflight = new Map<string, Promise<any>>();
 
 /** Fresh cached value (memory, then store) or null. Never fetches, never spends credits. */
-async function peekPersisted<T>(key: string): Promise<T | null> {
+async function peekPersisted<T>(key: string, fresh?: { maxAgeMs?: number; ttlMs: number }): Promise<T | null> {
+  const usable = (e: CacheEntry): boolean =>
+    e.expiresAt > Date.now() && (fresh?.maxAgeMs === undefined || Date.now() - (e.at ?? e.expiresAt - fresh.ttlMs) <= fresh.maxAgeMs);
   const mem = cache.get(key);
-  if (mem && mem.expiresAt > Date.now()) return mem.value as T;
+  if (mem && usable(mem)) return mem.value as T;
   try {
     const stored = (await oddsCacheTable.get(key)) as CacheEntry | null | undefined;
-    if (stored && stored.expiresAt > Date.now()) {
+    if (stored && usable(stored)) {
       cache.set(key, stored);
       return stored.value as T;
     }
@@ -481,11 +510,11 @@ async function peekPersisted<T>(key: string): Promise<T | null> {
  * fetch (two players opening the same match in the same second must not buy
  * its odds twice).
  */
-async function persistentCached<T>(key: string, ttlMs: number, fetcher: () => Promise<T>): Promise<T> {
+async function persistentCached<T>(key: string, ttlMs: number, fetcher: () => Promise<T>, opts: FreshnessOpts = {}): Promise<T> {
   const running = inflight.get(key);
   if (running) return running as Promise<T>;
 
-  const hit = await peekPersisted<T>(key);
+  const hit = await peekPersisted<T>(key, { maxAgeMs: opts.maxAgeMs, ttlMs });
   if (hit !== null) return hit;
 
   const raced = inflight.get(key); // another caller may have started while we awaited the store
@@ -493,7 +522,7 @@ async function persistentCached<T>(key: string, ttlMs: number, fetcher: () => Pr
 
   const promise = (async () => {
     const value = await fetcher();
-    const entry: CacheEntry = { value, expiresAt: Date.now() + ttlMs };
+    const entry: CacheEntry = { value, expiresAt: Date.now() + ttlMs, at: Date.now() };
     cache.set(key, entry);
     try {
       await oddsCacheTable.set(key, entry);
@@ -663,7 +692,7 @@ async function fetchOddsApiEvents(markets: string, league: LeagueId): Promise<Od
 }
 
 /** Best (highest) UK price for h2h (1X2), across every bookmaker offering it. */
-export async function fetchOddsTips(league: LeagueId = DEFAULT_LEAGUE): Promise<OddsTip[]> {
+export async function fetchOddsTips(league: LeagueId = DEFAULT_LEAGUE, opts: FreshnessOpts = {}): Promise<OddsTip[]> {
   // The Premier League keeps its original cache key so a restart right after this upgrade doesn't re-buy fresh odds.
   const cacheKey = league === DEFAULT_LEAGUE ? 'bulk_h2h' : `bulk_h2h_${league}`;
   return persistentCached<OddsTip[]>(cacheKey, ODDS_CACHE_TTL_MS, async () => {
@@ -695,7 +724,7 @@ export async function fetchOddsTips(league: LeagueId = DEFAULT_LEAGUE): Promise<
         h2h: home !== undefined && away !== undefined && draw !== undefined ? { home, draw, away } : null,
       };
     });
-  });
+  }, opts);
 }
 
 // ── Per-match markets (billed per market returned) ───────────────────────
@@ -943,7 +972,7 @@ export function parseEventMarkets(ev: OddsApiEvent, keys: readonly string[]): Ev
   return out;
 }
 
-async function fetchEventBundle(eventId: string, keys: readonly string[], tag: 'core' | 'extra', league: LeagueId): Promise<EventMarkets> {
+async function fetchEventBundle(eventId: string, keys: readonly string[], tag: 'core' | 'extra', league: LeagueId, opts: FreshnessOpts = {}): Promise<EventMarkets> {
   return persistentCached<EventMarkets>(`evodds_${eventId}_${tag}`, EVENT_ODDS_CACHE_TTL_MS, async () => {
     const res = await oddsApiFetch(
       `/sports/${getLeague(league).oddsSportKey}/events/${eventId}/odds/`,
@@ -961,17 +990,17 @@ async function fetchEventBundle(eventId: string, keys: readonly string[], tag: '
       `[sportybet] event ${eventId} ${tag}: books returned [${[...returned].join(', ') || 'nothing'}] -> offering [${Object.keys(parsed).join(', ') || 'nothing'}]`
     );
     return parsed;
-  });
+  }, opts);
 }
 
 /** CORE bundle (btts, double chance, draw no bet, goal ladders). <= 5 credits, cached 24h. Call when a match is opened. */
-export function fetchCoreMarkets(eventId: string, league: LeagueId = DEFAULT_LEAGUE): Promise<EventMarkets> {
-  return fetchEventBundle(eventId, CORE_MARKET_KEYS, 'core', league);
+export function fetchCoreMarkets(eventId: string, league: LeagueId = DEFAULT_LEAGUE, opts: FreshnessOpts = {}): Promise<EventMarkets> {
+  return fetchEventBundle(eventId, CORE_MARKET_KEYS, 'core', league, opts);
 }
 
 /** EXTRA bundle (1st-half BTTS / double chance, HT/FT). <= 3 credits, cached 24h. Call ONLY on an explicit "More markets" tap. */
-export function fetchExtraMarkets(eventId: string, league: LeagueId = DEFAULT_LEAGUE): Promise<EventMarkets> {
-  return fetchEventBundle(eventId, EXTRA_MARKET_KEYS, 'extra', league);
+export function fetchExtraMarkets(eventId: string, league: LeagueId = DEFAULT_LEAGUE, opts: FreshnessOpts = {}): Promise<EventMarkets> {
+  return fetchEventBundle(eventId, EXTRA_MARKET_KEYS, 'extra', league, opts);
 }
 
 /** The EXTRA bundle if it's already been bought and is still fresh — never spends a credit. null = not fetched yet. */
@@ -1395,10 +1424,12 @@ export async function placeCoupon(userId: string, stake: number, picks: PlaceCou
     placedAt: Date.now(),
   };
 
-  const existing: Coupon[] = (await couponsByUser.get(uid)) || [];
-  existing.unshift(coupon);
-  if (existing.length > MAX_COUPONS_PER_USER) existing.length = MAX_COUPONS_PER_USER;
-  await couponsByUser.set(uid, existing);
+  await withCouponLock(async () => {
+    const existing: Coupon[] = (await couponsByUser.get(uid)) || [];
+    existing.unshift(coupon);
+    if (existing.length > MAX_COUPONS_PER_USER) existing.length = MAX_COUPONS_PER_USER;
+    await couponsByUser.set(uid, existing);
+  });
 
   return { success: true, coupon };
 }
@@ -1522,6 +1553,56 @@ export interface RepricedSlip {
 
 const EXTRA_ONLY_MARKETS: readonly Market[] = ['btts_h1', 'double_chance_h1', 'halftime_fulltime'];
 
+interface PriceContext {
+  marketsByEvent: Map<string, EventMarkets>;
+  extraLoaded: Set<string>;
+}
+
+type LegPrice =
+  | { ok: true; fixture: FixtureWithOdds; options: MarketOption[]; option: MarketOption }
+  | { ok: false; reason: BookingDropReason };
+
+/**
+ * The live price of one selection, plus every sibling price in its market (cash out needs those to strip the
+ * bookmaker's margin). Pass maxAgeMs to refuse cached prices older than that and buy fresh ones instead.
+ */
+async function lookupLegPrice(leg: BookingLeg, joined: FixtureWithOdds[], ctx: PriceContext, maxAgeMs?: number): Promise<LegPrice> {
+  const home = normalizeTeamName(leg.homeTeam);
+  const away = normalizeTeamName(leg.awayTeam);
+
+  const fixture = joined.find((f) => f.league === leg.league && normalizeTeamName(f.homeTeam) === home && normalizeTeamName(f.awayTeam) === away);
+  if (!fixture) {
+    const started = new Date(leg.kickoff).getTime() - Date.now() < BETTING_CUTOFF_MS;
+    return { ok: false, reason: started ? 'started' : 'unavailable' };
+  }
+
+  let em: EventMarkets = {};
+  if (leg.market !== '1x2') {
+    if (!fixture.eventId) return { ok: false, reason: 'market_unavailable' };
+    try {
+      const id = fixture.eventId;
+      if (!ctx.marketsByEvent.has(id)) ctx.marketsByEvent.set(id, await fetchCoreMarkets(id, fixture.league, { maxAgeMs })); // normally cached 24h — the first loader pays, everyone after is free
+      em = ctx.marketsByEvent.get(id)!;
+      if (EXTRA_ONLY_MARKETS.includes(leg.market) && !ctx.extraLoaded.has(id)) {
+        const extra =
+          maxAgeMs === undefined
+            ? ((await getCachedExtraMarkets(id)) ?? (await fetchExtraMarkets(id, fixture.league)))
+            : await fetchExtraMarkets(id, fixture.league, { maxAgeMs });
+        em = { ...em, ...extra };
+        ctx.marketsByEvent.set(id, em);
+        ctx.extraLoaded.add(id);
+      }
+    } catch (err) {
+      return { ok: false, reason: isCreditBudgetError(err) ? 'budget' : 'market_unavailable' };
+    }
+  }
+
+  const options = getMarketOptions(leg.market, fixture, em, leg.team);
+  const option = options.find((o) => o.selection === leg.selection && (o.point ?? null) === (leg.point ?? null) && (o.team ?? null) === (leg.team ?? null));
+  if (!option) return { ok: false, reason: 'market_unavailable' };
+  return { ok: true, fixture, options, option };
+}
+
 /**
  * Turns a code's selections back into bettable picks: each is matched to a fixture that can still
  * be bet on, then re-priced from the live odds. A selection that can't be loaded (match started,
@@ -1531,71 +1612,269 @@ const EXTRA_ONLY_MARKETS: readonly Market[] = ['btts_h1', 'double_chance_h1', 'h
 export async function repriceBookingLegs(legs: BookingLeg[], joined: FixtureWithOdds[]): Promise<RepricedSlip> {
   const loaded: RepricedSlip['loaded'] = [];
   const dropped: RepricedSlip['dropped'] = [];
-  const marketsByEvent = new Map<string, EventMarkets>();
-  const extraLoaded = new Set<string>();
+  const ctx: PriceContext = { marketsByEvent: new Map(), extraLoaded: new Set() };
   const seenMatches = new Set<string>();
 
   for (const leg of legs) {
-    const home = normalizeTeamName(leg.homeTeam);
-    const away = normalizeTeamName(leg.awayTeam);
-    const matchKey = `${leg.league}|${home}|${away}`;
+    const matchKey = `${leg.league}|${normalizeTeamName(leg.homeTeam)}|${normalizeTeamName(leg.awayTeam)}`;
     if (seenMatches.has(matchKey)) continue; // a coupon holds one leg per match
     seenMatches.add(matchKey);
 
-    const fixture = joined.find((f) => f.league === leg.league && normalizeTeamName(f.homeTeam) === home && normalizeTeamName(f.awayTeam) === away);
-    if (!fixture) {
-      const started = new Date(leg.kickoff).getTime() - Date.now() < BETTING_CUTOFF_MS;
-      dropped.push({ leg, reason: started ? 'started' : 'unavailable' });
-      continue;
-    }
-
-    let em: EventMarkets = {};
-    if (leg.market !== '1x2') {
-      if (!fixture.eventId) {
-        dropped.push({ leg, reason: 'market_unavailable' });
-        continue;
-      }
-      try {
-        const id = fixture.eventId;
-        if (!marketsByEvent.has(id)) marketsByEvent.set(id, await fetchCoreMarkets(id, fixture.league)); // cached 24h — the first loader pays, everyone after is free
-        em = marketsByEvent.get(id)!;
-        if (EXTRA_ONLY_MARKETS.includes(leg.market) && !extraLoaded.has(id)) {
-          const extra = (await getCachedExtraMarkets(id)) ?? (await fetchExtraMarkets(id, fixture.league));
-          em = { ...em, ...extra };
-          marketsByEvent.set(id, em);
-          extraLoaded.add(id);
-        }
-      } catch (err) {
-        dropped.push({ leg, reason: isCreditBudgetError(err) ? 'budget' : 'market_unavailable' });
-        continue;
-      }
-    }
-
-    const option = getMarketOptions(leg.market, fixture, em, leg.team).find(
-      (o) => o.selection === leg.selection && (o.point ?? null) === (leg.point ?? null) && (o.team ?? null) === (leg.team ?? null)
-    );
-    if (!option) {
-      dropped.push({ leg, reason: 'market_unavailable' });
+    const priced = await lookupLegPrice(leg, joined, ctx);
+    if (!priced.ok) {
+      dropped.push({ leg, reason: priced.reason });
       continue;
     }
 
     loaded.push({
       was: leg.odds,
       pick: {
-        league: fixture.league,
-        homeTeam: fixture.homeTeam,
-        awayTeam: fixture.awayTeam,
-        kickoff: fixture.kickoff, // the fixture's CURRENT kick-off, in case the match was moved
+        league: priced.fixture.league,
+        homeTeam: priced.fixture.homeTeam,
+        awayTeam: priced.fixture.awayTeam,
+        kickoff: priced.fixture.kickoff, // the fixture's CURRENT kick-off, in case the match was moved
         market: leg.market,
-        selection: option.selection,
-        point: option.point,
-        team: option.team,
-        odds: option.odds,
+        selection: priced.option.selection,
+        point: priced.option.point,
+        team: priced.option.team,
+        odds: priced.option.odds,
       },
     });
   }
 
   return { loaded, dropped };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cash out — take a guaranteed amount now instead of waiting for the legs
+//
+//   value = stake x (odds of the legs already WON) x (each pending leg's multiplier) x (1 - margin)
+//
+// A pending leg's multiplier is  min(1, odds you took x its win probability NOW)  where the probability
+// comes from the live prices of that whole market with the bookmaker's margin stripped out. So a leg whose
+// odds drifted out (less likely) drags the offer down; one whose odds shortened is worth at most 1.
+//
+// That cap is deliberate. Players bet at prices up to 12h old (the odds cache), so without it a player
+// could bet at a stale, generous price and cash out minutes later against the fresh one — a risk-free
+// profit, repeatable forever. With it, a cash out can never pay more than what the coupon has already
+// banked from won legs (less the margin), so the only way to profit is to actually win legs.
+//
+// Pre-match only: every pending leg must be at least CASHOUT_CLOSES_BEFORE_KICKOFF_MS from kick-off.
+// Live cash out would need in-play prices every minute, which the odds-credit budget can't pay for.
+// Prices used are fresh (see the max-age constants), never the 12h/24h betting cache.
+// ─────────────────────────────────────────────────────────────────────────
+
+/** The house's cut of every cash out, on top of the margin already inside the odds. */
+export const CASHOUT_MARGIN = 0.03;
+export const MIN_CASHOUT = 1;
+const CASHOUT_CLOSES_BEFORE_KICKOFF_MS = 10 * 60_000;
+const CASHOUT_BULK_MAX_AGE_MS = 15 * 60_000; // 1X2 prices (1 credit per league to refresh)
+const CASHOUT_EVENT_MAX_AGE_MS = 30 * 60_000; // other markets (core bundle: 5 credits per match to refresh)
+const CASHOUT_QUOTE_VALID_MS = 2 * 60_000; // an offer can only be taken this long after it was priced
+const FALLBACK_OVERROUND = 1.06; // assumed margin when a market's full set of prices isn't available
+
+/** Cash out is offered while the coupon is pending and every undecided leg is still comfortably pre-match. */
+export function isCashOutOpen(coupon: Coupon, now: number = Date.now()): boolean {
+  if (coupon.status !== 'pending') return false;
+  const pending = coupon.legs.filter((l) => l.status === 'pending');
+  return pending.length > 0 && pending.every((l) => new Date(l.kickoff).getTime() - now > CASHOUT_CLOSES_BEFORE_KICKOFF_MS);
+}
+
+/**
+ * Probability that `option` wins, from the live prices of its whole market with the bookmaker's margin
+ * removed (the prices' implied probabilities add up to more than 100%; this scales them back).
+ * Falls back to a flat assumed margin when the market's full set of prices isn't there.
+ */
+export function noVigProbability(market: Market, option: MarketOption, options: MarketOption[]): number {
+  const inv = (o: MarketOption): number => 1 / o.odds;
+  const fallback = Math.min(1, inv(option) / FALLBACK_OVERROUND);
+
+  // The mutually-exclusive set this option competes in, and how many of its members win at once.
+  let siblings: MarketOption[];
+  let expectedSize: number;
+  let winnersPerOutcome = 1;
+  switch (market) {
+    case '1x2':
+      siblings = options;
+      expectedSize = 3;
+      break;
+    case 'totals':
+    case 'team_totals':
+      siblings = options.filter((o) => (o.point ?? null) === (option.point ?? null) && (o.team ?? null) === (option.team ?? null));
+      expectedSize = 2; // over + under at the same line
+      break;
+    case 'btts':
+    case 'btts_h1':
+    case 'draw_no_bet':
+      siblings = options;
+      expectedSize = 2;
+      break;
+    case 'double_chance':
+    case 'double_chance_h1':
+      siblings = options;
+      expectedSize = 3;
+      winnersPerOutcome = 2; // 1X, 12 and X2 each cover two of the three results
+      break;
+    case 'halftime_fulltime':
+      siblings = options;
+      expectedSize = 9;
+      break;
+    default:
+      return fallback;
+  }
+
+  if (siblings.length !== expectedSize || siblings.some((o) => !(o.odds > 1))) return fallback;
+  const total = siblings.reduce((acc, o) => acc + inv(o), 0);
+  return Math.max(0, Math.min(1, (inv(option) * winnersPerOutcome) / total));
+}
+
+/** The arithmetic of a cash out, kept pure so it can be tested on its own. `q` is a pending leg's win probability now. */
+export function computeCashOutValue(
+  stake: number,
+  legs: { status: LegStatus; was: number; q: number | null }[]
+): { banked: number; amount: number } | null {
+  let banked = stake;
+  let multiplier = 1;
+  for (const l of legs) {
+    if (l.status === 'won') banked *= l.was;
+    else if (l.status === 'pending') {
+      if (l.q === null) return null; // can't value a leg we have no price for
+      multiplier *= Math.min(1, l.was * l.q);
+    } // lost never reaches here (the coupon is already lost); voided legs count as 1
+  }
+  return { banked, amount: Math.floor(banked * multiplier * (1 - CASHOUT_MARGIN)) };
+}
+
+export interface CashOutQuote {
+  couponId: string;
+  amount: number;
+  /** What the coupon has locked in from legs already won (stake x their odds). */
+  banked: number;
+  potentialPayout: number;
+  /** When it was priced, and which leg statuses it was priced against — both checked again before paying. */
+  at: number;
+  fingerprint: string;
+  pending: { leg: Leg; nowOdds: number }[];
+}
+
+export type CashOutQuoteResult =
+  | { available: true; quote: CashOutQuote }
+  | { available: false; reason: 'not_pending' | 'closed' | 'prices_unavailable' | 'too_small' };
+
+const legFingerprint = (coupon: Coupon): string => coupon.legs.map((l) => `${l.id}:${l.status}`).join(',');
+
+/**
+ * Prices a cash out with FRESH odds (spends a few Odds API credits if the cache is older than the limits
+ * above — shared by everyone, so repeat looks within the window are free). Never falls back to stale prices:
+ * if a fresh price can't be had, there is no offer.
+ */
+export async function getCashOutQuote(coupon: Coupon): Promise<CashOutQuoteResult> {
+  if (coupon.status !== 'pending') return { available: false, reason: 'not_pending' };
+  if (!isCashOutOpen(coupon)) return { available: false, reason: 'closed' };
+
+  const pendingLegs = coupon.legs.filter((l) => l.status === 'pending');
+  const leagues = [...new Set(pendingLegs.map((l) => l.league ?? DEFAULT_LEAGUE))];
+
+  const joined: FixtureWithOdds[] = [];
+  try {
+    const perLeague = await Promise.all(
+      leagues.map(async (league) => {
+        const [fixtures, tips] = await Promise.all([fetchUpcomingFixtures(league), fetchOddsTips(league, { maxAgeMs: CASHOUT_BULK_MAX_AGE_MS })]);
+        return joinFixturesWithOdds(fixtures, tips, league);
+      })
+    );
+    for (const list of perLeague) joined.push(...list);
+  } catch (err) {
+    console.warn('[sportybet] cash out: could not refresh prices:', err instanceof Error ? err.message : err);
+    return { available: false, reason: 'prices_unavailable' };
+  }
+
+  const ctx: PriceContext = { marketsByEvent: new Map(), extraLoaded: new Set() };
+  const qByLeg = new Map<string, number>();
+  const pending: CashOutQuote['pending'] = [];
+  for (const leg of pendingLegs) {
+    const priced = await lookupLegPrice(toBookingLeg(leg), joined, ctx, CASHOUT_EVENT_MAX_AGE_MS);
+    if (!priced.ok) return { available: false, reason: 'prices_unavailable' };
+    qByLeg.set(leg.id, noVigProbability(leg.market, priced.option, priced.options));
+    pending.push({ leg, nowOdds: priced.option.odds });
+  }
+
+  const value = computeCashOutValue(
+    coupon.stake,
+    coupon.legs.map((l) => ({ status: l.status, was: l.oddsAtPlacement, q: l.status === 'pending' ? (qByLeg.get(l.id) ?? null) : null }))
+  );
+  if (!value) return { available: false, reason: 'prices_unavailable' };
+  if (value.amount < MIN_CASHOUT) return { available: false, reason: 'too_small' };
+
+  return {
+    available: true,
+    quote: {
+      couponId: coupon.id,
+      amount: value.amount,
+      banked: Math.round(value.banked * 100) / 100,
+      potentialPayout: coupon.potentialPayout,
+      at: Date.now(),
+      fingerprint: legFingerprint(coupon),
+      pending,
+    },
+  };
+}
+
+export type CashOutResult =
+  | { success: true; amount: number; coupon: Coupon }
+  | { success: false; reason: 'not_found' | 'not_pending' | 'closed' | 'changed' | 'bank_cannot_cover' | 'payout_failed' };
+
+/**
+ * Pays a quote out and closes the coupon. 'changed' means the offer is no longer valid (too old, or a leg settled
+ * since it was priced) — the caller should simply quote again. The coupon is marked and saved BEFORE any coins move
+ * (a crash can then leave a player unpaid — fixable by hand — but can never pay one twice), and the whole step
+ * runs under the coupon lock so settlement can't undo it.
+ */
+export async function cashOutCoupon(userId: string, couponId: string, quote: CashOutQuote): Promise<CashOutResult> {
+  const uid = cleanJid(userId);
+
+  return withCouponLock(async (): Promise<CashOutResult> => {
+    const list: Coupon[] = (await couponsByUser.get(uid)) || [];
+    const coupon = list.find((c) => c.id === couponId);
+    if (!coupon) return { success: false, reason: 'not_found' };
+    if (coupon.status !== 'pending') return { success: false, reason: 'not_pending' };
+    if (!isCashOutOpen(coupon)) return { success: false, reason: 'closed' };
+    if (quote.couponId !== coupon.id || quote.fingerprint !== legFingerprint(coupon) || Date.now() - quote.at > CASHOUT_QUOTE_VALID_MS) {
+      return { success: false, reason: 'changed' };
+    }
+
+    // The bank pays a cash out exactly like a win: same floor protection. If it can't cover the full offer,
+    // refuse (nothing has moved yet) rather than quietly paying less than was promised.
+    const pool = await getJackpotPool();
+    const settled = settleWin(quote.amount, pool);
+    if (settled.capped) return { success: false, reason: 'bank_cannot_cover' };
+
+    coupon.status = 'cashed_out';
+    coupon.cashOutAmount = quote.amount;
+    coupon.cashedOutAt = Date.now();
+    coupon.settledAt = coupon.cashedOutAt;
+    await couponsByUser.set(uid, list);
+
+    let drawn = 0;
+    try {
+      await deductFromJackpot(settled.payout);
+      drawn = settled.payout;
+      await recordHouseActivity(0, settled.payout);
+      await addCoins(uid, quote.amount, { type: 'sportybet', note: `Sportybet coupon ${coupon.id} cashed out` });
+    } catch (err) {
+      console.error(`[CRITICAL] sportybet cash out payout failed for coupon ${coupon.id} (user ${uid}):`, err);
+      if (drawn > 0) await contributeToJackpot(drawn).catch(() => {});
+      // Put the coupon back so the player still has their bet; the next attempt starts clean.
+      coupon.status = 'pending';
+      delete coupon.cashOutAmount;
+      delete coupon.cashedOutAt;
+      delete coupon.settledAt;
+      await couponsByUser.set(uid, list).catch((e: unknown) => console.error(`[CRITICAL] could not restore coupon ${coupon.id} after a failed cash out:`, e));
+      return { success: false, reason: 'payout_failed' };
+    }
+
+    return { success: true, amount: quote.amount, coupon };
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1767,10 +2046,14 @@ export function startCouponSettlementPoller(intervalMs: number = SETTLEMENT_POLL
 }
 
 async function runSettlementPass(): Promise<{ couponsChecked: number; couponsSettled: number }> {
-  const [allUsers, seasonMatches] = await Promise.all([
-    couponsByUser.getAll() as Promise<Record<string, Coupon[]>>,
-    fetchAllLeaguesSeasonMatches(),
-  ]);
+  // The slow part (the network) happens first, with no lock held. The coupons are read only AFTER it,
+  // inside the lock, so what gets written back is never older than the moment it was read.
+  const seasonMatches = await fetchAllLeaguesSeasonMatches();
+  return withCouponLock(() => settleCoupons(seasonMatches));
+}
+
+async function settleCoupons(seasonMatches: FootballDataMatch[]): Promise<{ couponsChecked: number; couponsSettled: number }> {
+  const allUsers = (await couponsByUser.getAll()) as Record<string, Coupon[]>;
 
   let couponsChecked = 0;
   let couponsSettled = 0;
@@ -1844,6 +2127,11 @@ async function runSettlementPass(): Promise<{ couponsChecked: number; couponsSet
           if (payout > 0) await contributeToJackpot(payout).catch(() => {});
           console.error(`[CRITICAL] sportybet payout failed for coupon ${coupon.id} (user ${userId}):`, err);
         }
+        // Persist a paid coupon straight away, not at the end of the user's loop — a crash in between
+        // would otherwise leave it 'pending' and pay it again on the next poll.
+        if (coupon.status === 'won') {
+          await couponsByUser.set(userId, coupons).catch((err: unknown) => console.error(`[CRITICAL] sportybet could not save paid coupon ${coupon.id}:`, err));
+        }
       } else {
         // Some legs still pending — recompute live odds/payout so "My Bets"
         // reflects any legs that were just dropped as voided.
@@ -1874,6 +2162,7 @@ const COUPON_EMOJI: Record<CouponStatus, string> = {
   pending: '🟡',
   won: '🟢',
   lost: '🔴',
+  cashed_out: '💸',
 };
 
 /** Short side name for a 1/x/2 code — "Arsenal", "Draw", "Man City". */
@@ -1938,13 +2227,15 @@ export function formatCoupon(coupon: Coupon): string {
 
   const wasCapped = coupon.status === 'won' && coupon.actualPayout !== undefined && coupon.actualPayout < coupon.potentialPayout;
   const payoutLine =
-    coupon.status === 'won'
+    coupon.status === 'cashed_out'
+      ? `Cashed out: ${formatNumber(coupon.cashOutAmount ?? 0)} coins`
+      : coupon.status === 'won'
       ? `Payout: ${formatNumber(coupon.actualPayout ?? coupon.potentialPayout)} coins` +
         (wasCapped ? ` _(capped from ${formatNumber(coupon.potentialPayout)} — the bank couldn't cover the full amount)_` : '')
       : `Potential payout: ${formatNumber(coupon.potentialPayout)} coins`;
 
   return [
-    `🎟️ *Coupon ${coupon.id.slice(-6).toUpperCase()}* ${COUPON_EMOJI[coupon.status]} ${coupon.status.toUpperCase()}`,
+    `🎟️ *Coupon ${coupon.id.slice(-6).toUpperCase()}* ${COUPON_EMOJI[coupon.status]} ${coupon.status.replace('_', ' ').toUpperCase()}`,
     ...lines,
     ``,
     `Stake: ${formatNumber(coupon.stake)} coins`,

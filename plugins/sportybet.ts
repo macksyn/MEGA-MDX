@@ -29,6 +29,10 @@
  * schedule (pollAndSettleCoupons in lib/sportybet.ts) — this file only ever
  * reads/displays coupon state.
  *
+ * Cash out: on a pending coupon, "Cash out" prices the coupon with fresh odds (see lib/sportybet.ts for the
+ * maths and why it's pre-match only) and, on confirm, closes it for that amount. The offer is re-priced the
+ * moment the player confirms; if it dropped, they're shown the new amount instead of being paid it silently.
+ *
  * Booking codes: any slip (while building it, or a placed coupon) can be shared as a
  * 6-character code. `.sportybet <code>` (or the "Load Booking Code" button, which explains
  * that) re-loads the same selections at TODAY's odds and the player picks their own stake.
@@ -62,6 +66,10 @@ import {
   parseBookingCode,
   repriceBookingLegs,
   getUserCoupons,
+  getCoupon,
+  getCashOutQuote,
+  cashOutCoupon,
+  isCashOutOpen,
   formatCoupon,
   legPickLabel,
   MIN_STAKE,
@@ -77,6 +85,7 @@ import {
   type EventMarkets,
   type TeamSide,
   type Coupon,
+  type CashOutQuote,
 } from '../lib/sportybet.js';
 
 // Settles finished matches onto coupons in the background (every 5 min, plus once on
@@ -204,7 +213,7 @@ function placeCouponErrorMessage(reason: string): string {
   }
 }
 
-const COUPON_LIST_EMOJI: Record<Coupon['status'], string> = { pending: '🟡', won: '🟢', lost: '🔴' };
+const COUPON_LIST_EMOJI: Record<Coupon['status'], string> = { pending: '🟡', won: '🟢', lost: '🔴', cashed_out: '💸' };
 
 // ─────────────────────────────────────────────────────────────────────────
 // Place a Bet — a chain of screens: fixture -> market -> selection ->
@@ -656,7 +665,7 @@ async function runMyBets(sock: any, message: any, chatId: string, userId: string
     options: page.map((c) => ({
       label: `${COUPON_LIST_EMOJI[c.status]} ${c.legs.length}-leg · ${formatNumber(c.stake)} coins`,
       value: c.id,
-      description: `${c.status.toUpperCase()} · placed ${formatDateShort(c.placedAt)}`,
+      description: `${c.status.replace('_', ' ').toUpperCase()} · placed ${formatDateShort(c.placedAt)}`,
     })),
     cancelLabel: 'Back',
   });
@@ -671,6 +680,116 @@ async function runMyBets(sock: any, message: any, chatId: string, userId: string
   const stillBettable = coupon.status === 'pending' && coupon.legs.some((l) => new Date(l.kickoff).getTime() - Date.now() > BETTING_CUTOFF_MS);
   const footer = stillBettable ? await bookingFooter(userId, coupon.legs) : '';
   await sock.sendMessage(chatId, { text: `${formatCoupon(coupon)}${footer}`, ...channelInfo }, { quoted: message });
+
+  if (isCashOutOpen(coupon)) {
+    const outcome = await runCouponActions(sock, message, chatId, userId, channelInfo, coupon.id);
+    if (outcome === 'back') return runMyBets(sock, message, chatId, userId, channelInfo); // Back = the coupon list again
+    return outcome;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cash out
+// ─────────────────────────────────────────────────────────────────────────
+
+async function runCouponActions(sock: any, message: any, chatId: string, userId: string, channelInfo: any, couponId: string) {
+  const result = await promptMenu(sock, message, chatId, userId, {
+    title: `🎟️ Coupon ${couponId.slice(-6).toUpperCase()}`,
+    text: 'What would you like to do?',
+    options: [{ label: '💸 Cash out', value: 'cashout', description: 'See your cash-out offer' }],
+    cancelLabel: 'Back',
+  });
+
+  if (result.cancelled) return 'back';
+  if (result.timedOut || !result.value) return;
+
+  const outcome = await runCashOut(sock, message, chatId, userId, channelInfo, couponId);
+  if (outcome === 'back') return runCouponActions(sock, message, chatId, userId, channelInfo, couponId);
+  return outcome;
+}
+
+function cashOutUnavailableMessage(reason: string): string {
+  switch (reason) {
+    case 'not_pending':
+      return 'This coupon is already settled — there is nothing left to cash out.';
+    case 'closed':
+      return 'Cash out is closed — a match on this coupon is about to kick off or already has.';
+    case 'too_small':
+      return 'The cash-out value on this coupon is too small to offer right now.';
+    default:
+      return "Cash out isn't available right now — live prices couldn't be refreshed. Try again in a few minutes.";
+  }
+}
+
+async function runCashOut(sock: any, message: any, chatId: string, userId: string, channelInfo: any, couponId: string) {
+  const coupon = await getCoupon(userId, couponId);
+  if (!coupon) {
+    await sock.sendMessage(chatId, { text: '❌ Could not find that coupon.', ...channelInfo }, { quoted: message });
+    return;
+  }
+
+  await sock.sendMessage(chatId, { text: '⏳ Getting your cash-out offer with live prices...', ...channelInfo }, { quoted: message });
+  const quoted = await getCashOutQuote(coupon);
+  if (!quoted.available) {
+    await sock.sendMessage(chatId, { text: `ℹ️ ${cashOutUnavailableMessage(quoted.reason)}`, ...channelInfo }, { quoted: message });
+    return;
+  }
+  return runCashOutOffer(sock, message, chatId, userId, channelInfo, coupon.id, quoted.quote);
+}
+
+async function runCashOutOffer(sock: any, message: any, chatId: string, userId: string, channelInfo: any, couponId: string, quote: CashOutQuote) {
+  const result = await promptMenu(sock, message, chatId, userId, {
+    title: `💸 Cash out · Coupon ${couponId.slice(-6).toUpperCase()}`,
+    text:
+      `Potential payout: ${formatNumber(quote.potentialPayout)} coins\n` +
+      `Cash out now: *${formatNumber(quote.amount)} coins*\n\n` +
+      `The offer follows the live odds, so it can change — it's re-checked when you confirm.`,
+    options: [{ label: `💸 Cash out ${formatNumber(quote.amount)} coins`, value: 'confirm' }],
+    cancelLabel: 'Back',
+  });
+
+  if (result.cancelled) return 'back';
+  if (result.timedOut || !result.value) return;
+
+  // Re-price right now, from the coupon as it stands right now: a leg may have settled, odds may have moved.
+  const coupon = await getCoupon(userId, couponId);
+  if (!coupon) return;
+  const fresh = await getCashOutQuote(coupon);
+  if (!fresh.available) {
+    await sock.sendMessage(chatId, { text: `ℹ️ ${cashOutUnavailableMessage(fresh.reason)}`, ...channelInfo }, { quoted: message });
+    return;
+  }
+
+  if (fresh.quote.amount < quote.amount) {
+    // Never pay less than the amount on the button without the player agreeing to the new figure.
+    await sock.sendMessage(
+      chatId,
+      { text: `📉 The odds moved — your offer is now *${formatNumber(fresh.quote.amount)} coins* (it was ${formatNumber(quote.amount)}).`, ...channelInfo },
+      { quoted: message }
+    );
+    // 'back' from the lower offer goes up to the coupon menu — never back to the old, higher figure.
+    return runCashOutOffer(sock, message, chatId, userId, channelInfo, couponId, fresh.quote);
+  }
+
+  const paid = await cashOutCoupon(userId, couponId, fresh.quote); // pays the fresh figure, which is never below what was shown
+  if (paid.success) {
+    await sock.sendMessage(
+      chatId,
+      { text: `✅ Cashed out *${formatNumber(paid.amount)} coins*.\n\n${formatCoupon(paid.coupon)}`, ...channelInfo },
+      { quoted: message }
+    );
+    return;
+  }
+
+  const why: Record<string, string> = {
+    not_found: 'Could not find that coupon.',
+    not_pending: 'This coupon has already been settled.',
+    closed: cashOutUnavailableMessage('closed'),
+    changed: 'The coupon changed while you were confirming — open it and try again to see the new offer.',
+    bank_cannot_cover: "The bank can't cover that cash-out right now — try again a little later.",
+    payout_failed: 'Something went wrong paying that out. Your coupon is unchanged — try again.',
+  };
+  await sock.sendMessage(chatId, { text: `❌ ${why[paid.reason] ?? 'Cash out failed.'}`, ...channelInfo }, { quoted: message });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
