@@ -10,7 +10,9 @@
  * 1. Add 'sportybet' to the TransactionType union in economy.ts, alongside
  *    the existing 'slots' | 'coinflip' | 'dice', so ledger entries for
  *    stakes/payouts are typed consistently with the other games.
- * 2. Set FOOTBALL_DATA_API_TOKEN and ODDS_API_KEY in your environment.
+ * 2. Set FOOTBALL_DATA_API_TOKEN and ODDS_API_KEY in your environment. Each accepts
+ *    SEVERAL keys separated by commas (FOOTBALL_DATA_API_TOKEN=tokenA,tokenB) —
+ *    calls rotate / fail over between them automatically (see "API key pools").
  *    Malvin is no longer used anywhere in this file — fixtures/results come
  *    straight from football-data.org (Malvin's /epl/upcoming and
  *    /epl/matches turned out to be stuck serving stale matchday 1-2 data),
@@ -18,6 +20,7 @@
  *    Malvin's h2h-only wrapper allowed).
  */
 
+import { createHash } from 'node:crypto';
 import { createStore } from './pluginStore.js';
 import { getWallet, addCoins, deductCoins, formatNumber } from './economy.js';
 import { cleanJid } from './isOwner.js';
@@ -28,15 +31,32 @@ import { getJackpotPool, contributeToJackpot, deductFromJackpot, settleWin, reco
 // ─────────────────────────────────────────────────────────────────────────
 
 const FOOTBALL_DATA_BASE = 'https://api.football-data.org/v4';
-const FOOTBALL_DATA_API_TOKEN = process.env.FOOTBALL_DATA_API_TOKEN || '';
-
 const ODDS_API_BASE = 'https://api.the-odds-api.com/v4';
-const ODDS_API_KEY = process.env.ODDS_API_KEY || '';
+
+// ── API key pools ────────────────────────────────────────────────────────
+// Keys live in the environment, never in source (source gets committed to git). Each variable takes
+// one key or a comma/space-separated list; the plural names ODDS_API_KEYS /
+// FOOTBALL_DATA_API_TOKENS work too. With several keys:
+//   football-data.org .... calls round-robin across the tokens (each has its own 10/min limit)
+//                          and a 429 / 403 instantly retries on the next token.
+//   The Odds API ......... the key with the most credits left is used first; a key that runs out
+//                          (or is invalid) is skipped and the next one takes over. Each key keeps
+//                          its own ODDS_CREDIT_RESERVE for the bulk list.
+function parseKeyList(...raw: (string | undefined)[]): string[] {
+  return [...new Set(raw.flatMap((r) => (r ?? '').split(/[\s,;]+/)).map((k) => k.trim()).filter(Boolean))];
+}
+
+const FOOTBALL_DATA_TOKENS = parseKeyList(process.env.FOOTBALL_DATA_API_TOKEN, process.env.FOOTBALL_DATA_API_TOKENS);
+const ODDS_API_KEYS = parseKeyList(process.env.ODDS_API_KEY, process.env.ODDS_API_KEYS);
+console.log(`[sportybet] ${FOOTBALL_DATA_TOKENS.length} football-data token(s), ${ODDS_API_KEYS.length} Odds API key(s) configured`);
+
+/** Last 4 characters only — enough to tell keys apart in logs without leaking one. */
+const keyTag = (key: string): string => `…${key.slice(-4)}`;
 
 // football-data.org's limit is per-minute (10/min), so a short cache is plenty.
 //
 // The Odds API's free tier is a flat 500 CREDITS/month instead. What a call costs:
-//   bulk  /sports/soccer_epl/odds ........ markets x regions
+//   bulk  /sports/{sport_key}/odds ....... markets x regions   (one call PER LEAGUE)
 //   event /events/{id}/odds .............. UNIQUE MARKETS ACTUALLY RETURNED x regions
 //   event /events/{id}/markets ........... 1  (no longer used — see below)
 // Because the event endpoint only bills for markets that come back, asking for
@@ -45,19 +65,22 @@ const ODDS_API_KEY = process.env.ODDS_API_KEY || '';
 // bundle and see what's returned.
 //
 // Spend plan (1 region = uk):
-//   bulk h2h, 8h cache ................... <= 3 calls/day x 1 credit  = <= 90/month
+//   bulk h2h, 12h cache, PER LEAGUE ...... <= 2 calls/day x 1 credit  = <= 60/month/league
 //   CORE bundle (<= 5 markets) ........... <= 5 credits per match, once per 24h,
 //                                          only when a player opens that match
 //   EXTRA bundle (<= 3 markets) .......... <= 3 credits per match, only if a player
 //                                          taps "More markets"
 //   reserve .............................. 40 credits per-match fetches never touch
-// ~38 EPL matches a month, so even if every one is opened (and half also tap
-// "More markets") that's roughly 38x5 + 19x3 = ~250, plus <= 90 bulk = ~340 of 500.
+// ~38 matches a month PER LEAGUE, so even if every one is opened (and half also tap
+// "More markets") that's roughly 38x5 + 19x3 = ~250 per league, plus <= 60 bulk each.
+// With three leagues the worst case (everything opened) can exceed 500 — which is what
+// ODDS_CREDIT_RESERVE is for: per-match fetches simply stop (players keep 1X2 + the
+// bulk list) while the account is within the reserve of empty, instead of overspending.
 // All odds caches are also persisted to the plugin store, so a bot restart
 // never re-buys odds that are still fresh.
 const FIXTURES_CACHE_TTL_MS = 60_000;
 const SEASON_MATCHES_CACHE_TTL_MS = 60_000;
-const ODDS_CACHE_TTL_MS = 8 * 60 * 60_000; // bulk h2h
+const ODDS_CACHE_TTL_MS = 12 * 60 * 60_000; // bulk h2h, per league
 const EVENT_ODDS_CACHE_TTL_MS = 24 * 60 * 60_000; // per-match market bundles
 
 /** Per-match fetches refuse to run if they could dip the account below this. Bulk h2h may use it. */
@@ -81,6 +104,53 @@ export const MAX_STAKE = 5000;
 export const MAX_LEGS_PER_COUPON = 10;
 
 // ─────────────────────────────────────────────────────────────────────────
+// Leagues — add a league here and every flow (fixtures, odds, betting,
+// settlement, the league pickers) picks it up. `footballDataCode` is the
+// football-data.org competition code, `oddsSportKey` is The Odds API sport key.
+// ─────────────────────────────────────────────────────────────────────────
+
+export type LeagueId = 'PL' | 'PD' | 'CL';
+
+export interface LeagueInfo {
+  id: LeagueId;
+  name: string;
+  flag: string;
+  footballDataCode: string;
+  oddsSportKey: string;
+}
+
+export const LEAGUES: readonly LeagueInfo[] = [
+  {
+    id: 'PL',
+    name: 'Premier League',
+    flag: '\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}', // England flag (swap for '⚽' if it shows as a black flag on an old phone)
+    footballDataCode: 'PL',
+    oddsSportKey: 'soccer_epl',
+  },
+  {
+    id: 'PD',
+    name: 'La Liga',
+    flag: '\u{1F1EA}\u{1F1F8}', // Spain flag
+    footballDataCode: 'PD', // football-data.org calls La Liga "Primera Division"
+    oddsSportKey: 'soccer_spain_la_liga',
+  },
+  {
+    id: 'CL',
+    name: 'Champions League',
+    flag: '\u{1F3C6}', // trophy
+    footballDataCode: 'CL',
+    oddsSportKey: 'soccer_uefa_champs_league',
+  },
+];
+
+/** Coupons placed before La Liga existed carry no league — they are Premier League. */
+export const DEFAULT_LEAGUE: LeagueId = 'PL';
+
+export function getLeague(id: LeagueId | undefined | null): LeagueInfo {
+  return LEAGUES.find((l) => l.id === (id ?? DEFAULT_LEAGUE)) ?? LEAGUES[0];
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Raw API shapes (as returned by football-data.org and The Odds API directly)
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -92,9 +162,11 @@ interface FootballDataTeam {
   crest?: string;
 }
 
-/** A match as returned by football-data.org's /v4/competitions/PL/matches. */
+/** A match as returned by football-data.org's /v4/competitions/{code}/matches. */
 interface FootballDataMatch {
   id: number;
+  /** Not part of football-data.org's payload — stamped on by our fetchers so every match knows its league. */
+  league?: LeagueId;
   utcDate: string; // ISO 8601 UTC
   status: string; // SCHEDULED | LIVE | IN_PLAY | PAUSED | FINISHED | POSTPONED | SUSPENDED | CANCELLED
   matchday: number;
@@ -102,6 +174,14 @@ interface FootballDataMatch {
   awayTeam: FootballDataTeam;
   score: {
     winner: 'HOME_TEAM' | 'AWAY_TEAM' | 'DRAW' | null;
+    /**
+     * Knockout matches only: how the match ended. REGULAR = 90 min; EXTRA_TIME = 120 min;
+     * PENALTY_SHOOTOUT = after a shootout. NOTE fullTime then INCLUDES extra time (and the
+     * shootout), and `winner` is whoever went through — neither is the 90-minute result
+     * these markets are priced on, so settlement reads regularTime instead (see scoreAfter90).
+     */
+    duration?: 'REGULAR' | 'EXTRA_TIME' | 'PENALTY_SHOOTOUT';
+    regularTime?: { home: number | null; away: number | null };
     fullTime: { home: number | null; away: number | null };
     /** Needed by the 1st-half markets (btts_h1, double_chance_h1, halftime_fulltime). */
     halfTime?: { home: number | null; away: number | null };
@@ -147,6 +227,7 @@ export type LegStatus = 'pending' | 'won' | 'lost' | 'voided';
 export type CouponStatus = 'pending' | 'won' | 'lost';
 
 export interface FixtureWithOdds {
+  league: LeagueId;
   eventId: string | null; // null if no Odds API match was found for this fixture yet
   homeTeam: string; // official name — carried through to settlement
   awayTeam: string;
@@ -157,6 +238,8 @@ export interface FixtureWithOdds {
 
 export interface Leg {
   id: string;
+  /** Missing on coupons placed before La Liga was added — treat as DEFAULT_LEAGUE. */
+  league?: LeagueId;
   homeTeam: string;
   awayTeam: string;
   kickoff: string;
@@ -228,28 +311,81 @@ async function cached<T>(key: string, ttlMs: number, fetcher: () => Promise<T>):
 // football-data.org client — fixtures & results
 // ─────────────────────────────────────────────────────────────────────────
 
+const fdCooldownUntil = new Map<string, number>(); // token -> epoch ms it's rate-limited until
+let fdNext = 0;
+
 async function footballDataGet<T>(path: string): Promise<T> {
-  const res = await fetch(`${FOOTBALL_DATA_BASE}${path}`, {
-    headers: { 'X-Auth-Token': FOOTBALL_DATA_API_TOKEN },
-  });
-  if (!res.ok) throw new Error(`football-data.org ${path} responded ${res.status}`);
-  return (await res.json()) as T;
+  const tokens = FOOTBALL_DATA_TOKENS.length ? FOOTBALL_DATA_TOKENS : ['']; // no token = football-data's anonymous tier
+  const start = fdNext++ % tokens.length; // round-robin, so the load (and the 10/min limit) is shared
+  let lastStatus = 0;
+
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[(start + i) % tokens.length];
+    // Skip a token that's cooling down after a 429 — unless it's the only one left to try.
+    if ((fdCooldownUntil.get(token) ?? 0) > Date.now() && i < tokens.length - 1) continue;
+
+    const res = await fetch(`${FOOTBALL_DATA_BASE}${path}`, { headers: { 'X-Auth-Token': token } });
+    if (res.ok) return (await res.json()) as T;
+
+    lastStatus = res.status;
+    if (res.status === 429) {
+      // football-data says how many seconds until the per-minute window resets
+      const wait = Number(res.headers.get('x-requestcounter-reset') ?? res.headers.get('retry-after')) || 60;
+      fdCooldownUntil.set(token, Date.now() + wait * 1000);
+      console.warn(`[sportybet] football-data token ${keyTag(token)} rate-limited for ${wait}s — trying the next token`);
+      continue;
+    }
+    if (res.status === 403) {
+      console.warn(`[sportybet] football-data token ${keyTag(token)} may not access ${path} (403) — trying the next token`);
+      continue;
+    }
+    break; // 400 / 404 / 5xx — another token won't change the answer
+  }
+  throw new Error(`football-data.org ${path} responded ${lastStatus}`);
 }
 
-/** Bettable fixture list — not-yet-played PL matches only. */
-export async function fetchUpcomingFixtures(): Promise<FootballDataMatch[]> {
-  return cached('sportybet:upcoming', FIXTURES_CACHE_TTL_MS, async () => {
-    const data = await footballDataGet<FootballDataMatchesResponse>('/competitions/PL/matches?status=SCHEDULED');
-    return data.matches;
+/**
+ * Future knockout rounds (Champions League) are listed before the teams are known — their
+ * team names come back null. Every name-based step downstream would choke on those, so
+ * they're dropped until the draw is made.
+ */
+function teamsKnown(m: FootballDataMatch): boolean {
+  return !!m.homeTeam?.name && !!m.awayTeam?.name;
+}
+
+/** Bettable fixture list — not-yet-played matches of ONE league. */
+export async function fetchUpcomingFixtures(league: LeagueId = DEFAULT_LEAGUE): Promise<FootballDataMatch[]> {
+  const info = getLeague(league);
+  return cached(`sportybet:upcoming:${info.id}`, FIXTURES_CACHE_TTL_MS, async () => {
+    const data = await footballDataGet<FootballDataMatchesResponse>(`/competitions/${info.footballDataCode}/matches?status=SCHEDULED`);
+    return data.matches.filter(teamsKnown).map((m): FootballDataMatch => ({ ...m, league: info.id }));
   });
 }
 
-/** Full-season match list (past/live/scheduled) — the settlement source of truth. */
-export async function fetchAllSeasonMatches(): Promise<FootballDataMatch[]> {
-  return cached('sportybet:season', SEASON_MATCHES_CACHE_TTL_MS, async () => {
-    const data = await footballDataGet<FootballDataMatchesResponse>('/competitions/PL/matches');
-    return data.matches;
+/** Full-season match list (past/live/scheduled) of ONE league. */
+export async function fetchAllSeasonMatches(league: LeagueId = DEFAULT_LEAGUE): Promise<FootballDataMatch[]> {
+  const info = getLeague(league);
+  return cached(`sportybet:season:${info.id}`, SEASON_MATCHES_CACHE_TTL_MS, async () => {
+    const data = await footballDataGet<FootballDataMatchesResponse>(`/competitions/${info.footballDataCode}/matches`);
+    return data.matches.filter(teamsKnown).map((m): FootballDataMatch => ({ ...m, league: info.id }));
   });
+}
+
+/**
+ * Season matches for EVERY league, each stamped with its league — the settlement
+ * source of truth and the Fixtures & Results feed. One league failing (rate limit,
+ * a plan that doesn't cover it) never blanks the others; it's logged and skipped.
+ * Only throws when every league failed.
+ */
+export async function fetchAllLeaguesSeasonMatches(): Promise<FootballDataMatch[]> {
+  const results = await Promise.allSettled(LEAGUES.map((l) => fetchAllSeasonMatches(l.id)));
+  const out: FootballDataMatch[] = [];
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') out.push(...r.value);
+    else console.error(`[sportybet] ${LEAGUES[i].name} season fetch failed:`, r.reason);
+  });
+  if (results.every((r) => r.status === 'rejected')) throw new Error('football-data.org: every league fetch failed');
+  return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -314,7 +450,7 @@ interface OddsApiEvent {
 // fresh.
 
 const oddsCacheTable = root.table!('oddsCache'); // key -> { value, expiresAt }
-const oddsMetaTable = root.table!('oddsApiMeta'); // 'usage' -> { remaining, at }
+const oddsMetaTable = root.table!('oddsApiMeta'); // 'usage_<key hash>' -> { remaining, at }
 
 interface CacheEntry {
   value: any;
@@ -370,37 +506,66 @@ async function persistentCached<T>(key: string, ttlMs: number, fetcher: () => Pr
   return promise;
 }
 
-let knownRemaining: number | null = null;
+// ── Per-key credit tracking ──────────────────────────────────────────────
+// Each key's remaining credits come from The Odds API's own response headers. They're stored in the
+// plugin store under a one-way hash of the key (never the key itself) so a restart still knows which
+// key is nearly empty.
 
-async function getKnownRemaining(): Promise<number | null> {
-  if (knownRemaining !== null) return knownRemaining;
-  try {
-    const meta = (await oddsMetaTable.get('usage')) as { remaining?: number } | null | undefined;
-    if (meta && typeof meta.remaining === 'number') knownRemaining = meta.remaining;
-  } catch {
-    /* no meta yet — treat as unknown */
-  }
-  return knownRemaining;
+interface OddsKeyState {
+  remaining?: number;
+  at?: number; // when `remaining` was last read
+  disabled?: boolean; // rejected as invalid this run — skipped until the bot restarts
 }
 
-/** Reads The Odds API's own usage headers after every call, logs the real cost, and remembers what's left. */
-async function recordUsage(res: Response, label: string): Promise<void> {
+const oddsKeyState = new Map<string, OddsKeyState>(); // keyed by the key itself (memory only)
+const oddsKeyId = (key: string): string => createHash('sha256').update(key).digest('hex').slice(0, 10);
+
+async function loadOddsKeyState(key: string): Promise<OddsKeyState> {
+  let st = oddsKeyState.get(key);
+  if (st) return st;
+  st = {};
+  try {
+    const stored = (await oddsMetaTable.get(`usage_${oddsKeyId(key)}`)) as { remaining?: number; at?: number } | null | undefined;
+    if (stored && typeof stored.remaining === 'number') st = { remaining: stored.remaining, at: stored.at };
+  } catch {
+    /* no record yet — unknown */
+  }
+  oddsKeyState.set(key, st);
+  return st;
+}
+
+/** Credits left on one key, or null if unknown / too old to trust (a new month may have reset it). */
+async function oddsKeyRemaining(key: string): Promise<number | null> {
+  const st = await loadOddsKeyState(key);
+  if (typeof st.remaining !== 'number') return null;
+  // A nearly-empty key is re-probed daily (a failed probe is free); a healthy one weekly.
+  const staleAfter = st.remaining <= ODDS_CREDIT_RESERVE ? 24 * 60 * 60_000 : 7 * 24 * 60 * 60_000;
+  if (st.at && Date.now() - st.at > staleAfter) return null;
+  return st.remaining;
+}
+
+async function setOddsKeyRemaining(key: string, remaining: number): Promise<void> {
+  const st = await loadOddsKeyState(key);
+  st.remaining = remaining;
+  st.at = Date.now();
+  try {
+    await oddsMetaTable.set(`usage_${oddsKeyId(key)}`, { remaining, at: st.at });
+  } catch {
+    /* best effort */
+  }
+}
+
+/** Reads The Odds API's own usage headers after every call, logs the real cost, and remembers what's left on THAT key. */
+async function recordUsage(res: Response, label: string, key: string): Promise<void> {
   const rawRemaining = res.headers.get('x-requests-remaining');
   const rawLast = res.headers.get('x-requests-last');
   // Number(null) is 0 — only trust a header that is actually present.
   const remaining = rawRemaining !== null && rawRemaining.trim() !== '' ? Number(rawRemaining) : NaN;
   const last = rawLast !== null && rawLast.trim() !== '' ? Number(rawLast) : NaN;
 
-  if (Number.isFinite(remaining)) {
-    knownRemaining = remaining;
-    try {
-      await oddsMetaTable.set('usage', { remaining, at: Date.now() });
-    } catch {
-      /* best effort */
-    }
-  }
+  if (Number.isFinite(remaining)) await setOddsKeyRemaining(key, remaining);
   console.log(
-    `[sportybet] odds-api ${label}: cost=${Number.isFinite(last) ? last : '?'} remaining=${Number.isFinite(remaining) ? remaining : '?'}`
+    `[sportybet] odds-api ${label} [key ${keyTag(key)}]: cost=${Number.isFinite(last) ? last : '?'} remaining=${Number.isFinite(remaining) ? remaining : '?'}`
   );
 }
 
@@ -415,30 +580,93 @@ export function isCreditBudgetError(err: unknown): boolean {
   return err instanceof Error && err.name === 'CreditBudgetError';
 }
 
-/** Per-match fetches stop while the account is within ODDS_CREDIT_RESERVE of empty, so the bulk fixture list keeps working. */
-async function assertCreditBudget(worstCaseCost: number): Promise<void> {
-  const remaining = await getKnownRemaining();
-  if (remaining !== null && remaining - worstCaseCost < ODDS_CREDIT_RESERVE) {
-    throw new CreditBudgetError(
-      `Odds API credits low (${remaining} left, reserve ${ODDS_CREDIT_RESERVE}) — per-match fetch skipped`
-    );
+/**
+ * Keys that can afford this call, richest first. Per-match fetches additionally leave
+ * ODDS_CREDIT_RESERVE on the key so the bulk fixture list keeps working; the bulk call may use it.
+ * A key whose balance is unknown (never used / stale) counts as full, so it gets probed.
+ */
+async function eligibleOddsKeys(worstCaseCost: number, respectReserve: boolean): Promise<string[]> {
+  const usable: { key: string; remaining: number | null }[] = [];
+  for (const key of ODDS_API_KEYS) {
+    if ((await loadOddsKeyState(key)).disabled) continue;
+    const remaining = await oddsKeyRemaining(key);
+    if (remaining !== null && remaining - worstCaseCost < (respectReserve ? ODDS_CREDIT_RESERVE : 0)) continue;
+    usable.push({ key, remaining });
   }
+  usable.sort((a, b) => (b.remaining ?? Infinity) - (a.remaining ?? Infinity));
+  return usable.map((u) => u.key);
+}
+
+/** After a non-OK reply: should the next key be tried ('next'), or is the answer final whatever key we use ('fatal')? */
+async function classifyOddsFailure(res: Response, key: string): Promise<'next' | 'fatal'> {
+  let code = '';
+  try {
+    code = String(((await res.clone().json()) as { error_code?: string })?.error_code ?? '');
+  } catch {
+    /* body wasn't JSON */
+  }
+
+  if (code === 'OUT_OF_USAGE_CREDITS') {
+    await setOddsKeyRemaining(key, 0);
+    console.warn(`[sportybet] Odds API key ${keyTag(key)} is out of credits — switching to the next key`);
+    return 'next';
+  }
+  if (res.status === 401 || res.status === 403) {
+    (await loadOddsKeyState(key)).disabled = true;
+    console.error(`[sportybet] Odds API key ${keyTag(key)} was rejected (${res.status} ${code || 'no code'}) — disabled until restart, trying the next key`);
+    return 'next';
+  }
+  if (res.status === 429) {
+    console.warn(`[sportybet] Odds API key ${keyTag(key)} hit the frequency limit — trying the next key`);
+    return 'next';
+  }
+  return 'fatal'; // 404 unknown sport / event, 422 bad market… — a different key gets the same answer
+}
+
+/**
+ * Every Odds API request goes through here: picks the best key that can afford it and fails over to
+ * the next one when a key is out of credits, invalid or rate-limited. Returns the final Response —
+ * callers still check `res.ok` for errors that no key can fix.
+ */
+async function oddsApiFetch(path: string, query: string, label: string, opts: { worstCaseCost: number; respectReserve: boolean }): Promise<Response> {
+  if (!ODDS_API_KEYS.length) throw new Error('No Odds API key configured — set ODDS_API_KEY in the environment');
+
+  const keys = await eligibleOddsKeys(opts.worstCaseCost, opts.respectReserve);
+  if (!keys.length) {
+    const why = `no Odds API key has enough credits (${ODDS_API_KEYS.length} configured, reserve ${ODDS_CREDIT_RESERVE})`;
+    if (opts.respectReserve) throw new CreditBudgetError(`${why} — per-match fetch skipped`);
+    throw new Error(`The Odds API: ${why}`);
+  }
+
+  let last: Response | null = null;
+  for (const key of keys) {
+    const res = await fetch(`${ODDS_API_BASE}${path}?${query}&apiKey=${key}`);
+    await recordUsage(res, label, key);
+    if (res.ok) return res;
+    last = res;
+    if ((await classifyOddsFailure(res, key)) === 'fatal') return res;
+  }
+  return last!; // every key failed in a way another key could have fixed — the caller reports the last status
 }
 
 // ── Bulk h2h (1 credit) ──────────────────────────────────────────────────
 
-async function fetchOddsApiEvents(markets: string): Promise<OddsApiEvent[]> {
-  const url = `${ODDS_API_BASE}/sports/soccer_epl/odds/?regions=uk&markets=${markets}&oddsFormat=decimal&apiKey=${ODDS_API_KEY}`;
-  const res = await fetch(url);
-  await recordUsage(res, `bulk ${markets}`);
+async function fetchOddsApiEvents(markets: string, league: LeagueId): Promise<OddsApiEvent[]> {
+  const sportKey = getLeague(league).oddsSportKey;
+  const res = await oddsApiFetch(`/sports/${sportKey}/odds/`, `regions=uk&markets=${markets}&oddsFormat=decimal`, `bulk ${sportKey} ${markets}`, {
+    worstCaseCost: 1, // h2h x 1 region
+    respectReserve: false,
+  });
   if (!res.ok) throw new Error(`The Odds API responded ${res.status}`);
   return (await res.json()) as OddsApiEvent[];
 }
 
 /** Best (highest) UK price for h2h (1X2), across every bookmaker offering it. */
-export async function fetchOddsTips(): Promise<OddsTip[]> {
-  return persistentCached<OddsTip[]>('bulk_h2h', ODDS_CACHE_TTL_MS, async () => {
-    const events = await fetchOddsApiEvents('h2h');
+export async function fetchOddsTips(league: LeagueId = DEFAULT_LEAGUE): Promise<OddsTip[]> {
+  // The Premier League keeps its original cache key so a restart right after this upgrade doesn't re-buy fresh odds.
+  const cacheKey = league === DEFAULT_LEAGUE ? 'bulk_h2h' : `bulk_h2h_${league}`;
+  return persistentCached<OddsTip[]>(cacheKey, ODDS_CACHE_TTL_MS, async () => {
+    const events = await fetchOddsApiEvents('h2h', league);
     return events.map((ev): OddsTip => {
       const bestH2h = new Map<string, number>(); // outcome name -> best price seen
       let bookmakerCount = 0;
@@ -714,12 +942,14 @@ export function parseEventMarkets(ev: OddsApiEvent, keys: readonly string[]): Ev
   return out;
 }
 
-async function fetchEventBundle(eventId: string, keys: readonly string[], tag: 'core' | 'extra'): Promise<EventMarkets> {
+async function fetchEventBundle(eventId: string, keys: readonly string[], tag: 'core' | 'extra', league: LeagueId): Promise<EventMarkets> {
   return persistentCached<EventMarkets>(`evodds_${eventId}_${tag}`, EVENT_ODDS_CACHE_TTL_MS, async () => {
-    await assertCreditBudget(keys.length); // worst case: every requested market comes back
-    const url = `${ODDS_API_BASE}/sports/soccer_epl/events/${eventId}/odds/?regions=uk&markets=${keys.join(',')}&oddsFormat=decimal&apiKey=${ODDS_API_KEY}`;
-    const res = await fetch(url);
-    await recordUsage(res, `event ${eventId} ${tag}`);
+    const res = await oddsApiFetch(
+      `/sports/${getLeague(league).oddsSportKey}/events/${eventId}/odds/`,
+      `regions=uk&markets=${keys.join(',')}&oddsFormat=decimal`,
+      `event ${eventId} ${tag}`,
+      { worstCaseCost: keys.length, respectReserve: true } // worst case: every requested market comes back
+    );
     if (!res.ok) throw new Error(`The Odds API event odds (${tag}) responded ${res.status}`);
     const ev = (await res.json()) as OddsApiEvent;
 
@@ -734,13 +964,13 @@ async function fetchEventBundle(eventId: string, keys: readonly string[], tag: '
 }
 
 /** CORE bundle (btts, double chance, draw no bet, goal ladders). <= 5 credits, cached 24h. Call when a match is opened. */
-export function fetchCoreMarkets(eventId: string): Promise<EventMarkets> {
-  return fetchEventBundle(eventId, CORE_MARKET_KEYS, 'core');
+export function fetchCoreMarkets(eventId: string, league: LeagueId = DEFAULT_LEAGUE): Promise<EventMarkets> {
+  return fetchEventBundle(eventId, CORE_MARKET_KEYS, 'core', league);
 }
 
 /** EXTRA bundle (1st-half BTTS / double chance, HT/FT). <= 3 credits, cached 24h. Call ONLY on an explicit "More markets" tap. */
-export function fetchExtraMarkets(eventId: string): Promise<EventMarkets> {
-  return fetchEventBundle(eventId, EXTRA_MARKET_KEYS, 'extra');
+export function fetchExtraMarkets(eventId: string, league: LeagueId = DEFAULT_LEAGUE): Promise<EventMarkets> {
+  return fetchEventBundle(eventId, EXTRA_MARKET_KEYS, 'extra', league);
 }
 
 /** The EXTRA bundle if it's already been bought and is still fresh — never spends a credit. null = not fetched yet. */
@@ -828,8 +1058,21 @@ export function getMarketOptions(market: Market, fixture: FixtureWithOdds, em: E
 // Albion"). Never compare these with === — normalize both sides first.
 // ─────────────────────────────────────────────────────────────────────────
 
+/** Atlético -> Atletico, Alavés -> Alaves, München -> Munchen, and the letters NFD can't split (Bodø -> Bodo). */
+function foldDiacritics(text: string): string {
+  return text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/ø/gi, (c) => (c === 'Ø' ? 'O' : 'o'))
+    .replace(/æ/gi, (c) => (c === 'Æ' ? 'Ae' : 'ae'))
+    .replace(/ß/g, 'ss')
+    .replace(/ł/gi, (c) => (c === 'Ł' ? 'L' : 'l'))
+    .replace(/đ/gi, (c) => (c === 'Đ' ? 'D' : 'd'))
+    .replace(/ı/g, 'i');
+}
+
 export function normalizeTeamName(name: string): string {
-  return name
+  return foldDiacritics(name)
     .toLowerCase()
     .replace(/\bafc\b/g, '')
     .replace(/\bfc\b/g, '')
@@ -879,6 +1122,54 @@ const CLUB_SHORT_NAME_OVERRIDES: Record<string, string> = {
   'preston north end': 'Preston',
   'huddersfield town': 'Huddersfield',
   'derby county': 'Derby',
+  // La Liga (keys are accent-free, after FC/CF stripping)
+  'club atletico de madrid': 'Atlético', // "Atlético Madrid" would be 15 chars — one too wide for the fixtures feed
+  'athletic club': 'Athletic Club',
+  'ca osasuna': 'Osasuna',
+  'rcd espanyol de barcelona': 'Espanyol',
+  'rayo vallecano de madrid': 'Rayo Vallecano',
+  'deportivo alaves': 'Alavés',
+  'levante ud': 'Levante',
+  'rc celta de vigo': 'Celta Vigo',
+  'rcd mallorca': 'Mallorca',
+  'real betis balompie': 'Real Betis',
+  'real sociedad de futbol': 'Real Sociedad',
+  'ud las palmas': 'Las Palmas',
+  'cd leganes': 'Leganés',
+  'real valladolid': 'Valladolid',
+  'rc deportivo la coruna': 'Deportivo',
+  'real racing club de santander': 'Racing Santander',
+  // Champions League (keys are accent-free, after FC/AFC/CF stripping)
+  'paris saint-germain': 'PSG',
+  'bayern munchen': 'Bayern Munich',
+  'internazionale milano': 'Inter Milan',
+  'ssc napoli': 'Napoli',
+  'atalanta bc': 'Atalanta',
+  'as roma': 'Roma',
+  'borussia dortmund': 'Dortmund',
+  'bayer 04 leverkusen': 'Leverkusen',
+  'eintracht frankfurt': 'Frankfurt',
+  'vfb stuttgart': 'Stuttgart',
+  'sporting clube de portugal': 'Sporting CP',
+  'sl benfica': 'Benfica',
+  'feyenoord rotterdam': 'Feyenoord',
+  'club brugge kv': 'Club Brugge',
+  'royale union saint-gilloise': 'Union SG',
+  'galatasaray sk': 'Galatasaray',
+  'fenerbahce sk': 'Fenerbahçe',
+  'fk bodo/glimt': 'Bodø/Glimt',
+  'qarabag fk': 'Qarabağ',
+  'olympique de marseille': 'Marseille',
+  'olympique lyonnais': 'Lyon',
+  'as monaco': 'Monaco',
+  'losc lille': 'Lille',
+  'sc braga': 'Braga',
+  'sk slavia praha': 'Slavia Praha',
+  'ac sparta praha': 'Sparta Praha',
+  'sk sturm graz': 'Sturm Graz',
+  'bsc young boys': 'Young Boys',
+  'fk crvena zvezda': 'Red Star',
+  'celtic': 'Celtic',
 };
 
 /**
@@ -892,26 +1183,114 @@ const CLUB_SHORT_NAME_OVERRIDES: Record<string, string> = {
  */
 export function shortClubName(officialName: string): string {
   const stripped = officialName
-    .replace(/^AFC\s+/i, '')
-    .replace(/\s+(AFC|FC)$/i, '')
+    .replace(/^(AFC|FC)\s+/i, '')
+    .replace(/\s+(AFC|FC|CF)$/i, '')
     .trim();
-  const key = stripped.toLowerCase().replace(/&/g, '').replace(/\s+/g, ' ').trim();
+  const key = foldDiacritics(stripped)
+    .toLowerCase()
+    .replace(/&/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
   return CLUB_SHORT_NAME_OVERRIDES[key] || stripped;
 }
 
-export function joinFixturesWithOdds(fixtures: FootballDataMatch[], tips: OddsTip[]): FixtureWithOdds[] {
+// ── Fixture <-> odds name matching ───────────────────────────────────────
+//
+// football-data.org and The Odds API name clubs differently, and La Liga makes
+// it much worse than the Premier League: "Club Atlético de Madrid" vs
+// "Atlético Madrid", "RCD Espanyol de Barcelona" vs "Espanyol", "Athletic
+// Club" vs "Athletic Bilbao". So the join compares NAME TOKENS, not strings:
+// drop the legal-form noise (FC, CF, RCD, de, club...), then two names match
+// when one's tokens are all inside the other's. An exact token match always
+// wins over a subset match. Same-ish names can't cross-match by accident
+// because BOTH teams and the match day must agree — and the join only ever
+// compares ONE league's fixtures against that league's odds.
+// This only bridges the two APIs; settlement and coupon identity still use
+// football-data.org's official names, which are compared exactly.
+
+const TEAM_NOISE_TOKENS = new Set(['afc', 'fc', 'cf', 'ud', 'cd', 'rcd', 'rc', 'sd', 'ca', 'sc', 'club', 'de', 'balompie', 'futbol', 'and']);
+
+/** Nicknames the odds feed may use that share no token with the official name (normalised form -> normalised official). */
+const TEAM_NAME_ALIASES: Record<string, string> = {
+  wolves: 'wolverhampton wanderers',
+  spurs: 'tottenham hotspur',
+  'man utd': 'manchester united',
+  'man united': 'manchester united',
+  'man city': 'manchester city',
+  'nottm forest': 'nottingham forest',
+  'nott m forest': 'nottingham forest',
+  // Champions League clubs — the odds feed uses English / short forms the official names don't contain
+  'inter milan': 'internazionale milano',
+  'bayern munich': 'bayern munchen',
+  psg: 'paris saint germain',
+  'sporting cp': 'sporting clube de portugal',
+  lyon: 'olympique lyonnais',
+  'slavia prague': 'slavia praha',
+  'red star belgrade': 'crvena zvezda',
+  'union st gilloise': 'union saint gilloise',
+  'atletico de madrid': 'atletico madrid',
+};
+
+function teamTokens(name: string): Set<string> {
+  const norm = normalizeTeamName(name);
+  const canon = TEAM_NAME_ALIASES[norm] ?? norm;
+  return new Set(canon.split(' ').filter((t) => t && !TEAM_NOISE_TOKENS.has(t)));
+}
+
+/** 2 = identical token sets, 1 = one is contained in the other, 0 = different clubs. */
+function teamMatchScore(a: string, b: string): 0 | 1 | 2 {
+  const ta = teamTokens(a);
+  const tb = teamTokens(b);
+  if (!ta.size || !tb.size) return 0;
+  const [small, big] = ta.size <= tb.size ? [ta, tb] : [tb, ta];
+  if (![...small].every((t) => big.has(t))) return 0;
+  return ta.size === tb.size ? 2 : 1;
+}
+
+/** football-data.org gives every club an official `name` AND a casual `shortName` ("Inter", "Bayern") — either may be what the odds feed echoes. */
+function teamScoreVsOdds(team: FootballDataTeam, oddsName: string): 0 | 1 | 2 {
+  const byName = teamMatchScore(team.name, oddsName);
+  const byShort = team.shortName ? teamMatchScore(team.shortName, oddsName) : 0;
+  return Math.max(byName, byShort) as 0 | 1 | 2;
+}
+
+const warnedNoOdds = new Set<string>();
+
+function findTip(fx: FootballDataMatch, tips: OddsTip[]): OddsTip | undefined {
+  let best: OddsTip | undefined;
+  let bestScore = 0;
+  for (const t of tips) {
+    if (!sameCalendarDay(t.commenceTime, fx.utcDate)) continue;
+    const h = teamScoreVsOdds(fx.homeTeam, t.homeTeam);
+    const a = teamScoreVsOdds(fx.awayTeam, t.awayTeam);
+    if (!h || !a) continue;
+    if (h + a > bestScore) {
+      best = t;
+      bestScore = h + a;
+    }
+  }
+  return best;
+}
+
+export function joinFixturesWithOdds(fixtures: FootballDataMatch[], tips: OddsTip[], league: LeagueId = DEFAULT_LEAGUE): FixtureWithOdds[] {
   return fixtures.map((fx) => {
     const kickoff = fx.utcDate; // already ISO UTC — football-data.org needs no date parsing
-    const home = normalizeTeamName(fx.homeTeam.name);
-    const away = normalizeTeamName(fx.awayTeam.name);
-    const tip = tips.find(
-      (t) =>
-        normalizeTeamName(t.homeTeam) === home &&
-        normalizeTeamName(t.awayTeam) === away &&
-        sameCalendarDay(t.commenceTime, kickoff)
-    );
+    const tip = findTip(fx, tips);
+
+    // Odds are normally listed ~1-2 weeks out: a fixture inside that window with NO match
+    // is almost always a naming gap between the two APIs — say so once, with both names.
+    const soon = new Date(kickoff).getTime() - Date.now() < 7 * 24 * 60 * 60_000;
+    const warnKey = `${fx.homeTeam.name}|${fx.awayTeam.name}`;
+    if (!tip && tips.length && soon && !warnedNoOdds.has(warnKey)) {
+      warnedNoOdds.add(warnKey);
+      console.warn(
+        `[sportybet] no odds match for ${fx.homeTeam.name} vs ${fx.awayTeam.name} (${kickoff.slice(0, 10)}). ` +
+          `Odds feed names that day: ${tips.filter((t) => sameCalendarDay(t.commenceTime, kickoff)).map((t) => `${t.homeTeam} v ${t.awayTeam}`).join('; ') || 'none'}`
+      );
+    }
 
     return {
+      league: fx.league ?? league,
       eventId: tip?.eventId ?? null,
       homeTeam: fx.homeTeam.name,
       awayTeam: fx.awayTeam.name,
@@ -944,6 +1323,7 @@ export function computePotentialPayout(stake: number, legs: Leg[]): number {
 // ─────────────────────────────────────────────────────────────────────────
 
 export interface PlaceCouponPick {
+  league?: LeagueId;
   homeTeam: string;
   awayTeam: string;
   kickoff: string;
@@ -991,6 +1371,7 @@ export async function placeCoupon(userId: string, stake: number, picks: PlaceCou
 
   const legs: Leg[] = picks.map((p) => ({
     id: `leg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    league: p.league ?? DEFAULT_LEAGUE,
     homeTeam: p.homeTeam,
     awayTeam: p.awayTeam,
     kickoff: p.kickoff,
@@ -1072,12 +1453,28 @@ function settleLine(total: number, point: number, selection: Selection): 'won' |
  * exactly on the line; postponed/suspended/cancelled matches. A voided leg
  * drops out of the combined odds exactly like a postponed match already does.
  */
+/**
+ * The score these markets settle on: goals after 90 minutes (+ stoppage time).
+ * Domestic league games: just fullTime. A knockout match that went to extra time or
+ * penalties: regularTime, because fullTime includes extra time and the shootout.
+ * Returns nulls (=> leg stays pending) rather than guessing if regularTime is missing.
+ */
+export function scoreAfter90(match: FootballDataMatch): { home: number | null; away: number | null } {
+  const duration = match.score.duration;
+  if (duration && duration !== 'REGULAR') {
+    const reg = match.score.regularTime;
+    if (reg && reg.home !== null && reg.home !== undefined && reg.away !== null && reg.away !== undefined) return { home: reg.home, away: reg.away };
+    console.warn(`[sportybet] ${match.homeTeam.name} v ${match.awayTeam.name} went to ${duration} but the API sent no regularTime — leaving its legs pending`);
+    return { home: null, away: null };
+  }
+  return { home: match.score.fullTime.home, away: match.score.fullTime.away };
+}
+
 export function resolveLegResult(leg: Leg, match: FootballDataMatch): 'won' | 'lost' | 'void' | null {
   if (['POSTPONED', 'SUSPENDED', 'CANCELLED'].includes(match.status)) return 'void';
   if (match.status !== 'FINISHED') return null; // SCHEDULED / LIVE / IN_PLAY / PAUSED — still genuinely pending
 
-  const home = match.score.fullTime.home;
-  const away = match.score.fullTime.away;
+  const { home, away } = scoreAfter90(match);
   if (home === null || away === null) return null; // FINISHED but no score recorded yet — leave pending rather than guess
 
   let htHome: number | null = null;
@@ -1090,6 +1487,10 @@ export function resolveLegResult(leg: Leg, match: FootballDataMatch): 'won' | 'l
 
   switch (leg.market) {
     case '1x2':
+      // After extra time / penalties `winner` is who went through, not the 90-minute result.
+      if (match.score.duration && match.score.duration !== 'REGULAR') {
+        return resultCode(home, away) === (leg.selection === 'home' ? '1' : leg.selection === 'away' ? '2' : 'x') ? 'won' : 'lost';
+      }
       if (match.score.winner === 'HOME_TEAM') return leg.selection === 'home' ? 'won' : 'lost';
       if (match.score.winner === 'AWAY_TEAM') return leg.selection === 'away' ? 'won' : 'lost';
       if (match.score.winner === 'DRAW') return leg.selection === 'draw' ? 'won' : 'lost';
@@ -1130,7 +1531,9 @@ export function resolveLegResult(leg: Leg, match: FootballDataMatch): 'won' | 'l
 
 /** "2 - 1", plus the half-time score for 1st-half markets so My Bets shows what the leg was judged on. */
 function formatFinalScore(leg: Leg, match: FootballDataMatch): string {
-  const base = `${match.score.fullTime.home} - ${match.score.fullTime.away}`;
+  const reg = scoreAfter90(match);
+  const decidedAfter90 = match.score.duration && match.score.duration !== 'REGULAR';
+  const base = `${reg.home} - ${reg.away}${decidedAfter90 ? ' after 90 min' : ''}`;
   const ht = match.score.halfTime;
   if (HALF_TIME_MARKETS.has(leg.market) && ht && ht.home !== null && ht.away !== null) return `${base}, HT ${ht.home} - ${ht.away}`;
   return base;
@@ -1183,7 +1586,7 @@ export function startCouponSettlementPoller(intervalMs: number = SETTLEMENT_POLL
 async function runSettlementPass(): Promise<{ couponsChecked: number; couponsSettled: number }> {
   const [allUsers, seasonMatches] = await Promise.all([
     couponsByUser.getAll() as Promise<Record<string, Coupon[]>>,
-    fetchAllSeasonMatches(),
+    fetchAllLeaguesSeasonMatches(),
   ]);
 
   let couponsChecked = 0;
@@ -1201,17 +1604,21 @@ async function runSettlementPass(): Promise<{ couponsChecked: number; couponsSet
         if (leg.status !== 'pending') continue;
         const home = normalizeTeamName(leg.homeTeam);
         const away = normalizeTeamName(leg.awayTeam);
+        const legLeague = leg.league ?? DEFAULT_LEAGUE; // pre-La-Liga coupons have no league: Premier League
         const match = seasonMatches.find(
-          (m) => normalizeTeamName(m.homeTeam.name) === home && normalizeTeamName(m.awayTeam.name) === away
+          (m) =>
+            (m.league ?? DEFAULT_LEAGUE) === legLeague &&
+            normalizeTeamName(m.homeTeam.name) === home &&
+            normalizeTeamName(m.awayTeam.name) === away
         );
-        if (!match) continue; // not in this payload — try again next poll
+        if (!match) continue; // not in this payload (or that league's fetch failed this pass) — try again next poll
 
         const result = resolveLegResult(leg, match);
         if (result === null) continue; // still genuinely pending
         leg.status = result === 'void' ? 'voided' : result; // 'won' | 'lost' | 'voided'
         // A finished match shows its score even on a voided leg (draw no bet on a draw, a pushed line).
         // A postponed/cancelled match has no score to show.
-        if (match.status === 'FINISHED' && match.score.fullTime.home !== null) leg.finalScore = formatFinalScore(leg, match);
+        if (match.status === 'FINISHED' && scoreAfter90(match).home !== null) leg.finalScore = formatFinalScore(leg, match);
         legsChanged = true;
       }
 
@@ -1337,10 +1744,13 @@ export function legPickLabel(leg: {
 }
 
 export function formatCoupon(coupon: Coupon): string {
+  // A single-league coupon needs no tag; once it mixes leagues, each leg gets its league's flag.
+  const mixedLeagues = new Set(coupon.legs.map((l) => l.league ?? DEFAULT_LEAGUE)).size > 1;
   const lines = coupon.legs.map((leg) => {
     const pick = legPickLabel(leg);
     const score = leg.finalScore ? ` (${leg.finalScore})` : '';
-    return `${LEG_EMOJI[leg.status]} ${shortClubName(leg.homeTeam)} vs ${shortClubName(leg.awayTeam)} — ${pick} @ ${leg.oddsAtPlacement}${score}`;
+    const flag = mixedLeagues ? `${getLeague(leg.league).flag} ` : '';
+    return `${LEG_EMOJI[leg.status]} ${flag}${shortClubName(leg.homeTeam)} vs ${shortClubName(leg.awayTeam)} — ${pick} @ ${leg.oddsAtPlacement}${score}`;
   });
 
   const wasCapped = coupon.status === 'won' && coupon.actualPayout !== undefined && coupon.actualPayout < coupon.potentialPayout;
