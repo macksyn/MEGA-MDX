@@ -20,6 +20,10 @@ const ACTION_EMOJI: Record<string, string> = {
 export function cleanResponse(text: string): string {
   return text
     .trim()
+    // Strip ChatGPT-web ":::writing{variant=... id=... title=...}" wrapper (and its closing ":::") leaked by the proxy.
+    .replace(/^[ \t]*:::[ \t]*writing\s*\{[^}]*\}[ \t]*\r?\n?/gim, '')
+    .replace(/^[ \t]*:::[ \t]*$/gm, '')
+    .trim()
     .replace(/\*\s*([a-z ]{3,20}?)\s*\*/gi, (match, action: string) =>
       ACTION_EMOJI[action.trim().toLowerCase()] ?? match)
     // Strip prompt-instruction lines the model sometimes echoes — only when the line STARTS with the marker.
