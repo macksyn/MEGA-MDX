@@ -23,7 +23,6 @@ import { handleTagDetection } from '../plugins/antitag.js';
 import { handleMentionDetection } from '../plugins/mention.js';
 import { handleChatbotResponse } from '../plugins/chatbot.js';
 import { handleLocalBotMessage } from '../plugins/localbot.js';
-import { handleTicTacToeMove } from '../plugins/tictactoe.js';
 import { handleAutoReply } from '../plugins/autoreply.js';
 import { handleAntiSpam, invalidateGroupCache } from '../plugins/antispam.js';
 import { startSchedulerEngine } from '../plugins/schedule.js';
