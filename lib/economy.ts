@@ -147,12 +147,6 @@ export interface Wallet {
                           // is the ONLY place that survives to build a mention that WhatsApp will actually
                           // render — never reconstruct a mention JID by guessing the domain.
   identitySyncedAt: number | null;
-  // ── Equipment fields ──
-  equipment: {
-    boat: string;   // tier name: 'canoe', 'fishingBoat', 'speedBoat', 'deepSeaVessel', 'explorerShip'
-    net: string;    // 'wornNet', 'reinforcedNet', 'premiumNet', 'industrialNet'
-    bait: string;   // 'worms', 'shrimp', 'artificialBait', 'premiumBait', 'legendaryBait'
-  };
 }
 
 const EMPTY_WALLET: Wallet = {
@@ -171,11 +165,6 @@ const EMPTY_WALLET: Wallet = {
   phone: null,
   jid: null,
   identitySyncedAt: null,
-  equipment: {
-    boat: 'canoe',
-    net: 'wornNet',
-    bait: 'worms',
-  },
 };
 
 export async function getWallet(userId: string): Promise<Wallet> {
@@ -1183,107 +1172,6 @@ export async function resetLevel2Grace(
 
 export function formatNumber(n: number): string {
   return n.toLocaleString('en-US');
-}
-
-// ── Equipment definitions and functions ───────────────────────────────────────
-
-export interface EquipmentDef {
-  tier: string;
-  displayName: string;
-  cost: number;
-  modifiers: {
-    emptyMod?: number;       // multiplier for empty chance (boat)
-    predatorMod?: number;    // multiplier for predator chance (boat)
-    rarityShift?: number;    // amount of probability moved from common to higher (net)
-    treasureMod?: number;    // multiplier for treasure chance (bait)
-    jackpotMod?: number;     // multiplier for jackpot chance (bait)
-    qualityBoost?: number;   // increase chance of higher quality (bait)
-  };
-}
-
-export const EQUIPMENT_DEFS: Record<string, EquipmentDef> = {
-  // Boats
-  canoe:         { tier: 'canoe', displayName: 'Canoe', cost: 0, modifiers: { emptyMod: 1.0, predatorMod: 1.0 } },
-  fishingBoat:   { tier: 'fishingBoat', displayName: 'Fishing Boat', cost: 500, modifiers: { emptyMod: 0.95, predatorMod: 0.95 } },
-  speedBoat:     { tier: 'speedBoat', displayName: 'Speed Boat', cost: 2000, modifiers: { emptyMod: 0.88, predatorMod: 0.88 } },
-  deepSeaVessel: { tier: 'deepSeaVessel', displayName: 'Deep Sea Vessel', cost: 8000, modifiers: { emptyMod: 0.78, predatorMod: 0.78 } },
-  explorerShip:  { tier: 'explorerShip', displayName: 'Explorer Ship', cost: 30000, modifiers: { emptyMod: 0.65, predatorMod: 0.65 } },
-  // Nets
-  wornNet:       { tier: 'wornNet', displayName: 'Worn Net', cost: 0, modifiers: { rarityShift: 0 } },
-  reinforcedNet: { tier: 'reinforcedNet', displayName: 'Reinforced Net', cost: 300, modifiers: { rarityShift: 0.05 } },
-  premiumNet:    { tier: 'premiumNet', displayName: 'Premium Net', cost: 1500, modifiers: { rarityShift: 0.12 } },
-  industrialNet: { tier: 'industrialNet', displayName: 'Industrial Net', cost: 6000, modifiers: { rarityShift: 0.20 } },
-  // Bait
-  worms:          { tier: 'worms', displayName: 'Worms', cost: 0, modifiers: { treasureMod: 1.0, jackpotMod: 1.0, qualityBoost: 0 } },
-  shrimp:         { tier: 'shrimp', displayName: 'Shrimp', cost: 200, modifiers: { treasureMod: 1.1, jackpotMod: 1.05, qualityBoost: 0.05 } },
-  artificialBait: { tier: 'artificialBait', displayName: 'Artificial Bait', cost: 1000, modifiers: { treasureMod: 1.25, jackpotMod: 1.1, qualityBoost: 0.10 } },
-  premiumBait:    { tier: 'premiumBait', displayName: 'Premium Bait', cost: 4000, modifiers: { treasureMod: 1.5, jackpotMod: 1.2, qualityBoost: 0.20 } },
-  legendaryBait:  { tier: 'legendaryBait', displayName: 'Legendary Bait', cost: 15000, modifiers: { treasureMod: 2.0, jackpotMod: 1.5, qualityBoost: 0.35 } },
-};
-
-export function getEquipmentDefs(type: 'boat' | 'net' | 'bait'): EquipmentDef[] {
-  const map: Record<string, string[]> = {
-    boat: ['canoe', 'fishingBoat', 'speedBoat', 'deepSeaVessel', 'explorerShip'],
-    net: ['wornNet', 'reinforcedNet', 'premiumNet', 'industrialNet'],
-    bait: ['worms', 'shrimp', 'artificialBait', 'premiumBait', 'legendaryBait'],
-  };
-  return map[type].map(key => EQUIPMENT_DEFS[key]);
-}
-
-export async function getEquipment(userId: string) {
-  const wallet = await getWallet(userId);
-  return wallet.equipment;
-}
-
-export async function buyEquipment(userId: string, type: 'boat' | 'net' | 'bait', tier: string): Promise<{ success: boolean; reason?: string }> {
-  const def = EQUIPMENT_DEFS[tier];
-  if (!def) return { success: false, reason: 'invalid_tier' };
-
-  // Check that tier belongs to the correct type
-  const typeMap: Record<string, string[]> = {
-    boat: ['canoe','fishingBoat','speedBoat','deepSeaVessel','explorerShip'],
-    net: ['wornNet','reinforcedNet','premiumNet','industrialNet'],
-    bait: ['worms','shrimp','artificialBait','premiumBait','legendaryBait'],
-  };
-  if (!typeMap[type].includes(tier)) return { success: false, reason: 'tier_not_for_type' };
-
-  const wallet = await getWallet(userId);
-  if (wallet.coins < def.cost) return { success: false, reason: 'insufficient_funds' };
-
-  // Deduct cost
-  const result = await deductCoins(userId, def.cost, { type: 'admin_debit', note: `bought ${type}: ${tier}` });
-  if (!result.success) return { success: false, reason: 'insufficient_funds' };
-
-  // Set equipment — through mutateWallet so this can't race the deduct
-  // above (or anything else touching this wallet).
-  try {
-    await mutateWallet(userId, (wallet) => {
-      wallet.equipment = { ...wallet.equipment, [type]: tier };
-    });
-  } catch (err: any) {
-    // Coins already spent — if setting the equipment field itself throws,
-    // refund rather than have the member pay for gear they never received.
-    console.error(`[economy] equipment purchase failed to apply after debit committed (user=${userId} type=${type} tier=${tier}):`, err?.message || err);
-    try {
-      await addCoins(userId, def.cost, { type: 'admin_credit', note: `auto-refund: ${type} purchase (${tier}) failed to apply` });
-    } catch (refundErr: any) {
-      console.error(`[economy] CRITICAL: equipment purchase refund ALSO failed (user=${userId} type=${type} tier=${tier}) — needs manual reconciliation:`, refundErr?.message || refundErr);
-    }
-    return { success: false, reason: 'purchase_failed' };
-  }
-
-  return { success: true };
-}
-
-export async function equipEquipment(userId: string, type: 'boat' | 'net' | 'bait', tier: string): Promise<{ success: boolean; reason?: string }> {
-  const def = EQUIPMENT_DEFS[tier];
-  if (!def) return { success: false, reason: 'invalid_tier' };
-  // We'll allow equipping any tier (assuming they bought it)
-  // In a full system we'd check ownership, but we trust the buy flow.
-  await mutateWallet(userId, (wallet) => {
-    wallet.equipment = { ...wallet.equipment, [type]: tier };
-  });
-  return { success: true };
 }
 
 // ── Peer-to-peer exchange (Taka-style "beans" trade) ─────────────────────────

@@ -72,6 +72,7 @@
     "mongoose": "^9.0.2",
     "mumaker": "^2.0.0",
     "mysql2": "^3.16.0",
+    "node": "^26.12.0",
     "node-cache": "^5.1.2",
     "node-cron": "^4.6.0",
     "node-fetch": "^3.3.2",
