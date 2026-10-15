@@ -17,8 +17,8 @@ export const cooldown = 3000;
 // Configured exactly to 5, 20, 50, and 100 coin options
 const ALLOWED_BETS = [5, 20, 50, 100];
 
-const SPIN_FRAMES = ['▰▱▱▱▱', '▰▰▱▱▱', '▰▰▰▱▱', '▰▰▰▰▱', '▰▰▰▰▰'];
-const SPIN_FRAME_DELAY_MS = 550;
+const SPIN_FRAMES = ['▰▱▱▱▱', '▰▰▰▱▱', '▰▰▰▰▰'];
+const SPIN_FRAME_DELAY_MS = 250;
 
 const WIN_BANNERS: Record<string, string> = {
   big:       '『 🎉 Ｂ Ｉ Ｇ　Ｗ Ｉ Ｎ ！ 🎉 』',
