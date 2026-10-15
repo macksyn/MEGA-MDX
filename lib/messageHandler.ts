@@ -393,11 +393,6 @@ if (isGroup && !message.key.fromMe) {
         });
      if (c4Handled) return;
 
-        if (/^[1-9]$/.test(userMessage) || userMessage === 'surrender') {
-            await handleTicTacToeMove(sock, chatId, senderId, userMessage);
-            return;
-        }
-
         if (!message.key.fromMe) {
             await store.incrementMessageCount(chatId, senderId, message.pushName);
         } else {
