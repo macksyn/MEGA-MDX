@@ -67,7 +67,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
   const grid = spinGridForTier(outcome.tier);
 
   const sent = await sock.sendMessage(chatId, {
-    text: `🎰 *JUNGLE HUNT* 🎰\n\n🎰 Spinning${SPIN_FRAMES[0]}`,
+    text: `🎰 *JUNGLE HUNT* 🎰\n\n🎰 Spinning\n\n${SPIN_FRAMES[0]}`,
     ...channelInfo
   }, { quoted: message });
 
