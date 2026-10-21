@@ -1762,6 +1762,27 @@ export async function getBookingCode(raw: string): Promise<BookingCode | null> {
   return ((await bookingCodesTable.get(code)) as BookingCode | null | undefined) ?? null;
 }
 
+// Codes only exist for slips a player chose to share, but a code is still a key to someone's selections — so a player who
+// keeps typing codes that don't exist is paused instead of being allowed to guess.
+const MAX_FAILED_LOOKUPS = 8;
+const FAILED_LOOKUP_WINDOW_MS = 10 * 60_000;
+const failedLookups = new Map<string, number[]>();
+
+/** Seconds until this player may try another code (0 = allowed now). */
+export function bookingLookupBlockedFor(userId: string): number {
+  const recent = (failedLookups.get(cleanJid(userId)) ?? []).filter((t) => Date.now() - t < FAILED_LOOKUP_WINDOW_MS);
+  if (recent.length < MAX_FAILED_LOOKUPS) return 0;
+  return Math.max(1, Math.ceil((recent[0] + FAILED_LOOKUP_WINDOW_MS - Date.now()) / 1000));
+}
+
+/** Call when a typed code was malformed or didn't exist. */
+export function noteFailedBookingLookup(userId: string): void {
+  const uid = cleanJid(userId);
+  const recent = (failedLookups.get(uid) ?? []).filter((t) => Date.now() - t < FAILED_LOOKUP_WINDOW_MS);
+  recent.push(Date.now());
+  failedLookups.set(uid, recent);
+}
+
 export type BookingDropReason = 'started' | 'unavailable' | 'market_unavailable' | 'budget';
 
 export interface RepricedSlip {

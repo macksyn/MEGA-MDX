@@ -40,10 +40,11 @@
  * (remaining, used, pace, projected run-out, where they went) and football-data.org calls per token against
  * its 10/minute limit — plus a 14-day history. "Owner" means the bot owner or a sudo user (lib/isOwner).
  *
- * Booking codes: any slip (while building it, or a placed coupon) can be shared as a
- * 6-character code. `.sportybet <code>` (or the "Load Booking Code" button, which explains
- * that) re-loads the same selections at TODAY's odds and the player picks their own stake.
- * Matches that have started or markets that are gone are listed as "not loaded".
+ * Share: a placed bet's slip has a Share button (right after placing, and under My Bets). A booking code is only
+ * made — and only shown — when the player taps it; nothing prints a code by itself, so a bet stays private until
+ * its owner chooses to share it. Others load a code with `<prefix>sportybet <code>`, which re-prices the picks at
+ * today's odds and lets them bet their own stake.
+
  */
 import { withEconomyGuard, formatNumber, getWallet } from '../lib/economy.js';
 import { promptMenu, promptAmount } from '../lib/buttonSession.js';
@@ -72,6 +73,8 @@ import {
   createBookingCode,
   getBookingCode,
   parseBookingCode,
+  bookingLookupBlockedFor,
+  noteFailedBookingLookup,
   repriceBookingLegs,
   getUserCoupons,
   getCoupon,
@@ -170,31 +173,6 @@ function buildSlipPreview(picks: PlaceCouponPick[]): string {
   return picks.map((p, i) => `${i + 1}. ${shortClubName(p.homeTeam)} vs ${shortClubName(p.awayTeam)} — ${legPickLabel(p)} @ ${p.odds}`).join('\n');
 }
 
-function combinedOddsOf(picks: { odds: number }[]): number {
-  return Math.round(picks.reduce((acc, p) => acc * p.odds, 1) * 100) / 100;
-}
-
-/** The standalone "here's my code" message for a slip that hasn't been placed (yet). */
-function bookingShareText(code: string, picks: PlaceCouponPick[]): string {
-  return (
-    `🔗 *Booking code: ${code}*\n` +
-    `${picks.length} selection${picks.length > 1 ? 's' : ''} · ${combinedOddsOf(picks)}x combined odds\n\n` +
-    `${buildSlipPreview(picks)}\n\n` +
-    `Share it — anyone can send *${PREFIX}sportybet ${code}* to load this slip and bet their own stake.`
-  );
-}
-
-/** Two short lines for the end of a coupon message. Never throws: a share code is a bonus, not worth hiding a placed bet over. */
-async function bookingFooter(userId: string, legs: Parameters<typeof createBookingCode>[1]): Promise<string> {
-  try {
-    const code = await createBookingCode(userId, legs);
-    return `\n\n🔗 Booking code: *${code}*\nShare it — anyone can send *${PREFIX}sportybet ${code}* to bet these same selections.`;
-  } catch (err) {
-    console.warn('[sportybet] could not create a booking code:', err instanceof Error ? err.message : err);
-    return '';
-  }
-}
-
 const BOOKING_DROP_REASON: Record<BookingDropReason, string> = {
   started: 'match has started or betting has closed',
   unavailable: 'no odds available for this match right now',
@@ -254,8 +232,8 @@ async function runConfirm(sock: any, message: any, chatId: string, userId: strin
     await sock.sendMessage(chatId, { text: `❌ ${placeCouponErrorMessage(placed.reason)}`, ...channelInfo }, { quoted: message });
     return;
   }
-  const footer = await bookingFooter(userId, placed.coupon.legs);
-  await sock.sendMessage(chatId, { text: `🎉 Bet placed!\n\n${formatCoupon(placed.coupon)}${footer}`, ...channelInfo }, { quoted: message });
+  await sock.sendMessage(chatId, { text: `🎉 Bet placed!\n\n${formatCoupon(placed.coupon)}`, ...channelInfo }, { quoted: message });
+  await runCouponActions(sock, message, chatId, userId, channelInfo, placed.coupon.id, { only: ['share'], cancelLabel: 'Done', text: 'Your bet is in.' });
 }
 
 async function runStakeEntry(sock: any, message: any, chatId: string, userId: string, channelInfo: any, picks: PlaceCouponPick[]) {
@@ -305,7 +283,6 @@ async function runAddOrStake(
   if (canAddMore) options.push({ label: '➕ Add another match', value: 'more' });
   options.push({ label: '✏️ Edit slip', value: 'edit', description: 'Remove or change games' });
   options.push({ label: '💰 Place this bet', value: 'stake' });
-  options.push({ label: '🔗 Get booking code', value: 'share', description: 'Share this slip with friends' });
 
   const result = await promptMenu(sock, message, chatId, userId, {
     title: titleOverride ?? `✅ Added (${picks.length} leg${picks.length > 1 ? 's' : ''} so far)`,
@@ -318,17 +295,6 @@ async function runAddOrStake(
   if (result.timedOut || !result.value) return;
 
   if (result.value === 'edit') return runEditSlip(sock, message, chatId, userId, channelInfo, joined, picks, titleOverride);
-
-  if (result.value === 'share') {
-    try {
-      const code = await createBookingCode(userId, picks);
-      await sock.sendMessage(chatId, { text: bookingShareText(code, picks), ...channelInfo }, { quoted: message });
-    } catch (err) {
-      console.warn('[sportybet] booking code failed:', err instanceof Error ? err.message : err);
-      await sock.sendMessage(chatId, { text: '⚠️ Could not create a booking code right now.', ...channelInfo }, { quoted: message });
-    }
-    return runAddOrStake(sock, message, chatId, userId, channelInfo, joined, picks, titleOverride); // back to the same slip
-  }
 
   const outcome =
     result.value === 'more'
@@ -787,36 +753,76 @@ async function runMyBets(sock: any, message: any, chatId: string, userId: string
   const coupon = page.find((c) => c.id === result.value);
   if (!coupon) return;
 
-  // A code is only useful while something on the coupon can still be bet on.
-  const stillBettable = coupon.status === 'pending' && coupon.legs.some((l) => new Date(l.kickoff).getTime() - Date.now() > BETTING_CUTOFF_MS);
-  const footer = stillBettable ? await bookingFooter(userId, coupon.legs) : '';
-  await sock.sendMessage(chatId, { text: `${formatCoupon(coupon)}${footer}`, ...channelInfo }, { quoted: message });
+  await sock.sendMessage(chatId, { text: formatCoupon(coupon), ...channelInfo }, { quoted: message });
 
-  if (isCashOutOpen(coupon)) {
-    const outcome = await runCouponActions(sock, message, chatId, userId, channelInfo, coupon.id);
-    if (outcome === 'back') return runMyBets(sock, message, chatId, userId, channelInfo); // Back = the coupon list again
-    return outcome;
-  }
+  const outcome = await runCouponActions(sock, message, chatId, userId, channelInfo, coupon.id);
+  if (outcome === 'back') return runMyBets(sock, message, chatId, userId, channelInfo); // Back = the coupon list again
+  return outcome;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Cash out
 // ─────────────────────────────────────────────────────────────────────────
 
-async function runCouponActions(sock: any, message: any, chatId: string, userId: string, channelInfo: any, couponId: string) {
+/** A slip can be shared while something on it can still be bet on. */
+function isShareable(coupon: Coupon): boolean {
+  return coupon.status === 'pending' && coupon.legs.some((l) => new Date(l.kickoff).getTime() - Date.now() > BETTING_CUTOFF_MS);
+}
+
+/**
+ * What the player can do with a coupon: Share (a bookable slip) and Cash out (while it's open). Shows only what applies,
+ * and nothing at all when nothing does. `only` narrows it (right after placing a bet it's just Share).
+ */
+async function runCouponActions(
+  sock: any,
+  message: any,
+  chatId: string,
+  userId: string,
+  channelInfo: any,
+  couponId: string,
+  opts: { only?: ('share' | 'cashout')[]; cancelLabel?: string; text?: string } = {}
+) {
+  const coupon = await getCoupon(userId, couponId);
+  if (!coupon) return;
+
+  const options: { label: string; value: string; description?: string }[] = [];
+  if (isShareable(coupon) && (!opts.only || opts.only.includes('share'))) options.push({ label: '📤 Share', value: 'share' });
+  if (isCashOutOpen(coupon) && (!opts.only || opts.only.includes('cashout'))) options.push({ label: '💸 Cash out', value: 'cashout', description: 'See your cash-out offer' });
+  if (!options.length) return;
+
   const result = await promptMenu(sock, message, chatId, userId, {
     title: `🎟️ Coupon ${couponId.slice(-6).toUpperCase()}`,
-    text: 'What would you like to do?',
-    options: [{ label: '💸 Cash out', value: 'cashout', description: 'See your cash-out offer' }],
-    cancelLabel: 'Back',
+    text: opts.text ?? 'What would you like to do?',
+    options,
+    cancelLabel: opts.cancelLabel ?? 'Back',
   });
 
   if (result.cancelled) return 'back';
   if (result.timedOut || !result.value) return;
 
+  if (result.value === 'share') {
+    await runShareCoupon(sock, message, chatId, userId, channelInfo, coupon);
+    return;
+  }
+
   const outcome = await runCashOut(sock, message, chatId, userId, channelInfo, couponId);
-  if (outcome === 'back') return runCouponActions(sock, message, chatId, userId, channelInfo, couponId);
+  if (outcome === 'back') return runCouponActions(sock, message, chatId, userId, channelInfo, couponId, opts);
   return outcome;
+}
+
+/** The slip again, this time with its code — the only place a code is ever made or shown. */
+async function runShareCoupon(sock: any, message: any, chatId: string, userId: string, channelInfo: any, coupon: Coupon) {
+  try {
+    const code = await createBookingCode(userId, coupon.legs);
+    await sock.sendMessage(
+      chatId,
+      { text: `${formatCoupon(coupon)}\n\n🔗 Code: *${code}*\nBet the same selections: *${PREFIX}sportybet ${code}*`, ...channelInfo },
+      { quoted: message }
+    );
+  } catch (err) {
+    console.warn('[sportybet] could not share coupon:', err instanceof Error ? err.message : err);
+    await sock.sendMessage(chatId, { text: "⚠️ Couldn't share this slip right now — try again in a moment.", ...channelInfo }, { quoted: message });
+  }
 }
 
 function cashOutUnavailableMessage(reason: string): string {
@@ -925,19 +931,27 @@ async function runLoadBookingCode(sock: any, message: any, chatId: string, userI
     return;
   }
 
+  const wait = bookingLookupBlockedFor(userId);
+  if (wait > 0) {
+    await sock.sendMessage(chatId, { text: `⏳ Too many codes that didn't match. Try again in ${Math.ceil(wait / 60)} min.`, ...channelInfo }, { quoted: message });
+    return;
+  }
+
   const code = parseBookingCode(rawCode);
   if (!code) {
-    await sock.sendMessage(chatId, { text: "❌ That doesn't look like a booking code. Codes are 6 characters, like *K7M2QX*.", ...channelInfo }, { quoted: message });
+    noteFailedBookingLookup(userId);
+    await sock.sendMessage(chatId, { text: "❌ That doesn't look like a code. Codes are 6 characters, like *K7M2QX*.", ...channelInfo }, { quoted: message });
     return;
   }
 
   const booking = await getBookingCode(code);
   if (!booking) {
-    await sock.sendMessage(chatId, { text: `❌ Booking code *${code}* wasn't found. Check it and try again.`, ...channelInfo }, { quoted: message });
+    noteFailedBookingLookup(userId);
+    await sock.sendMessage(chatId, { text: `❌ Code *${code}* wasn't found. Check it and try again.`, ...channelInfo }, { quoted: message });
     return;
   }
 
-  await sock.sendMessage(chatId, { text: `⏳ Loading booking code *${code}* with the latest odds...`, ...channelInfo }, { quoted: message });
+  await sock.sendMessage(chatId, { text: `⏳ Loading code *${code}* with the latest odds...`, ...channelInfo }, { quoted: message });
 
   const { joined, failed } = await loadBettableFixtures();
   if (failed.length === LEAGUES.length) {
@@ -950,7 +964,7 @@ async function runLoadBookingCode(sock: any, message: any, chatId: string, userI
 
   if (!slip.loaded.length) {
     const why = slip.dropped.map((d) => `• ${name(d.leg)} — ${BOOKING_DROP_REASON[d.reason]}`).join('\n');
-    await sock.sendMessage(chatId, { text: `❌ Nothing in booking code *${code}* can be bet on right now.\n\n${why}`, ...channelInfo }, { quoted: message });
+    await sock.sendMessage(chatId, { text: `❌ Nothing in code *${code}* can be bet on right now.\n\n${why}`, ...channelInfo }, { quoted: message });
     return;
   }
 
@@ -959,7 +973,7 @@ async function runLoadBookingCode(sock: any, message: any, chatId: string, userI
   for (const { pick, was } of slip.loaded) {
     if (pick.odds !== was) notes.push(`${pick.odds > was ? '📈' : '📉'} ${name(pick)} — ${legPickLabel(pick)}: ${was} → ${pick.odds}`);
   }
-  const header = `🔗 Booking code *${code}* — ${slip.loaded.length} of ${booking.legs.length} selection${booking.legs.length > 1 ? 's' : ''} loaded at today's odds.`;
+  const header = `🔗 Code *${code}* — ${slip.loaded.length} of ${booking.legs.length} selection${booking.legs.length > 1 ? 's' : ''} loaded at today's odds.`;
   const parts = [header];
   if (notes.length) parts.push(`Odds changed:\n${notes.join('\n')}`);
   if (slip.dropped.length) parts.push(`⚠️ Not loaded:\n${slip.dropped.map((d) => `• ${name(d.leg)} — ${BOOKING_DROP_REASON[d.reason]}`).join('\n')}`);
@@ -1433,7 +1447,6 @@ async function runMainMenu(sock: any, message: any, chatId: string, userId: stri
     options: [
       { label: '💰 Place a Bet', value: 'place' },
       { label: '🎫 My Bets', value: 'mybets' },
-      { label: '🔗 Load Booking Code', value: 'load' },
       { label: '📅 Fixtures & Results', value: 'fixtures' },
     ],
     cancelLabel: 'Exit',
@@ -1448,9 +1461,6 @@ async function runMainMenu(sock: any, message: any, chatId: string, userId: stri
       break;
     case 'mybets':
       outcome = await runMyBets(sock, message, chatId, userId, channelInfo);
-      break;
-    case 'load':
-      outcome = await runLoadBookingCode(sock, message, chatId, userId, channelInfo);
       break;
     case 'fixtures':
       outcome = await runFixtures(sock, message, chatId, userId, channelInfo);
