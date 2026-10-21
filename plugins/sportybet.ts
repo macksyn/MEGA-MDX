@@ -29,9 +29,16 @@
  * schedule (pollAndSettleCoupons in lib/sportybet.ts) — this file only ever
  * reads/displays coupon state.
  *
+ * Edit slip: any slip (built here or loaded from a booking code) can have games removed, or a game's
+ * selection changed (same match, any market/outcome) before it's placed — like a real betslip.
+ *
  * Cash out: on a pending coupon, "Cash out" prices the coupon with fresh odds (see lib/sportybet.ts for the
  * maths and why it's pre-match only) and, on confirm, closes it for that amount. The offer is re-priced the
  * moment the player confirms; if it dropped, they're shown the new amount instead of being paid it silently.
+ *
+ * Owner dashboard: `.sportybet stats` (owner only) shows live usage for both APIs — Odds API credits per key
+ * (remaining, used, pace, projected run-out, where they went) and football-data.org calls per token against
+ * its 10/minute limit — plus a 14-day history. "Owner" means the bot owner or a sudo user (lib/isOwner).
  *
  * Booking codes: any slip (while building it, or a placed coupon) can be shared as a
  * 6-character code. `.sportybet <code>` (or the "Load Booking Code" button, which explains
@@ -40,7 +47,8 @@
  */
 import { withEconomyGuard, formatNumber, getWallet } from '../lib/economy.js';
 import { promptMenu, promptAmount } from '../lib/buttonSession.js';
-import { cleanJid } from '../lib/isOwner.js';
+import isOwnerOrSudo, { cleanJid } from '../lib/isOwner.js';
+import config from '../config.js';
 import {
   fetchUpcomingFixtures,
   fetchOddsTips,
@@ -69,6 +77,7 @@ import {
   getCoupon,
   getCashOutQuote,
   cashOutCoupon,
+  getUsageReport,
   isCashOutOpen,
   formatCoupon,
   legPickLabel,
@@ -86,6 +95,9 @@ import {
   type TeamSide,
   type Coupon,
   type CashOutQuote,
+  type UsageReport,
+  type OddsDay,
+  type FdDay,
 } from '../lib/sportybet.js';
 
 // Settles finished matches onto coupons in the background (every 5 min, plus once on
@@ -96,6 +108,9 @@ export const command = 'sportybet';
 export const aliases = ['bet', 'sb'];
 export const category = 'economy-games';
 export const cooldown = 3000;
+
+/** The command prefix users actually type (config.prefix), so every "send .sportybet CODE" hint is right even if PREFIXES changes. */
+const PREFIX = config.prefix || '.';
 
 const WAT_OFFSET_MS = 60 * 60 * 1000; // Nigeria is UTC+1 year-round, no DST
 
@@ -165,7 +180,7 @@ function bookingShareText(code: string, picks: PlaceCouponPick[]): string {
     `🔗 *Booking code: ${code}*\n` +
     `${picks.length} selection${picks.length > 1 ? 's' : ''} · ${combinedOddsOf(picks)}x combined odds\n\n` +
     `${buildSlipPreview(picks)}\n\n` +
-    `Share it — anyone can send *.sportybet ${code}* to load this slip and bet their own stake.`
+    `Share it — anyone can send *${PREFIX}sportybet ${code}* to load this slip and bet their own stake.`
   );
 }
 
@@ -173,7 +188,7 @@ function bookingShareText(code: string, picks: PlaceCouponPick[]): string {
 async function bookingFooter(userId: string, legs: Parameters<typeof createBookingCode>[1]): Promise<string> {
   try {
     const code = await createBookingCode(userId, legs);
-    return `\n\n🔗 Booking code: *${code}*\nShare it — anyone can send *.sportybet ${code}* to bet these same selections.`;
+    return `\n\n🔗 Booking code: *${code}*\nShare it — anyone can send *${PREFIX}sportybet ${code}* to bet these same selections.`;
   } catch (err) {
     console.warn('[sportybet] could not create a booking code:', err instanceof Error ? err.message : err);
     return '';
@@ -288,6 +303,7 @@ async function runAddOrStake(
   const canAddMore = picks.length < MAX_LEGS_PER_COUPON && joined.some((f) => !picks.some((p) => sameMatch(p, f)));
   const options = [];
   if (canAddMore) options.push({ label: '➕ Add another match', value: 'more' });
+  options.push({ label: '✏️ Edit slip', value: 'edit', description: 'Remove or change games' });
   options.push({ label: '💰 Place this bet', value: 'stake' });
   options.push({ label: '🔗 Get booking code', value: 'share', description: 'Share this slip with friends' });
 
@@ -300,6 +316,8 @@ async function runAddOrStake(
 
   if (result.cancelled) return 'back';
   if (result.timedOut || !result.value) return;
+
+  if (result.value === 'edit') return runEditSlip(sock, message, chatId, userId, channelInfo, joined, picks, titleOverride);
 
   if (result.value === 'share') {
     try {
@@ -360,7 +378,8 @@ async function runSelectionPicker(
   fixture: FixtureWithOdds,
   market: Market,
   em: EventMarkets,
-  team?: TeamSide
+  team?: TeamSide,
+  slot?: number // set when this pick REPLACES the one at that position in the slip (Edit slip → Change selection)
 ) {
   const opts = getMarketOptions(market, fixture, em, team);
   if (!opts.length) return 'back'; // nothing priced here after all — step back rather than show an empty menu
@@ -400,9 +419,10 @@ async function runSelectionPicker(
     odds: chosen.odds,
   };
 
-  const outcome = await runAddOrStake(sock, message, chatId, userId, channelInfo, joined, [...picks, newPick]);
+  const next = slot === undefined ? [...picks, newPick] : [...picks.slice(0, slot), newPick, ...picks.slice(slot)]; // a changed pick keeps its place
+  const outcome = await runAddOrStake(sock, message, chatId, userId, channelInfo, joined, next, slot === undefined ? undefined : '✏️ Selection changed');
   if (outcome === 'back') {
-    return runSelectionPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, market, em, team);
+    return runSelectionPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, market, em, team, slot);
   }
   return outcome;
 }
@@ -417,7 +437,8 @@ async function runTeamTotalsPicker(
   joined: FixtureWithOdds[],
   picks: PlaceCouponPick[],
   fixture: FixtureWithOdds,
-  em: EventMarkets
+  em: EventMarkets,
+  slot?: number
 ) {
   const options: { label: string; value: string; description?: string }[] = [];
   if (em.team_totals?.home.length) options.push({ label: `🏠 ${shortClubName(fixture.homeTeam)}`, value: 'home', description: 'Goals scored by this team' });
@@ -433,8 +454,8 @@ async function runTeamTotalsPicker(
   if (result.cancelled) return 'back';
   if (result.timedOut || !result.value) return;
 
-  const outcome = await runSelectionPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, 'team_totals', em, result.value as TeamSide);
-  if (outcome === 'back') return runTeamTotalsPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, em);
+  const outcome = await runSelectionPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, 'team_totals', em, result.value as TeamSide, slot);
+  if (outcome === 'back') return runTeamTotalsPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, em, slot);
   return outcome;
 }
 
@@ -446,7 +467,8 @@ async function runMarketPicker(
   channelInfo: any,
   joined: FixtureWithOdds[],
   picks: PlaceCouponPick[],
-  fixture: FixtureWithOdds
+  fixture: FixtureWithOdds,
+  slot?: number
 ) {
   // Prices beyond 1X2 are bought here, for THIS match only, and cached for 24h
   // (so Back / re-opening is free). Core markets load automatically; the extra
@@ -498,15 +520,104 @@ async function runMarketPicker(
       console.warn('[sportybet] extra markets failed:', err instanceof Error ? err.message : err);
       await sock.sendMessage(chatId, { text: '⚠️ Could not load more markets right now.', ...channelInfo }, { quoted: message });
     }
-    return runMarketPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture);
+    return runMarketPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, slot);
   }
 
   const market = result.value as Market;
   const outcome =
     market === 'team_totals'
-      ? await runTeamTotalsPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, em)
-      : await runSelectionPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, market, em);
-  if (outcome === 'back') return runMarketPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture);
+      ? await runTeamTotalsPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, em, slot)
+      : await runSelectionPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, market, em, undefined, slot);
+  if (outcome === 'back') return runMarketPicker(sock, message, chatId, userId, channelInfo, joined, picks, fixture, slot);
+  return outcome;
+}
+
+/**
+ * Edit slip: the games on the slip as a list. Tap one to change its selection or remove it; Done goes
+ * back to the slip menu. Removing the last game starts a fresh slip.
+ */
+async function runEditSlip(
+  sock: any,
+  message: any,
+  chatId: string,
+  userId: string,
+  channelInfo: any,
+  joined: FixtureWithOdds[],
+  picks: PlaceCouponPick[],
+  titleOverride?: string
+) {
+  // A "Slip loaded (4 legs)" title has to follow the edits.
+  const retitled = titleOverride?.replace(/\(\d+ legs?\)/, `(${picks.length} leg${picks.length === 1 ? '' : 's'})`);
+
+  const result = await promptMenu(sock, message, chatId, userId, {
+    title: '✏️ Edit slip',
+    text: `${buildSlipPreview(picks)}\n\nTap a game to change its selection or remove it.`,
+    options: picks.map((p, i) => ({
+      label: `${i + 1}. ${shortClubName(p.homeTeam)} vs ${shortClubName(p.awayTeam)}`,
+      value: String(i),
+      description: `${legPickLabel(p)} @ ${p.odds}`,
+    })),
+    cancelLabel: '✅ Done',
+  });
+
+  if (result.cancelled) return runAddOrStake(sock, message, chatId, userId, channelInfo, joined, picks, retitled);
+  if (result.timedOut || !result.value) return;
+
+  const index = Number(result.value);
+  if (!picks[index]) return runEditSlip(sock, message, chatId, userId, channelInfo, joined, picks, titleOverride);
+
+  // Only "Back" from the game's own menu returns here to re-show THIS list. Anything else is a final answer from a
+  // later screen (an edited slip, the slip menu, a placed bet) and must pass straight up — handing it to this frame
+  // would bring back games the player just removed.
+  const outcome = await runEditPick(sock, message, chatId, userId, channelInfo, joined, picks, index, titleOverride);
+  if (outcome === 'pick-back') return runEditSlip(sock, message, chatId, userId, channelInfo, joined, picks, titleOverride);
+  return outcome;
+}
+
+async function runEditPick(
+  sock: any,
+  message: any,
+  chatId: string,
+  userId: string,
+  channelInfo: any,
+  joined: FixtureWithOdds[],
+  picks: PlaceCouponPick[],
+  index: number,
+  titleOverride?: string
+) {
+  const pick = picks[index];
+  const fixture = joined.find((f) => f.league === (pick.league ?? DEFAULT_LEAGUE) && sameMatch(pick, f));
+  const name = `${shortClubName(pick.homeTeam)} vs ${shortClubName(pick.awayTeam)}`;
+
+  const options: { label: string; value: string; description?: string }[] = [];
+  if (fixture) options.push({ label: '🔄 Change selection', value: 'change', description: 'Another market or outcome for this game' });
+  options.push({ label: '🗑️ Remove this game', value: 'remove' });
+
+  const result = await promptMenu(sock, message, chatId, userId, {
+    title: `${index + 1}. ${name}`,
+    text: `${legPickLabel(pick)} @ ${pick.odds}${fixture ? '' : "\n\nThis game is no longer on the odds board, so it can only be removed."}`,
+    options,
+    cancelLabel: 'Back',
+  });
+
+  if (result.cancelled) return 'pick-back';
+  if (result.timedOut || !result.value) return;
+
+  const rest = picks.filter((_, i) => i !== index);
+
+  if (result.value === 'remove') {
+    if (!rest.length) {
+      await sock.sendMessage(chatId, { text: `🗑️ Removed ${name}. Your slip is empty — pick a match to start again.`, ...channelInfo }, { quoted: message });
+      const fresh = await runLeaguePicker(sock, message, chatId, userId, channelInfo, joined, []);
+      return fresh === 'back' ? undefined : fresh; // nothing left to go back to — end quietly rather than revive the removed games
+    }
+    await sock.sendMessage(chatId, { text: `🗑️ Removed ${name}.`, ...channelInfo }, { quoted: message });
+    return runEditSlip(sock, message, chatId, userId, channelInfo, joined, rest, titleOverride);
+  }
+
+  // Change: pick the same match again from the market list; the new pick takes the old one's place.
+  const outcome = await runMarketPicker(sock, message, chatId, userId, channelInfo, joined, rest, fixture!, index);
+  if (outcome === 'back') return runEditPick(sock, message, chatId, userId, channelInfo, joined, picks, index, titleOverride); // backed out: nothing changed
   return outcome;
 }
 
@@ -805,7 +916,7 @@ async function runLoadBookingCode(sock: any, message: any, chatId: string, userI
       {
         text:
           '🔗 *Load a booking code*\n\n' +
-          'Send *.sportybet <code>* — for example *.sportybet K7M2QX*.\n\n' +
+          `Send *${PREFIX}sportybet <code>* — for example *${PREFIX}sportybet K7M2QX*.\n\n` +
           "You'll get the same selections at today's odds, and you choose your own stake.",
         ...channelInfo,
       },
@@ -852,6 +963,7 @@ async function runLoadBookingCode(sock: any, message: any, chatId: string, userI
   const parts = [header];
   if (notes.length) parts.push(`Odds changed:\n${notes.join('\n')}`);
   if (slip.dropped.length) parts.push(`⚠️ Not loaded:\n${slip.dropped.map((d) => `• ${name(d.leg)} — ${BOOKING_DROP_REASON[d.reason]}`).join('\n')}`);
+  parts.push('Use ✏️ Edit slip to remove or change games before you place it.');
   await sock.sendMessage(chatId, { text: parts.join('\n\n'), ...channelInfo }, { quoted: message });
 
   const picks = slip.loaded.map((l) => l.pick);
@@ -1102,6 +1214,214 @@ async function runFixturesLeague(sock: any, message: any, chatId: string, userId
   return sock.sendMessage(chatId, { text: buildFeedText(matches, mode, scope), ...channelInfo }, { quoted: message });
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────
+// Owner dashboard — API usage
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Who may open the dashboard: the bot owner or a sudo user, decided by the project's own helper
+ * (lib/isOwner — it also resolves @lid senders through the group's participant list, which is why it needs
+ * the raw sender id, the socket and the chat). Anything that goes wrong means "no".
+ */
+async function isStatsAdmin(sock: any, senderId: string, chatId: string): Promise<boolean> {
+  try {
+    return (await isOwnerOrSudo(senderId, sock, chatId)) === true;
+  } catch {
+    return false;
+  }
+}
+
+const num = (n: number): string => Math.round(n).toLocaleString('en-US');
+const bar = (fraction: number, width = 10): string => {
+  const filled = Math.max(0, Math.min(width, Math.round(fraction * width)));
+  return '▓'.repeat(filled) + '░'.repeat(width - filled);
+};
+/** "20 Oct, 15:42" in WAT. */
+function formatStamp(ts: number): string {
+  const d = new Date(ts + WAT_OFFSET_MS);
+  return `${d.getUTCDate()} ${MONTH_NAMES[d.getUTCMonth()].slice(0, 3)}, ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+}
+function shortDate(ts: number): string {
+  const d = new Date(ts + WAT_OFFSET_MS);
+  return `${d.getUTCDate()} ${MONTH_NAMES[d.getUTCMonth()].slice(0, 3)}`;
+}
+function ago(ts: number | null, now: number): string {
+  if (ts === null) return 'never';
+  const s = Math.max(0, Math.round((now - ts) / 1000));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86_400) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86_400)}d ago`;
+}
+const plural = (n: number, word: string): string => `${num(n)} ${word}${n === 1 ? '' : 's'}`;
+
+const KIND_LABEL: Record<string, string> = { bulk: 'Odds lists', event_core: 'Match markets', event_extra: 'More markets' };
+const PURPOSE_LABEL: Record<string, string> = { betting: 'betting', cashout: 'cash out', booking: 'booking codes' };
+const leagueName = (id: string): string => (LEAGUES.some((l) => l.id === id) ? getLeague(id as LeagueId).name : id);
+
+/** "a 120 · b 85 · c 40", biggest first, skipping zeros. */
+function breakdown(entries: Record<string, number>, label: (k: string) => string): string {
+  const parts = Object.entries(entries)
+    .filter(([, v]) => v > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${label(k)} ${num(v)}`);
+  return parts.length ? parts.join(' · ') : '—';
+}
+
+function oddsSpend(label: string, d: OddsDay): string {
+  return `${label}: *${plural(d.credits, 'credit')}* (${plural(d.calls, 'call')}${d.errors ? `, ${d.errors} failed` : ''})`;
+}
+
+function overviewText(r: UsageReport): string {
+  const o = r.odds;
+  const lines: string[] = [`📊 *Sportybet API usage*`, `_${formatStamp(r.generatedAt)} WAT_`, ''];
+
+  // The Odds API
+  lines.push(`🎯 *The Odds API* · ${plural(o.configured, 'key')}`);
+  if (o.remaining !== null && o.quota) {
+    lines.push(`${bar(o.remaining / o.quota)} *${num(o.remaining)} / ${num(o.quota)}* credits left (${Math.round((o.remaining / o.quota) * 100)}%)`);
+  } else if (o.remaining !== null) {
+    lines.push(`*${num(o.remaining)}* credits left`);
+  } else {
+    lines.push('No balance read yet this month — it appears after the first odds call.');
+  }
+  if (o.used !== null) lines.push(`Used this month: ${num(o.used)}`);
+  const daysToReset = Math.ceil((r.nextReset - r.generatedAt) / 86_400_000);
+  lines.push(`Resets ${shortDate(r.nextReset)} · in ${plural(daysToReset, 'day')}`);
+  if (o.ratePerDay !== null && o.remaining !== null) {
+    const pace = `~${num(o.ratePerDay)}/day`;
+    if (o.willRunOutBeforeReset && o.runOutAt !== null) lines.push(`⚠️ Pace ${pace} → runs out around *${shortDate(o.runOutAt)}*, before the reset${o.roughEstimate ? ' (rough — early in the month)' : ''}`);
+    else lines.push(`✅ Pace ${pace} → lasts past the reset${o.roughEstimate ? ' (rough — early in the month)' : ''}`);
+  }
+  const needAttention = o.keys.filter((k) => k.status === 'low' || k.status === 'exhausted' || k.status === 'disabled');
+  for (const k of needAttention) lines.push(`⚠️ Key ${k.index} (${k.tag}): ${k.status}`);
+  lines.push('');
+
+  // football-data.org
+  const f = r.fd;
+  lines.push(`⚽ *football-data.org* · ${plural(Math.max(f.configured, 1), 'token')} (${f.limitPerMinute} calls/min each)`);
+  lines.push(`Last minute: ${f.callsLastMinute} of ${f.limitPerMinute * Math.max(f.configured, 1)} calls`);
+  lines.push(`Today: ${plural(f.today.calls, 'call')} · peak ${f.today.peakPerMinute}/min · ${f.today.rateLimited} rate-limited`);
+  lines.push(`This month: ${plural(f.month.calls, 'call')} · ${f.month.rateLimited} rate-limited`);
+  const cooling = f.tokens.filter((t) => t.status === 'cooling');
+  lines.push(cooling.length ? `⏳ ${cooling.map((t) => `Token ${t.index} resting ${t.cooldownSeconds}s`).join(', ')}` : '✅ All tokens ready');
+  lines.push('');
+
+  lines.push(oddsSpend('Today (this bot)', o.today));
+  lines.push(oddsSpend('This month (this bot)', o.month));
+  if (o.cacheSavedEstimate > 0) lines.push(`🧮 The cache saved roughly *${num(o.cacheSavedEstimate)} credits* this month (estimate)`);
+  lines.push('', '_Open the other pages for per-key detail, where the credits went, and the 14-day history._');
+  return lines.join('\n');
+}
+
+const KEY_STATUS: Record<string, string> = {
+  active: '✅ active',
+  low: '⚠️ low — per-match fetches paused on this key',
+  exhausted: '⛔ out of credits',
+  disabled: '🚫 rejected as invalid (until restart)',
+  unused: '⚪ no balance read yet this month',
+};
+
+function oddsText(r: UsageReport): string {
+  const o = r.odds;
+  const blocks: string[] = [`🎯 *The Odds API — per key*`, `_${formatStamp(r.generatedAt)} WAT_`];
+  if (!o.keys.length) blocks.push('', 'No key is configured (set ODDS_API_KEY).');
+
+  for (const k of o.keys) {
+    const l: string[] = ['', `*Key ${k.index}* (${k.tag}) ${KEY_STATUS[k.status]}`];
+    if (k.remaining !== null && k.quota) l.push(`${bar(k.remaining / k.quota)} ${num(k.remaining)} / ${num(k.quota)} left (${Math.round((k.remaining / k.quota) * 100)}%)`);
+    else if (k.remaining !== null) l.push(`${num(k.remaining)} credits left`);
+    if (k.used !== null) l.push(`Used this month: ${num(k.used)}${k.asOf ? ` · read ${ago(k.asOf, r.generatedAt)}` : ''}`);
+    if (k.lastCall) {
+      const [kind, league] = k.lastCall.label.split(' ');
+      l.push(`Last call ${ago(k.lastCall.at, r.generatedAt)}: ${KIND_LABEL[kind] ?? kind} · ${leagueName(league ?? '')} · cost ${k.lastCall.cost ?? '?'}${k.lastCall.ok ? '' : ' · failed'}`);
+    }
+    l.push(`This bot — today: ${plural(k.today.credits, 'credit')} · month: ${plural(k.month.credits, 'credit')} (${plural(k.month.calls, 'call')})`);
+    if (k.month.credits > 0) {
+      l.push(`• What: ${breakdown(Object.fromEntries(Object.entries(k.month.byKind).map(([a, b]) => [a, b.credits])), (x) => KIND_LABEL[x] ?? x)}`);
+      l.push(`• League: ${breakdown(k.month.byLeague, leagueName)}`);
+      l.push(`• Why: ${breakdown(k.month.byPurpose, (x) => PURPOSE_LABEL[x] ?? x)}`);
+    }
+    blocks.push(l.join('\n'));
+  }
+
+  blocks.push('');
+  const tail: string[] = [];
+  if (o.remaining !== null) tail.push(`*All keys:* ${num(o.remaining)}${o.quota ? ` of ${num(o.quota)}` : ''} credits left${o.used !== null ? `, ${num(o.used)} used` : ''}`);
+  if (o.ratePerDay !== null) tail.push(`Pace: ~${num(o.ratePerDay)} credits/day${o.runOutAt && o.willRunOutBeforeReset ? ` → ⚠️ empty around ${shortDate(o.runOutAt)}` : ' → fine until the reset'}`);
+  tail.push(`Credits reset on ${shortDate(r.nextReset)} (assumed 00:00 UTC) · per-match fetches stop on a key at ${o.reserve} left`);
+  blocks.push(tail.join('\n'));
+  return blocks.join('\n');
+}
+
+function fdText(r: UsageReport): string {
+  const f = r.fd;
+  const blocks: string[] = [`⚽ *football-data.org — per token*`, `_${formatStamp(r.generatedAt)} WAT · limit ${f.limitPerMinute} calls/min per token_`];
+  for (const t of f.tokens) {
+    const status = t.status === 'cooling' ? `⏳ resting ${t.cooldownSeconds}s` : t.status === 'unused' ? '⚪ not used yet' : '✅ ready';
+    const l: string[] = ['', `*Token ${t.index}* (${t.tag}) ${status}`];
+    // The API's own "calls left this minute" is only meaningful for the minute it was read in.
+    const api = t.availableThisMinute !== null && t.availableAt && r.generatedAt - t.availableAt < 60_000 ? ` · API says ${t.availableThisMinute} left (${ago(t.availableAt, r.generatedAt)})` : '';
+    l.push(`Last minute: ${t.callsLastMinute} of ${f.limitPerMinute}${api}`);
+    l.push(`Today: ${plural(t.today.calls, 'call')} · peak ${t.today.peakPerMinute}/min · ${t.today.rateLimited} rate-limited${t.today.forbidden ? ` · ${t.today.forbidden} forbidden` : ''}${t.today.errors ? ` · ${t.today.errors} errors` : ''}`);
+    l.push(`Month: ${plural(t.month.calls, 'call')} · ${t.month.rateLimited} rate-limited`);
+    l.push(`Last call: ${ago(t.lastCallAt, r.generatedAt)}${t.lastStatus ? ` (status ${t.lastStatus})` : ''}`);
+    if (t.month.calls > 0) l.push(`• Busiest: ${breakdown(t.month.byEndpoint, (x) => x).split(' · ').slice(0, 5).join(' · ')}`);
+    blocks.push(l.join('\n'));
+  }
+  blocks.push('', `All tokens — last minute: ${f.callsLastMinute} of ${f.limitPerMinute * f.tokens.length} · today ${num(f.today.calls)} · month ${num(f.month.calls)}`);
+  return blocks.join('\n');
+}
+
+function historyText(r: UsageReport): string {
+  const pad = (v: string | number, w: number): string => String(v).padStart(w);
+  const rows = r.history.map((h) => {
+    const label = new Date(`${h.date}T00:00:00Z`);
+    const date = `${String(label.getUTCDate()).padStart(2, ' ')} ${MONTH_NAMES[label.getUTCMonth()].slice(0, 3)}`;
+    return `${date}  ${pad(h.oddsCredits, 7)}  ${pad(h.oddsCalls, 5)}  ${pad(h.fdCalls, 6)}  ${pad(h.fdRateLimited, 4)}`;
+  });
+  const total = r.history.reduce((a, h) => ({ c: a.c + h.oddsCredits, k: a.k + h.oddsCalls, f: a.f + h.fdCalls, l: a.l + h.fdRateLimited }), { c: 0, k: 0, f: 0, l: 0 });
+  return (
+    `📅 *Last 14 days*\n_Days are UTC · Odds API = this bot's calls and credits_\n\n` +
+    '```\n' +
+    `Day      Credits  Calls  FD-calls  429s\n` +
+    rows.join('\n') +
+    `\nTotal   ${pad(total.c, 7)}  ${pad(total.k, 5)}  ${pad(total.f, 6)}  ${pad(total.l, 4)}\n` +
+    '```'
+  );
+}
+
+async function sendStatsPage(sock: any, message: any, chatId: string, channelInfo: any, page: string) {
+  const report = await getUsageReport();
+  const text = page === 'odds' ? oddsText(report) : page === 'fd' ? fdText(report) : page === 'history' ? historyText(report) : overviewText(report);
+  await sock.sendMessage(chatId, { text, ...channelInfo }, { quoted: message });
+}
+
+async function runAdminStats(sock: any, message: any, chatId: string, userId: string, channelInfo: any) {
+  const pick = await promptMenu(sock, message, chatId, userId, {
+    title: '📊 API usage',
+    text: 'Owner dashboard — what do you want to see?',
+    options: [
+      { label: '📊 Overview', value: 'overview', description: 'Both APIs at a glance' },
+      { label: '🎯 Odds API keys', value: 'odds', description: 'Credits per key, pace, where they went' },
+      { label: '⚽ football-data tokens', value: 'fd', description: 'Calls vs the 10/min limit' },
+      { label: '📅 Last 14 days', value: 'history', description: 'Daily usage' },
+    ],
+    cancelLabel: 'Exit',
+  });
+  if (pick.cancelled || pick.timedOut || !pick.value) return;
+
+  try {
+    await sendStatsPage(sock, message, chatId, channelInfo, pick.value);
+  } catch (err) {
+    console.error('[sportybet] stats failed:', err);
+    await sock.sendMessage(chatId, { text: '⚠️ Could not build the usage report right now.', ...channelInfo }, { quoted: message });
+    return;
+  }
+  return runAdminStats(sock, message, chatId, userId, channelInfo); // back to the menu for the next page
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Entry point — the only screen with an Exit button; everywhere deeper uses Back.
 // ─────────────────────────────────────────────────────────────────────────
@@ -1156,6 +1476,23 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     return;
   }
 
+  // Owner dashboard. `.sportybet stats` opens the menu; `.sportybet stats odds|fd|history|overview` jumps to a page.
+  if (shortcut === 'stats' || shortcut === 'usage') {
+    if (!(await isStatsAdmin(sock, senderId, chatId))) {
+      await sock.sendMessage(chatId, { text: '🔒 The usage dashboard is for the bot owner.', ...channelInfo }, { quoted: message });
+      return;
+    }
+    const page = (args[1] || '').toLowerCase();
+    if (['overview', 'odds', 'fd', 'history'].includes(page)) {
+      try {
+        return await sendStatsPage(sock, message, chatId, channelInfo, page);
+      } catch (err) {
+        console.error('[sportybet] stats failed:', err);
+        return sock.sendMessage(chatId, { text: '⚠️ Could not build the usage report right now.', ...channelInfo }, { quoted: message });
+      }
+    }
+    return runAdminStats(sock, message, chatId, userId, channelInfo);
+  }
   // `.sportybet load K7M2QX`, `.sportybet code K7M2QX`, or just `.sportybet K7M2QX`
   if (['load', 'code', 'booking', 'book'].includes(shortcut)) {
     const outcome = await runLoadBookingCode(sock, message, chatId, userId, channelInfo, args.slice(1).join(' '));
