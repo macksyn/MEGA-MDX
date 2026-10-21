@@ -295,6 +295,164 @@ function withCouponLock<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Usage ledger — what every API call cost, for the owner's dashboard
+//
+// One record per calendar month ('month:2026-10') holding one entry per day, with per-key counters.
+// The Odds API's credits reset on the 1st (we assume 00:00 UTC), so months line up with the quota,
+// and days are UTC days. Counters are updated in memory and written out ~1.5s later in one go;
+// a crash can lose that last second of statistics but never an API call. Keys are only ever
+// stored as a one-way hash.
+// ─────────────────────────────────────────────────────────────────────────
+
+const usageTable = root.table!('usageStats'); // 'month:YYYY-MM' -> MonthStats
+
+export interface OddsDay {
+  calls: number;
+  credits: number;
+  errors: number;
+  byKind: Record<string, { calls: number; credits: number }>; // bulk | event_core | event_extra
+  byLeague: Record<string, number>; // credits
+  byPurpose: Record<string, number>; // credits
+}
+export interface FdDay {
+  calls: number;
+  rateLimited: number;
+  forbidden: number;
+  errors: number;
+  peakPerMinute: number;
+  byEndpoint: Record<string, number>;
+}
+interface DayStats {
+  odds: Record<string, OddsDay>; // by hashed key
+  fd: Record<string, FdDay>; // by hashed token
+  cacheHits: Record<string, number>; // bulk | event_core | event_extra
+}
+interface MonthStats {
+  month: string;
+  days: Record<string, DayStats>; // 'DD'
+}
+
+const monthStatsLoading = new Map<string, Promise<MonthStats>>();
+const dirtyUsageMonths = new Set<string>();
+let usageFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let usageWriteTail: Promise<unknown> = Promise.resolve();
+
+const pad2 = (n: number): string => String(n).padStart(2, '0');
+const monthKeyOf = (ts: number): string => {
+  const d = new Date(ts);
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}`;
+};
+/** 00:00 UTC on the 1st of the month `ts` falls in — when The Odds API's monthly credits start over. */
+const monthStartOf = (ts: number): number => {
+  const d = new Date(ts);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
+};
+const nextMonthStartOf = (ts: number): number => {
+  const d = new Date(ts);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
+};
+
+/**
+ * Loads a month's record once and keeps it. A FAILED read throws (and isn't remembered): starting from an
+ * empty record after a store hiccup would later overwrite the real history with a near-empty month.
+ */
+function getMonthStats(month: string): Promise<MonthStats> {
+  let p = monthStatsLoading.get(month);
+  if (!p) {
+    p = (async () => {
+      const stored = (await usageTable.get(`month:${month}`)) as MonthStats | null | undefined;
+      return stored && stored.days ? stored : { month, days: {} };
+    })();
+    p.catch(() => monthStatsLoading.delete(month));
+    monthStatsLoading.set(month, p);
+  }
+  return p;
+}
+
+/** Applies a change to today's counters. Never throws — statistics must never break an API call. */
+async function mutateToday(change: (day: DayStats) => void): Promise<void> {
+  try {
+    const now = Date.now();
+    const month = monthKeyOf(now);
+    const stats = await getMonthStats(month);
+    const dd = pad2(new Date(now).getUTCDate());
+    const day = (stats.days[dd] ??= { odds: {}, fd: {}, cacheHits: {} });
+    change(day); // no await between loading and changing: nothing can interleave
+    dirtyUsageMonths.add(month);
+    if (!usageFlushTimer) {
+      usageFlushTimer = setTimeout(() => {
+        usageFlushTimer = null;
+        void flushUsageStats();
+      }, 1500);
+      (usageFlushTimer as { unref?: () => void }).unref?.();
+    }
+  } catch (err) {
+    console.warn('[sportybet] usage stats not recorded:', err instanceof Error ? err.message : err);
+  }
+}
+
+/** Writes any pending statistics now (the dashboard calls this so it never shows stale numbers). */
+export function flushUsageStats(): Promise<void> {
+  const months = [...dirtyUsageMonths];
+  dirtyUsageMonths.clear();
+  usageWriteTail = usageWriteTail.then(async () => {
+    for (const month of months) {
+      try {
+        await usageTable.set(`month:${month}`, await getMonthStats(month));
+      } catch (err) {
+        dirtyUsageMonths.add(month); // try again with the next flush
+        console.error('[sportybet] could not save usage stats:', err instanceof Error ? err.message : err);
+      }
+    }
+  });
+  return usageWriteTail.then(() => undefined);
+}
+
+const emptyOddsDay = (): OddsDay => ({ calls: 0, credits: 0, errors: 0, byKind: {}, byLeague: {}, byPurpose: {} });
+const emptyFdDay = (): FdDay => ({ calls: 0, rateLimited: 0, forbidden: 0, errors: 0, peakPerMinute: 0, byEndpoint: {} });
+
+interface OddsCallMeta {
+  kind: 'bulk' | 'event_core' | 'event_extra';
+  league: LeagueId;
+  purpose: Purpose;
+}
+
+function recordOddsStat(keyHash: string, meta: OddsCallMeta, ok: boolean, cost: number): Promise<void> {
+  return mutateToday((day) => {
+    const d = (day.odds[keyHash] ??= emptyOddsDay());
+    d.calls++;
+    d.credits += cost;
+    if (!ok) d.errors++;
+    const k = (d.byKind[meta.kind] ??= { calls: 0, credits: 0 });
+    k.calls++;
+    k.credits += cost;
+    d.byLeague[meta.league] = (d.byLeague[meta.league] ?? 0) + cost;
+    d.byPurpose[meta.purpose] = (d.byPurpose[meta.purpose] ?? 0) + cost;
+  });
+}
+
+function recordFdStat(tokenHash: string, endpoint: string, status: number, perMinuteNow: number): Promise<void> {
+  return mutateToday((day) => {
+    const d = (day.fd[tokenHash] ??= emptyFdDay());
+    d.calls++;
+    if (status === 429) d.rateLimited++;
+    else if (status === 403) d.forbidden++;
+    else if (status >= 400) d.errors++;
+    d.peakPerMinute = Math.max(d.peakPerMinute, perMinuteNow);
+    d.byEndpoint[endpoint] = (d.byEndpoint[endpoint] ?? 0) + 1;
+  });
+}
+
+/** A cache hit on odds data = a request (and its credits) that never had to be made. */
+function recordCacheHit(cacheKey: string): Promise<void> {
+  const kind = cacheKey.startsWith('bulk') ? 'bulk' : cacheKey.endsWith('_extra') ? 'event_extra' : cacheKey.endsWith('_core') ? 'event_core' : null;
+  if (!kind) return Promise.resolve();
+  return mutateToday((day) => {
+    day.cacheHits[kind] = (day.cacheHits[kind] ?? 0) + 1;
+  });
+}
+
 const MAX_COUPONS_PER_USER = 100;
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -333,8 +491,26 @@ async function cached<T>(key: string, ttlMs: number, fetcher: () => Promise<T>):
 // football-data.org client — fixtures & results
 // ─────────────────────────────────────────────────────────────────────────
 
+/** football-data.org's free tier: this many requests per minute, per token. */
+export const FD_LIMIT_PER_MINUTE = 10;
+
 const fdCooldownUntil = new Map<string, number>(); // token -> epoch ms it's rate-limited until
+const fdWindow = new Map<string, number[]>(); // token -> timestamps of its calls in the last minute
+interface FdReading {
+  lastCallAt: number;
+  lastStatus: number;
+  availableThisMinute: number | null; // straight from the API's own header
+  availableAt: number | null;
+}
+const fdReading = new Map<string, FdReading>();
 let fdNext = 0;
+
+/** '/competitions/PL/matches?status=SCHEDULED' -> 'PL upcoming'; '/competitions/PL/matches' -> 'PL season'. */
+function fdEndpointLabel(path: string): string {
+  const m = path.match(/^\/competitions\/([A-Z0-9]+)\/matches(\?.*)?$/);
+  if (!m) return path.split('?')[0];
+  return `${m[1]} ${m[2]?.includes('status=SCHEDULED') ? 'upcoming' : 'season'}`;
+}
 
 async function footballDataGet<T>(path: string): Promise<T> {
   const tokens = FOOTBALL_DATA_TOKENS.length ? FOOTBALL_DATA_TOKENS : ['']; // no token = football-data's anonymous tier
@@ -343,16 +519,32 @@ async function footballDataGet<T>(path: string): Promise<T> {
 
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[(start + i) % tokens.length];
-    // Skip a token that's cooling down after a 429 — unless it's the only one left to try.
+    // Skip a token that's cooling down — unless it's the only one left to try.
     if ((fdCooldownUntil.get(token) ?? 0) > Date.now() && i < tokens.length - 1) continue;
 
-    const res = await fetch(`${FOOTBALL_DATA_BASE}${path}`, { headers: { 'X-Auth-Token': token } });
-    if (res.ok) return (await res.json()) as T;
+    const calledAt = Date.now();
+    const recent = (fdWindow.get(token) ?? []).filter((t) => calledAt - t < 60_000);
+    recent.push(calledAt);
+    fdWindow.set(token, recent);
 
+    const res = await fetch(`${FOOTBALL_DATA_BASE}${path}`, { headers: { 'X-Auth-Token': token } });
     lastStatus = res.status;
+
+    // The API reports how many calls this token has left in the current minute, and when that resets.
+    const availableHeader = res.headers.get('x-requests-available-minute');
+    const available = availableHeader !== null && availableHeader.trim() !== '' && Number.isFinite(Number(availableHeader)) ? Number(availableHeader) : null;
+    const resetHeader = res.headers.get('x-requestcounter-reset') ?? res.headers.get('retry-after');
+    const resetSeconds = resetHeader !== null && Number(resetHeader) > 0 ? Number(resetHeader) : null;
+    fdReading.set(token, { lastCallAt: calledAt, lastStatus: res.status, availableThisMinute: available, availableAt: available !== null ? calledAt : (fdReading.get(token)?.availableAt ?? null) });
+    void recordFdStat(oddsKeyId(token), fdEndpointLabel(path), res.status, recent.length);
+
+    if (res.ok) {
+      if (available === 0) fdCooldownUntil.set(token, Date.now() + (resetSeconds ?? 60) * 1000); // used the last call of the minute: rest instead of earning a 429
+      return (await res.json()) as T;
+    }
+
     if (res.status === 429) {
-      // football-data says how many seconds until the per-minute window resets
-      const wait = Number(res.headers.get('x-requestcounter-reset') ?? res.headers.get('retry-after')) || 60;
+      const wait = resetSeconds ?? 60;
       fdCooldownUntil.set(token, Date.now() + wait * 1000);
       console.warn(`[sportybet] football-data token ${keyTag(token)} rate-limited for ${wait}s — trying the next token`);
       continue;
@@ -480,9 +672,13 @@ interface CacheEntry {
   at?: number; // when it was fetched (older entries: expiresAt - the ttl it was written with)
 }
 
+/** Why an odds fetch happens — only used to break the owner's credit statistics down. */
+export type Purpose = 'betting' | 'cashout' | 'booking';
+
 /** Optional per-call freshness: treat a cached value older than maxAgeMs as missing, even if its normal ttl hasn't run out. */
 interface FreshnessOpts {
   maxAgeMs?: number;
+  purpose?: Purpose;
 }
 
 const inflight = new Map<string, Promise<any>>();
@@ -515,7 +711,10 @@ async function persistentCached<T>(key: string, ttlMs: number, fetcher: () => Pr
   if (running) return running as Promise<T>;
 
   const hit = await peekPersisted<T>(key, { maxAgeMs: opts.maxAgeMs, ttlMs });
-  if (hit !== null) return hit;
+  if (hit !== null) {
+    void recordCacheHit(key); // a credit-spending call that didn't have to happen
+    return hit;
+  }
 
   const raced = inflight.get(key); // another caller may have started while we awaited the store
   if (raced) return raced as Promise<T>;
@@ -543,7 +742,9 @@ async function persistentCached<T>(key: string, ttlMs: number, fetcher: () => Pr
 
 interface OddsKeyState {
   remaining?: number;
-  at?: number; // when `remaining` was last read
+  used?: number; // credits this key has used this month, as reported by the API itself
+  at?: number; // when `remaining` / `used` were last read
+  lastCall?: { at: number; label: string; cost: number | null; ok: boolean };
   disabled?: boolean; // rejected as invalid this run — skipped until the bot restarts
 }
 
@@ -555,8 +756,8 @@ async function loadOddsKeyState(key: string): Promise<OddsKeyState> {
   if (st) return st;
   st = {};
   try {
-    const stored = (await oddsMetaTable.get(`usage_${oddsKeyId(key)}`)) as { remaining?: number; at?: number } | null | undefined;
-    if (stored && typeof stored.remaining === 'number') st = { remaining: stored.remaining, at: stored.at };
+    const stored = (await oddsMetaTable.get(`usage_${oddsKeyId(key)}`)) as Partial<OddsKeyState> | null | undefined;
+    if (stored && typeof stored.remaining === 'number') st = { remaining: stored.remaining, used: stored.used, at: stored.at, lastCall: stored.lastCall };
   } catch {
     /* no record yet — unknown */
   }
@@ -564,39 +765,56 @@ async function loadOddsKeyState(key: string): Promise<OddsKeyState> {
   return st;
 }
 
-/** Credits left on one key, or null if unknown / too old to trust (a new month may have reset it). */
+/**
+ * Credits left on one key, or null if unknown. The Odds API's credits start over on the 1st of each month, so a
+ * reading from a previous month counts for nothing — that's how a drained key gets used again the moment it resets.
+ * A key at or below the reserve is also re-checked every few hours (a failed check costs nothing).
+ */
 async function oddsKeyRemaining(key: string): Promise<number | null> {
   const st = await loadOddsKeyState(key);
   if (typeof st.remaining !== 'number') return null;
-  // A nearly-empty key is re-probed daily (a failed probe is free); a healthy one weekly.
-  const staleAfter = st.remaining <= ODDS_CREDIT_RESERVE ? 24 * 60 * 60_000 : 7 * 24 * 60 * 60_000;
-  if (st.at && Date.now() - st.at > staleAfter) return null;
+  if (st.at !== undefined) {
+    if (st.at < monthStartOf(Date.now())) return null;
+    if (st.remaining <= ODDS_CREDIT_RESERVE && Date.now() - st.at > 6 * 60 * 60_000) return null;
+  }
   return st.remaining;
 }
 
-async function setOddsKeyRemaining(key: string, remaining: number): Promise<void> {
+async function setOddsKeyRemaining(key: string, remaining: number, used?: number): Promise<void> {
   const st = await loadOddsKeyState(key);
   st.remaining = remaining;
+  if (used !== undefined) st.used = used;
   st.at = Date.now();
+  await persistOddsKeyState(key, st);
+}
+
+async function persistOddsKeyState(key: string, st: OddsKeyState): Promise<void> {
   try {
-    await oddsMetaTable.set(`usage_${oddsKeyId(key)}`, { remaining, at: st.at });
+    await oddsMetaTable.set(`usage_${oddsKeyId(key)}`, { remaining: st.remaining, used: st.used, at: st.at, lastCall: st.lastCall });
   } catch {
     /* best effort */
   }
 }
 
 /** Reads The Odds API's own usage headers after every call, logs the real cost, and remembers what's left on THAT key. */
-async function recordUsage(res: Response, label: string, key: string): Promise<void> {
-  const rawRemaining = res.headers.get('x-requests-remaining');
-  const rawLast = res.headers.get('x-requests-last');
-  // Number(null) is 0 — only trust a header that is actually present.
-  const remaining = rawRemaining !== null && rawRemaining.trim() !== '' ? Number(rawRemaining) : NaN;
-  const last = rawLast !== null && rawLast.trim() !== '' ? Number(rawLast) : NaN;
+async function recordUsage(res: Response, label: string, key: string, meta: OddsCallMeta): Promise<void> {
+  const num = (name: string): number => {
+    const raw = res.headers.get(name);
+    return raw !== null && raw.trim() !== '' ? Number(raw) : NaN; // Number(null) is 0 — only trust a header that is actually present
+  };
+  const remaining = num('x-requests-remaining');
+  const used = num('x-requests-used');
+  const last = num('x-requests-last');
 
-  if (Number.isFinite(remaining)) await setOddsKeyRemaining(key, remaining);
+  const st = await loadOddsKeyState(key);
+  st.lastCall = { at: Date.now(), label: `${meta.kind} ${meta.league}`, cost: Number.isFinite(last) ? last : null, ok: res.ok }; // "bulk PL" — the dashboard words it
+  if (Number.isFinite(remaining)) await setOddsKeyRemaining(key, remaining, Number.isFinite(used) ? used : undefined);
+  else await persistOddsKeyState(key, st);
+
   console.log(
     `[sportybet] odds-api ${label} [key ${keyTag(key)}]: cost=${Number.isFinite(last) ? last : '?'} remaining=${Number.isFinite(remaining) ? remaining : '?'}`
   );
+  void recordOddsStat(oddsKeyId(key), meta, res.ok, Number.isFinite(last) ? last : 0);
 }
 
 export class CreditBudgetError extends Error {
@@ -658,7 +876,7 @@ async function classifyOddsFailure(res: Response, key: string): Promise<'next' |
  * the next one when a key is out of credits, invalid or rate-limited. Returns the final Response —
  * callers still check `res.ok` for errors that no key can fix.
  */
-async function oddsApiFetch(path: string, query: string, label: string, opts: { worstCaseCost: number; respectReserve: boolean }): Promise<Response> {
+async function oddsApiFetch(path: string, query: string, label: string, opts: { worstCaseCost: number; respectReserve: boolean; meta: OddsCallMeta }): Promise<Response> {
   if (!ODDS_API_KEYS.length) throw new Error('No Odds API key configured — set ODDS_API_KEY in the environment');
 
   const keys = await eligibleOddsKeys(opts.worstCaseCost, opts.respectReserve);
@@ -671,21 +889,22 @@ async function oddsApiFetch(path: string, query: string, label: string, opts: { 
   let last: Response | null = null;
   for (const key of keys) {
     const res = await fetch(`${ODDS_API_BASE}${path}?${query}&apiKey=${key}`);
-    await recordUsage(res, label, key);
+    await recordUsage(res, label, key, opts.meta);
     if (res.ok) return res;
     last = res;
     if ((await classifyOddsFailure(res, key)) === 'fatal') return res;
   }
-  return last!; // every key failed in a way another key could have fixed — the caller reports the last status
+  throw new Error(`The Odds API: all ${keys.length} key(s) failed — out of credits, rejected or rate-limited (last status ${last?.status ?? '?'})`);
 }
 
 // ── Bulk h2h (1 credit) ──────────────────────────────────────────────────
 
-async function fetchOddsApiEvents(markets: string, league: LeagueId): Promise<OddsApiEvent[]> {
+async function fetchOddsApiEvents(markets: string, league: LeagueId, purpose: Purpose): Promise<OddsApiEvent[]> {
   const sportKey = getLeague(league).oddsSportKey;
   const res = await oddsApiFetch(`/sports/${sportKey}/odds/`, `regions=uk&markets=${markets}&oddsFormat=decimal`, `bulk ${sportKey} ${markets}`, {
     worstCaseCost: 1, // h2h x 1 region
     respectReserve: false,
+    meta: { kind: 'bulk', league, purpose },
   });
   if (!res.ok) throw new Error(`The Odds API responded ${res.status}`);
   return (await res.json()) as OddsApiEvent[];
@@ -696,7 +915,7 @@ export async function fetchOddsTips(league: LeagueId = DEFAULT_LEAGUE, opts: Fre
   // The Premier League keeps its original cache key so a restart right after this upgrade doesn't re-buy fresh odds.
   const cacheKey = league === DEFAULT_LEAGUE ? 'bulk_h2h' : `bulk_h2h_${league}`;
   return persistentCached<OddsTip[]>(cacheKey, ODDS_CACHE_TTL_MS, async () => {
-    const events = await fetchOddsApiEvents('h2h', league);
+    const events = await fetchOddsApiEvents('h2h', league, opts.purpose ?? 'betting');
     return events.map((ev): OddsTip => {
       const bestH2h = new Map<string, number>(); // outcome name -> best price seen
       let bookmakerCount = 0;
@@ -978,7 +1197,7 @@ async function fetchEventBundle(eventId: string, keys: readonly string[], tag: '
       `/sports/${getLeague(league).oddsSportKey}/events/${eventId}/odds/`,
       `regions=uk&markets=${keys.join(',')}&oddsFormat=decimal`,
       `event ${eventId} ${tag}`,
-      { worstCaseCost: keys.length, respectReserve: true } // worst case: every requested market comes back
+      { worstCaseCost: keys.length, respectReserve: true, meta: { kind: tag === 'core' ? 'event_core' : 'event_extra', league, purpose: opts.purpose ?? 'betting' } } // worst case: every requested market comes back
     );
     if (!res.ok) throw new Error(`The Odds API event odds (${tag}) responded ${res.status}`);
     const ev = (await res.json()) as OddsApiEvent;
@@ -1566,7 +1785,7 @@ type LegPrice =
  * The live price of one selection, plus every sibling price in its market (cash out needs those to strip the
  * bookmaker's margin). Pass maxAgeMs to refuse cached prices older than that and buy fresh ones instead.
  */
-async function lookupLegPrice(leg: BookingLeg, joined: FixtureWithOdds[], ctx: PriceContext, maxAgeMs?: number): Promise<LegPrice> {
+async function lookupLegPrice(leg: BookingLeg, joined: FixtureWithOdds[], ctx: PriceContext, purpose: Purpose, maxAgeMs?: number): Promise<LegPrice> {
   const home = normalizeTeamName(leg.homeTeam);
   const away = normalizeTeamName(leg.awayTeam);
 
@@ -1581,13 +1800,13 @@ async function lookupLegPrice(leg: BookingLeg, joined: FixtureWithOdds[], ctx: P
     if (!fixture.eventId) return { ok: false, reason: 'market_unavailable' };
     try {
       const id = fixture.eventId;
-      if (!ctx.marketsByEvent.has(id)) ctx.marketsByEvent.set(id, await fetchCoreMarkets(id, fixture.league, { maxAgeMs })); // normally cached 24h — the first loader pays, everyone after is free
+      if (!ctx.marketsByEvent.has(id)) ctx.marketsByEvent.set(id, await fetchCoreMarkets(id, fixture.league, { maxAgeMs, purpose })); // normally cached 24h — the first loader pays, everyone after is free
       em = ctx.marketsByEvent.get(id)!;
       if (EXTRA_ONLY_MARKETS.includes(leg.market) && !ctx.extraLoaded.has(id)) {
         const extra =
           maxAgeMs === undefined
-            ? ((await getCachedExtraMarkets(id)) ?? (await fetchExtraMarkets(id, fixture.league)))
-            : await fetchExtraMarkets(id, fixture.league, { maxAgeMs });
+            ? ((await getCachedExtraMarkets(id)) ?? (await fetchExtraMarkets(id, fixture.league, { purpose })))
+            : await fetchExtraMarkets(id, fixture.league, { maxAgeMs, purpose });
         em = { ...em, ...extra };
         ctx.marketsByEvent.set(id, em);
         ctx.extraLoaded.add(id);
@@ -1620,7 +1839,7 @@ export async function repriceBookingLegs(legs: BookingLeg[], joined: FixtureWith
     if (seenMatches.has(matchKey)) continue; // a coupon holds one leg per match
     seenMatches.add(matchKey);
 
-    const priced = await lookupLegPrice(leg, joined, ctx);
+    const priced = await lookupLegPrice(leg, joined, ctx, 'booking');
     if (!priced.ok) {
       dropped.push({ leg, reason: priced.reason });
       continue;
@@ -1779,7 +1998,7 @@ export async function getCashOutQuote(coupon: Coupon): Promise<CashOutQuoteResul
   try {
     const perLeague = await Promise.all(
       leagues.map(async (league) => {
-        const [fixtures, tips] = await Promise.all([fetchUpcomingFixtures(league), fetchOddsTips(league, { maxAgeMs: CASHOUT_BULK_MAX_AGE_MS })]);
+        const [fixtures, tips] = await Promise.all([fetchUpcomingFixtures(league), fetchOddsTips(league, { maxAgeMs: CASHOUT_BULK_MAX_AGE_MS, purpose: 'cashout' })]);
         return joinFixturesWithOdds(fixtures, tips, league);
       })
     );
@@ -1793,7 +2012,7 @@ export async function getCashOutQuote(coupon: Coupon): Promise<CashOutQuoteResul
   const qByLeg = new Map<string, number>();
   const pending: CashOutQuote['pending'] = [];
   for (const leg of pendingLegs) {
-    const priced = await lookupLegPrice(toBookingLeg(leg), joined, ctx, CASHOUT_EVENT_MAX_AGE_MS);
+    const priced = await lookupLegPrice(toBookingLeg(leg), joined, ctx, 'cashout', CASHOUT_EVENT_MAX_AGE_MS);
     if (!priced.ok) return { available: false, reason: 'prices_unavailable' };
     qByLeg.set(leg.id, noVigProbability(leg.market, priced.option, priced.options));
     pending.push({ leg, nowOdds: priced.option.odds });
@@ -1875,6 +2094,237 @@ export async function cashOutCoupon(userId: string, couponId: string, quote: Cas
 
     return { success: true, amount: quote.amount, coupon };
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Usage report — the owner's view of both APIs
+// ─────────────────────────────────────────────────────────────────────────
+
+export interface OddsKeyReport {
+  index: number; // 1-based, in the order the keys are listed in the environment
+  tag: string; // "…1111"
+  status: 'active' | 'low' | 'exhausted' | 'disabled' | 'unused';
+  remaining: number | null;
+  used: number | null;
+  quota: number | null; // used + remaining, when both are known
+  asOf: number | null; // when the balance was last read from the API
+  lastCall: { at: number; label: string; cost: number | null; ok: boolean } | null;
+  today: OddsDay;
+  month: OddsDay;
+}
+
+export interface FdTokenReport {
+  index: number;
+  tag: string;
+  status: 'ready' | 'cooling' | 'unused';
+  cooldownSeconds: number;
+  callsLastMinute: number; // counted by this bot, right now
+  availableThisMinute: number | null; // the API's own figure, as of availableAt
+  availableAt: number | null;
+  lastCallAt: number | null;
+  lastStatus: number | null;
+  today: FdDay;
+  month: FdDay;
+}
+
+export interface UsageReport {
+  generatedAt: number;
+  monthStart: number;
+  nextReset: number;
+  odds: {
+    configured: number;
+    keys: OddsKeyReport[];
+    remaining: number | null; // across keys that have a reading this month
+    used: number | null;
+    quota: number | null;
+    reserve: number;
+    ratePerDay: number | null; // credits/day this month, from the API's own "used" counters
+    runOutAt: number | null;
+    willRunOutBeforeReset: boolean;
+    roughEstimate: boolean; // too early in the month for the pace to mean much
+    today: OddsDay;
+    month: OddsDay;
+    cacheHitsMonth: Record<string, number>;
+    cacheSavedEstimate: number;
+  };
+  fd: {
+    configured: number;
+    tokens: FdTokenReport[];
+    limitPerMinute: number;
+    callsLastMinute: number;
+    today: FdDay;
+    month: FdDay;
+  };
+  /** The last 14 UTC days, newest first. */
+  history: { date: string; oddsCredits: number; oddsCalls: number; fdCalls: number; fdRateLimited: number }[];
+}
+
+function addOddsDay(into: OddsDay, d: OddsDay): void {
+  into.calls += d.calls;
+  into.credits += d.credits;
+  into.errors += d.errors;
+  for (const [k, v] of Object.entries(d.byKind)) {
+    const t = (into.byKind[k] ??= { calls: 0, credits: 0 });
+    t.calls += v.calls;
+    t.credits += v.credits;
+  }
+  for (const [k, v] of Object.entries(d.byLeague)) into.byLeague[k] = (into.byLeague[k] ?? 0) + v;
+  for (const [k, v] of Object.entries(d.byPurpose)) into.byPurpose[k] = (into.byPurpose[k] ?? 0) + v;
+}
+
+function addFdDay(into: FdDay, d: FdDay): void {
+  into.calls += d.calls;
+  into.rateLimited += d.rateLimited;
+  into.forbidden += d.forbidden;
+  into.errors += d.errors;
+  into.peakPerMinute = Math.max(into.peakPerMinute, d.peakPerMinute);
+  for (const [k, v] of Object.entries(d.byEndpoint)) into.byEndpoint[k] = (into.byEndpoint[k] ?? 0) + v;
+}
+
+export async function getUsageReport(): Promise<UsageReport> {
+  await flushUsageStats();
+  const now = Date.now();
+  const monthStart = monthStartOf(now);
+  const thisMonth = await getMonthStats(monthKeyOf(now));
+  const todayKey = pad2(new Date(now).getUTCDate());
+  const todayStats = thisMonth.days[todayKey];
+
+  // ── The Odds API ──
+  const keys: OddsKeyReport[] = [];
+  for (let i = 0; i < ODDS_API_KEYS.length; i++) {
+    const key = ODDS_API_KEYS[i];
+    const id = oddsKeyId(key);
+    const st = await loadOddsKeyState(key);
+    const remaining = await oddsKeyRemaining(key);
+    const sameMonth = st.at !== undefined && st.at >= monthStart;
+    const used = remaining !== null && sameMonth && typeof st.used === 'number' ? st.used : null;
+
+    const month = emptyOddsDay();
+    for (const day of Object.values(thisMonth.days)) if (day.odds[id]) addOddsDay(month, day.odds[id]);
+    const today = todayStats?.odds[id] ?? emptyOddsDay();
+
+    const status: OddsKeyReport['status'] = st.disabled ? 'disabled' : remaining === null ? 'unused' : remaining <= 0 ? 'exhausted' : remaining <= ODDS_CREDIT_RESERVE ? 'low' : 'active';
+    keys.push({
+      index: i + 1,
+      tag: keyTag(key),
+      status,
+      remaining,
+      used,
+      quota: remaining !== null && used !== null ? remaining + used : null,
+      asOf: st.at ?? null,
+      lastCall: st.lastCall ?? null,
+      today,
+      month,
+    });
+  }
+
+  const known = keys.filter((k) => k.remaining !== null);
+  const remainingTotal = known.length ? known.reduce((a, k) => a + (k.remaining ?? 0), 0) : null;
+  const withUsed = keys.filter((k) => k.used !== null);
+  const usedTotal = withUsed.length ? withUsed.reduce((a, k) => a + (k.used ?? 0), 0) : null;
+  const quotaKeys = keys.filter((k) => k.quota !== null);
+  const quotaTotal = quotaKeys.length ? quotaKeys.reduce((a, k) => a + (k.quota ?? 0), 0) : null;
+
+  const elapsedDays = (now - monthStart) / 86_400_000;
+  const ratePerDay = usedTotal !== null ? usedTotal / Math.max(elapsedDays, 1) : null; // the API's own counters, so it includes anything else using these keys
+  const runOutAt = ratePerDay && ratePerDay > 0 && remainingTotal !== null ? now + (remainingTotal / ratePerDay) * 86_400_000 : null;
+  const nextReset = nextMonthStartOf(now);
+
+  const oddsMonth = emptyOddsDay();
+  const oddsToday = emptyOddsDay();
+  for (const k of keys) {
+    addOddsDay(oddsMonth, k.month);
+    addOddsDay(oddsToday, k.today);
+  }
+  const cacheHitsMonth: Record<string, number> = {};
+  for (const day of Object.values(thisMonth.days)) for (const [k, v] of Object.entries(day.cacheHits)) cacheHitsMonth[k] = (cacheHitsMonth[k] ?? 0) + v;
+  // What those hits would have cost as fresh calls: 1 credit for the bulk list, ~5 for a core bundle, ~3 for the extras.
+  const cacheSavedEstimate = (cacheHitsMonth.bulk ?? 0) * 1 + (cacheHitsMonth.event_core ?? 0) * 5 + (cacheHitsMonth.event_extra ?? 0) * 3;
+
+  // ── football-data.org ──
+  const tokens: FdTokenReport[] = [];
+  const fdTokens = FOOTBALL_DATA_TOKENS.length ? FOOTBALL_DATA_TOKENS : [''];
+  for (let i = 0; i < fdTokens.length; i++) {
+    const token = fdTokens[i];
+    const id = oddsKeyId(token);
+    const reading = fdReading.get(token);
+    const cooldownSeconds = Math.max(0, Math.ceil(((fdCooldownUntil.get(token) ?? 0) - now) / 1000));
+    const month = emptyFdDay();
+    for (const day of Object.values(thisMonth.days)) if (day.fd[id]) addFdDay(month, day.fd[id]);
+    tokens.push({
+      index: i + 1,
+      tag: token ? keyTag(token) : '(none)',
+      status: cooldownSeconds > 0 ? 'cooling' : month.calls === 0 && !reading ? 'unused' : 'ready',
+      cooldownSeconds,
+      callsLastMinute: (fdWindow.get(token) ?? []).filter((t) => now - t < 60_000).length,
+      availableThisMinute: reading?.availableThisMinute ?? null,
+      availableAt: reading?.availableAt ?? null,
+      lastCallAt: reading?.lastCallAt ?? null,
+      lastStatus: reading?.lastStatus ?? null,
+      today: todayStats?.fd[id] ?? emptyFdDay(),
+      month,
+    });
+  }
+  const fdMonth = emptyFdDay();
+  const fdToday = emptyFdDay();
+  for (const t of tokens) {
+    addFdDay(fdMonth, t.month);
+    addFdDay(fdToday, t.today);
+  }
+
+  // ── last 14 days ──
+  const history: UsageReport['history'] = [];
+  for (let back = 0; back < 14; back++) {
+    const ts = now - back * 86_400_000;
+    let stats: MonthStats | null = null;
+    try {
+      stats = await getMonthStats(monthKeyOf(ts));
+    } catch {
+      /* month unreadable — show the day as empty rather than fail the whole report */
+    }
+    const day = stats?.days[pad2(new Date(ts).getUTCDate())];
+    const row = { date: new Date(ts).toISOString().slice(0, 10), oddsCredits: 0, oddsCalls: 0, fdCalls: 0, fdRateLimited: 0 };
+    for (const o of Object.values(day?.odds ?? {})) {
+      row.oddsCredits += o.credits;
+      row.oddsCalls += o.calls;
+    }
+    for (const f of Object.values(day?.fd ?? {})) {
+      row.fdCalls += f.calls;
+      row.fdRateLimited += f.rateLimited;
+    }
+    history.push(row);
+  }
+
+  return {
+    generatedAt: now,
+    monthStart,
+    nextReset,
+    odds: {
+      configured: ODDS_API_KEYS.length,
+      keys,
+      remaining: remainingTotal,
+      used: usedTotal,
+      quota: quotaTotal,
+      reserve: ODDS_CREDIT_RESERVE,
+      ratePerDay,
+      runOutAt,
+      willRunOutBeforeReset: runOutAt !== null && runOutAt < nextReset,
+      roughEstimate: elapsedDays < 3,
+      today: oddsToday,
+      month: oddsMonth,
+      cacheHitsMonth,
+      cacheSavedEstimate,
+    },
+    fd: {
+      configured: FOOTBALL_DATA_TOKENS.length,
+      tokens,
+      limitPerMinute: FD_LIMIT_PER_MINUTE,
+      callsLastMinute: tokens.reduce((a, t) => a + t.callsLastMinute, 0),
+      today: fdToday,
+      month: fdMonth,
+    },
+    history,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
