@@ -167,6 +167,8 @@ interface FootballDataMatch {
   id: number;
   /** Not part of football-data.org's payload — stamped on by our fetchers so every match knows its league. */
   league?: LeagueId;
+  /** 'REGULAR_SEASON' (domestic leagues), 'LEAGUE_STAGE' (Champions League phase 1), 'LAST_16'… for knockouts. */
+  stage?: string;
   utcDate: string; // ISO 8601 UTC
   status: string; // SCHEDULED | LIVE | IN_PLAY | PAUSED | FINISHED | POSTPONED | SUSPENDED | CANCELLED
   matchday: number;
@@ -477,13 +479,14 @@ export async function getReserveBalance(): Promise<number> {
 // upstream call per TTL window, not one each.
 // ─────────────────────────────────────────────────────────────────────────
 
-const cache = new Map<string, { value: any; expiresAt: number }>();
+const cache = new Map<string, CacheEntry>();
 
-async function cached<T>(key: string, ttlMs: number, fetcher: () => Promise<T>): Promise<T> {
+async function cached<T>(key: string, ttlMs: number, fetcher: () => Promise<T>, opts: { maxAgeMs?: number } = {}): Promise<T> {
   const hit = cache.get(key);
-  if (hit && hit.expiresAt > Date.now()) return hit.value as T;
+  const now = Date.now();
+  if (hit && hit.expiresAt > now && (opts.maxAgeMs === undefined || now - (hit.at ?? hit.expiresAt - ttlMs) <= opts.maxAgeMs)) return hit.value as T;
   const value = await fetcher();
-  cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+  cache.set(key, { value, expiresAt: Date.now() + ttlMs, at: Date.now() });
   return value;
 }
 
@@ -577,12 +580,17 @@ export async function fetchUpcomingFixtures(league: LeagueId = DEFAULT_LEAGUE): 
 }
 
 /** Full-season match list (past/live/scheduled) of ONE league. */
-export async function fetchAllSeasonMatches(league: LeagueId = DEFAULT_LEAGUE): Promise<FootballDataMatch[]> {
+export async function fetchAllSeasonMatches(league: LeagueId = DEFAULT_LEAGUE, opts: { maxAgeMs?: number } = {}): Promise<FootballDataMatch[]> {
   const info = getLeague(league);
-  return cached(`sportybet:season:${info.id}`, SEASON_MATCHES_CACHE_TTL_MS, async () => {
-    const data = await footballDataGet<FootballDataMatchesResponse>(`/competitions/${info.footballDataCode}/matches`);
-    return data.matches.filter(teamsKnown).map((m): FootballDataMatch => ({ ...m, league: info.id }));
-  });
+  return cached(
+    `sportybet:season:${info.id}`,
+    SEASON_MATCHES_CACHE_TTL_MS,
+    async () => {
+      const data = await footballDataGet<FootballDataMatchesResponse>(`/competitions/${info.footballDataCode}/matches`);
+      return data.matches.filter(teamsKnown).map((m): FootballDataMatch => ({ ...m, league: info.id }));
+    },
+    opts
+  );
 }
 
 /**
@@ -591,14 +599,15 @@ export async function fetchAllSeasonMatches(league: LeagueId = DEFAULT_LEAGUE): 
  * a plan that doesn't cover it) never blanks the others; it's logged and skipped.
  * Only throws when every league failed.
  */
-export async function fetchAllLeaguesSeasonMatches(): Promise<FootballDataMatch[]> {
-  const results = await Promise.allSettled(LEAGUES.map((l) => fetchAllSeasonMatches(l.id)));
+export async function fetchAllLeaguesSeasonMatches(opts: { maxAgeMs?: number; leagues?: readonly LeagueId[] } = {}): Promise<FootballDataMatch[]> {
+  const wanted = LEAGUES.filter((l) => !opts.leagues || opts.leagues.includes(l.id));
+  const results = await Promise.allSettled(wanted.map((l) => fetchAllSeasonMatches(l.id, { maxAgeMs: opts.maxAgeMs })));
   const out: FootballDataMatch[] = [];
   results.forEach((r, i) => {
     if (r.status === 'fulfilled') out.push(...r.value);
-    else console.error(`[sportybet] ${LEAGUES[i].name} season fetch failed:`, r.reason);
+    else console.error(`[sportybet] ${wanted[i].name} season fetch failed:`, r.reason);
   });
-  if (results.every((r) => r.status === 'rejected')) throw new Error('football-data.org: every league fetch failed');
+  if (results.length > 0 && results.every((r) => r.status === 'rejected')) throw new Error('football-data.org: every league fetch failed');
   return out;
 }
 
@@ -2403,6 +2412,62 @@ export function scoreAfter90(match: FootballDataMatch): { home: number | null; a
   return { home: match.score.fullTime.home, away: match.score.fullTime.away };
 }
 
+// ── Settling a leg before full time ──────────────────────────────────────
+//
+// Some results can't be undone by anything that happens later in the match, so there is no reason to
+// make a player wait for the final whistle:
+//   Over X goals / a team's Over X ........ wins the moment the goals pass X (a later goal can't un-score it)
+//   Under X goals / a team's Under X ....... loses the moment the goals pass X
+//   Both teams to score — Yes / No ......... wins / loses the moment both teams have scored
+//   First-half markets (BTTS 1H, DC 1H) .... are final at the half-time break
+// Everything else (1X2, draw no bet, double chance, HT/FT, Under that is "winning", BTTS No that is "winning")
+// can still change, so it waits for full time as before.
+//
+// Two safeguards. (1) A goal can be disallowed after a VAR check and the feed can lag, so a verdict must stay
+// true for EARLY_SETTLE_CONFIRM_MS of consecutive polls before it counts. (2) Knockout stages can go to
+// extra time, and goals there don't count for 90-minute markets — with only a running score and no match
+// clock there is no way to tell them apart, so knockout matches always wait for full time.
+
+const LIVE_STATUSES = ['IN_PLAY', 'PAUSED', 'LIVE'];
+const EARLY_SETTLE_CONFIRM_MS = 3 * 60_000;
+const NO_EXTRA_TIME_STAGES = new Set<string | undefined>([undefined, 'REGULAR_SEASON', 'LEAGUE_STAGE', 'GROUP_STAGE']);
+
+/** 'won' / 'lost' if the leg's result is already beyond reach of anything left in the match, else null. */
+export function resolveLegEarly(leg: Leg, match: FootballDataMatch): 'won' | 'lost' | null {
+  if (!LIVE_STATUSES.includes(match.status)) return null;
+  if (!NO_EXTRA_TIME_STAGES.has(match.stage)) return null;
+
+  // First half over (the break): the half-time score is final, so half-time markets can be settled now.
+  if (match.status === 'PAUSED' && (leg.market === 'btts_h1' || leg.market === 'double_chance_h1')) {
+    const result = resolveLegResult(leg, { ...match, status: 'FINISHED' });
+    return result === 'won' || result === 'lost' ? result : null;
+  }
+
+  // Full-time markets: the running score is what's been scored so far.
+  const home = match.score.fullTime.home;
+  const away = match.score.fullTime.away;
+  if (home === null || home === undefined || away === null || away === undefined) return null;
+
+  switch (leg.market) {
+    case 'totals':
+    case 'team_totals': {
+      const goals = leg.market === 'totals' ? home + away : leg.team === 'home' ? home : leg.team === 'away' ? away : null;
+      const line = leg.point;
+      if (goals === null || line === undefined || line === null) return null;
+      if (goals <= line) return null; // an integer line exactly met is a push at full time — not decided yet
+      return leg.selection === 'over' ? 'won' : leg.selection === 'under' ? 'lost' : null;
+    }
+    case 'btts':
+      if (!(home > 0 && away > 0)) return null;
+      return leg.selection === 'yes' ? 'won' : leg.selection === 'no' ? 'lost' : null;
+    default:
+      return null;
+  }
+}
+
+/** Verdicts seen on earlier polls: a leg is only settled early once the same verdict has held long enough. */
+const earlyVerdicts = new Map<string, { verdict: 'won' | 'lost'; since: number }>();
+
 export function resolveLegResult(leg: Leg, match: FootballDataMatch): 'won' | 'lost' | 'void' | null {
   if (['POSTPONED', 'SUSPENDED', 'CANCELLED'].includes(match.status)) return 'void';
   if (match.status !== 'FINISHED') return null; // SCHEDULED / LIVE / IN_PLAY / PAUSED — still genuinely pending
@@ -2479,8 +2544,8 @@ function formatFinalScore(leg: Leg, match: FootballDataMatch): string {
  */
 let settlementInFlight = false;
 
-export async function pollAndSettleCoupons(): Promise<{ couponsChecked: number; couponsSettled: number }> {
-  if (settlementInFlight) return { couponsChecked: 0, couponsSettled: 0 };
+export async function pollAndSettleCoupons(): Promise<SettlementPassResult> {
+  if (settlementInFlight) return { couponsChecked: 0, couponsSettled: 0, legsSettledEarly: 0, live: true, msToNextKickoff: null }; // a pass is already running — keep the fast pace
   settlementInFlight = true;
   try {
     return await runSettlementPass();
@@ -2498,36 +2563,75 @@ const SETTLEMENT_POLL_MS = 5 * 60_000;
  * Costs football-data.org calls only (the season list is cached for 60s);
  * it never touches The Odds API credits.
  */
+const LIVE_POLL_MS = 60_000;
+
+/** How long to wait before the next settlement pass: a minute while a match is on, else until just after the next kick-off (at most the idle interval). */
+export function nextPollDelayMs(r: Pick<SettlementPassResult, 'live' | 'msToNextKickoff'>, idleMs: number = SETTLEMENT_POLL_MS): number {
+  if (r.live) return Math.min(LIVE_POLL_MS, idleMs);
+  if (r.msToNextKickoff !== null && r.msToNextKickoff < idleMs) return Math.min(idleMs, Math.max(LIVE_POLL_MS, r.msToNextKickoff + 30_000));
+  return idleMs;
+}
+
 export function startCouponSettlementPoller(intervalMs: number = SETTLEMENT_POLL_MS): void {
   const g = globalThis as any;
   if (g.__sportybetSettlementTimer) return;
 
-  const tick = async () => {
+  const loop = async () => {
+    let delay = intervalMs;
     try {
-      const { couponsChecked, couponsSettled } = await pollAndSettleCoupons();
-      if (couponsSettled > 0) console.log(`[sportybet] settlement: ${couponsSettled} settled of ${couponsChecked} pending coupon(s)`);
+      const result = await pollAndSettleCoupons();
+      if (result.couponsSettled > 0 || result.legsSettledEarly > 0) {
+        console.log(`[sportybet] settlement: ${result.couponsSettled} coupon(s) settled of ${result.couponsChecked} pending, ${result.legsSettledEarly} leg(s) settled live`);
+      }
+      delay = nextPollDelayMs(result, intervalMs);
     } catch (err) {
       console.error('[sportybet] settlement poll failed:', err);
     }
+    g.__sportybetSettlementTimer = setTimeout(loop, delay);
+    g.__sportybetSettlementTimer.unref?.();
   };
 
-  g.__sportybetSettlementTimer = setInterval(tick, intervalMs);
-  g.__sportybetSettlementTimer.unref?.();
-  void tick();
+  g.__sportybetSettlementTimer = setTimeout(() => {}, 0); // marks the poller as started (and stops a second one) until the first pass sets the real timer
+  void loop(); // settle anything that finished while the bot was offline
 }
 
-async function runSettlementPass(): Promise<{ couponsChecked: number; couponsSettled: number }> {
+export interface SettlementPassResult {
+  couponsChecked: number;
+  couponsSettled: number;
+  legsSettledEarly: number;
+  /** A pending leg's match is under way (or just was) — poll fast while true. */
+  live: boolean;
+  /** Time until the next pending leg kicks off, if none is live right now. */
+  msToNextKickoff: number | null;
+}
+
+const LIVE_WINDOW_MS = 4 * 60 * 60_000; // a match is treated as "under way" for this long after kick-off (extra time and delays included)
+
+async function runSettlementPass(): Promise<SettlementPassResult> {
+  // Which leagues even have a pending leg? (A read for planning only — the real read happens under the lock below.)
+  // No pending legs means nothing to settle and no reason to spend a football-data call.
+  const planning = (await couponsByUser.getAll()) as Record<string, Coupon[]>;
+  const leagues = new Set<LeagueId>();
+  for (const coupons of Object.values(planning)) {
+    for (const c of coupons) if (c.status === 'pending') for (const l of c.legs) if (l.status === 'pending') leagues.add(l.league ?? DEFAULT_LEAGUE);
+  }
+  if (!leagues.size) return { couponsChecked: 0, couponsSettled: 0, legsSettledEarly: 0, live: false, msToNextKickoff: null };
+
   // The slow part (the network) happens first, with no lock held. The coupons are read only AFTER it,
   // inside the lock, so what gets written back is never older than the moment it was read.
-  const seasonMatches = await fetchAllLeaguesSeasonMatches();
+  // maxAgeMs: a score cached for a minute is too stale to settle a live match on.
+  const seasonMatches = await fetchAllLeaguesSeasonMatches({ leagues: [...leagues], maxAgeMs: 20_000 });
   return withCouponLock(() => settleCoupons(seasonMatches));
 }
 
-async function settleCoupons(seasonMatches: FootballDataMatch[]): Promise<{ couponsChecked: number; couponsSettled: number }> {
+async function settleCoupons(seasonMatches: FootballDataMatch[]): Promise<SettlementPassResult> {
   const allUsers = (await couponsByUser.getAll()) as Record<string, Coupon[]>;
 
   let couponsChecked = 0;
   let couponsSettled = 0;
+  let legsSettledEarly = 0;
+  let live = false;
+  let msToNextKickoff: number | null = null;
 
   for (const [userId, coupons] of Object.entries(allUsers)) {
     let userChanged = false;
@@ -2548,14 +2652,44 @@ async function settleCoupons(seasonMatches: FootballDataMatch[]): Promise<{ coup
             normalizeTeamName(m.homeTeam.name) === home &&
             normalizeTeamName(m.awayTeam.name) === away
         );
+        // Tells the poller how fast to run: quickly while something is on, otherwise wake up for the next kick-off.
+        const sinceKickoff = Date.now() - new Date(leg.kickoff).getTime();
+        if (sinceKickoff >= 0 && sinceKickoff < LIVE_WINDOW_MS) live = true;
+        else if (sinceKickoff < 0) msToNextKickoff = msToNextKickoff === null ? -sinceKickoff : Math.min(msToNextKickoff, -sinceKickoff);
+
         if (!match) continue; // not in this payload (or that league's fetch failed this pass) — try again next poll
 
-        const result = resolveLegResult(leg, match);
-        if (result === null) continue; // still genuinely pending
+        let result = resolveLegResult(leg, match);
+        let settledLive = false;
+        if (result === null) {
+          // Not finished — but maybe already decided beyond doubt (see "Settling a leg before full time").
+          const verdict = resolveLegEarly(leg, match);
+          if (verdict === null) {
+            earlyVerdicts.delete(leg.id);
+            continue; // still genuinely pending
+          }
+          const seen = earlyVerdicts.get(leg.id);
+          if (!seen || seen.verdict !== verdict) {
+            earlyVerdicts.set(leg.id, { verdict, since: Date.now() });
+            continue; // first sighting — wait for it to hold (a disallowed goal would take it back)
+          }
+          if (Date.now() - seen.since < EARLY_SETTLE_CONFIRM_MS) continue;
+          result = verdict;
+          settledLive = true;
+        }
+        earlyVerdicts.delete(leg.id);
         leg.status = result === 'void' ? 'voided' : result; // 'won' | 'lost' | 'voided'
-        // A finished match shows its score even on a voided leg (draw no bet on a draw, a pushed line).
-        // A postponed/cancelled match has no score to show.
-        if (match.status === 'FINISHED' && scoreAfter90(match).home !== null) leg.finalScore = formatFinalScore(leg, match);
+        if (settledLive) {
+          const halfTimeOnly = match.status === 'PAUSED' && (leg.market === 'btts_h1' || leg.market === 'double_chance_h1');
+          leg.finalScore = halfTimeOnly
+            ? `${match.score.halfTime?.home} - ${match.score.halfTime?.away} at half-time`
+            : `${match.score.fullTime.home} - ${match.score.fullTime.away} · settled live`;
+          legsSettledEarly++;
+        } else if (match.status === 'FINISHED' && scoreAfter90(match).home !== null) {
+          // A finished match shows its score even on a voided leg (draw no bet on a draw, a pushed line).
+          // A postponed/cancelled match has no score to show.
+          leg.finalScore = formatFinalScore(leg, match);
+        }
         legsChanged = true;
       }
 
@@ -2614,7 +2748,7 @@ async function settleCoupons(seasonMatches: FootballDataMatch[]): Promise<{ coup
     if (userChanged) await couponsByUser.set(userId, coupons);
   }
 
-  return { couponsChecked, couponsSettled };
+  return { couponsChecked, couponsSettled, legsSettledEarly, live, msToNextKickoff };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
