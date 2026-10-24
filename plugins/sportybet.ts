@@ -85,7 +85,6 @@ import {
   formatCoupon,
   legPickLabel,
   formatHandicap,
-  leagueHasHalfTimeData,
   MIN_STAKE,
   MAX_STAKE,
   MAX_LEGS_PER_COUPON,
@@ -475,8 +474,7 @@ async function runMarketPicker(
           : undefined,
   }));
 
-  // ESPN-fed leagues (Europa League) have no half-time score, so there is nothing to offer — or settle — behind "More markets".
-  if (fixture.eventId && coreLoaded && extra === null && leagueHasHalfTimeData(fixture.league)) {
+  if (fixture.eventId && coreLoaded && extra === null) {
     options.push({ label: '➕ More markets', value: 'more', description: '1st half & half-time/full-time' });
   }
 

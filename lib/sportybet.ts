@@ -19,9 +19,7 @@
  *    and odds come straight from The Odds API (richer market access than
  *    Malvin's h2h-only wrapper allowed).
  * 3. Optional: SPORTYBET_LINES_BOOKMAKERS (comma list, <= 10 books) overrides which
- *    bookmakers are asked for Asian handicap / team-goal ladders; ESPN_USER_AGENT
- *    overrides the header sent to ESPN (Europa League feed); SPORTYBET_DISABLE_ESPN_LEAGUES=1
- *    switches the Europa League off entirely.
+ *    bookmakers are asked for Asian handicap / team-goal ladders.
  */
 
 import { createHash } from 'node:crypto';
@@ -80,7 +78,7 @@ const keyTag = (key: string): string => `…${key.slice(-4)}`;
 //   reserve .............................. 40 credits per-match fetches never touch
 // ~38 matches a month PER LEAGUE, so even if every one is opened (and half also tap
 // "More markets") that's roughly 38x7 + 19x3 = ~320 per league, plus <= 60 bulk each.
-// With four leagues the worst case (everything opened) far exceeds 500 — which is what
+// With three leagues the worst case (everything opened) can exceed 500 — which is what
 // ODDS_CREDIT_RESERVE is for: per-match fetches simply stop (players keep 1X2 + the
 // bulk list) while the account is within the reserve of empty, instead of overspending.
 // All odds caches are also persisted to the plugin store, so a bot restart
@@ -131,7 +129,7 @@ export const MAX_LEGS_PER_COUPON = 10;
 // football-data.org competition code, `oddsSportKey` is The Odds API sport key.
 // ─────────────────────────────────────────────────────────────────────────
 
-export type LeagueId = 'PL' | 'PD' | 'CL' | 'EL';
+export type LeagueId = 'PL' | 'PD' | 'CL';
 
 export interface LeagueInfo {
   id: LeagueId;
@@ -139,13 +137,9 @@ export interface LeagueInfo {
   flag: string;
   footballDataCode: string;
   oddsSportKey: string;
-  /** Where fixtures/results come from. Default 'football-data'; 'espn' = ESPN's public scoreboard (football-data.org's free tier lacks the competition). */
-  provider?: 'football-data' | 'espn';
-  /** ESPN league slug, e.g. 'uefa.europa'. Only for provider 'espn'. */
-  espnSlug?: string;
 }
 
-const ALL_LEAGUES: readonly LeagueInfo[] = [
+export const LEAGUES: readonly LeagueInfo[] = [
   {
     id: 'PL',
     name: 'Premier League',
@@ -167,31 +161,13 @@ const ALL_LEAGUES: readonly LeagueInfo[] = [
     footballDataCode: 'CL',
     oddsSportKey: 'soccer_uefa_champs_league',
   },
-  {
-    id: 'EL',
-    name: 'Europa League',
-    flag: '\u{1F7E0}', // orange circle
-    footballDataCode: 'EL', // unused — football-data.org's free tier doesn't carry this competition
-    oddsSportKey: 'soccer_uefa_europa_league', // confirm once against GET /v4/sports (costs no credits)
-    provider: 'espn',
-    espnSlug: 'uefa.europa',
-  },
 ];
-
-/** The leagues players can bet on. ESPN-fed leagues can be switched off with SPORTYBET_DISABLE_ESPN_LEAGUES=1. */
-export const LEAGUES: readonly LeagueInfo[] = ALL_LEAGUES.filter((l) => l.provider !== 'espn' || process.env.SPORTYBET_DISABLE_ESPN_LEAGUES !== '1');
 
 /** Coupons placed before La Liga existed carry no league — they are Premier League. */
 export const DEFAULT_LEAGUE: LeagueId = 'PL';
 
 export function getLeague(id: LeagueId | undefined | null): LeagueInfo {
-  // ALL_LEAGUES, not LEAGUES: a coupon placed on a league that is switched off now must still show its own name.
-  return ALL_LEAGUES.find((l) => l.id === (id ?? DEFAULT_LEAGUE)) ?? ALL_LEAGUES[0];
-}
-
-/** The ESPN feed carries no half-time score, so 1st-half markets (and their settlement) only exist for football-data leagues. */
-export function leagueHasHalfTimeData(id: LeagueId | undefined | null): boolean {
-  return getLeague(id).provider !== 'espn';
+  return LEAGUES.find((l) => l.id === (id ?? DEFAULT_LEAGUE)) ?? LEAGUES[0];
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -615,138 +591,10 @@ function teamsKnown(m: FootballDataMatch): boolean {
   return !!m.homeTeam?.name && !!m.awayTeam?.name;
 }
 
-// ── ESPN scoreboard (Europa League) ──────────────────────────────────────
-// football-data.org's free tier has no Europa League, so leagues flagged provider 'espn' take their
-// fixtures and results from ESPN's public scoreboard instead (no key, no published quota). It is an
-// UNDOCUMENTED API, so everything here is conservative:
-//   * ESPN answers 403 unless the request carries an identifying User-Agent. If you ever see
-//     "responded 403" in the log, set ESPN_USER_AGENT to  "<name>/1.0 (+https://your-repo-url)".
-//   * Only a plain STATUS_FULL_TIME result settles legs. Extra time / penalties and any status name we
-//     don't recognise are held as "in play" (legs stay pending) rather than guessed — a knockout tie
-//     decided after 120 minutes needs a regular-time score this feed doesn't give us.
-//   * ESPN matches never settle early (stage 'ESPN' is not in NO_EXTRA_TIME_STAGES) and carry no
-//     half-time score, so 1st-half markets aren't offered for these leagues (leagueHasHalfTimeData).
-const ESPN_BASE = 'https://site.api.espn.com/apis/site/v2/sports/soccer';
-const ESPN_USER_AGENT = process.env.ESPN_USER_AGENT?.trim() || 'sportybet-bot/1.0 (+https://github.com/macksyn/MEGA-MDX)';
-
-interface EspnCompetitor {
-  homeAway?: string;
-  score?: string | number;
-  team?: { id?: string | number; displayName?: string; shortDisplayName?: string };
-}
-interface EspnEvent {
-  id?: string | number;
-  date?: string;
-  status?: { type?: { name?: string; state?: string } };
-  competitions?: { competitors?: EspnCompetitor[] }[];
-}
-interface EspnScoreboard {
-  events?: EspnEvent[];
-}
-
-const warnedEspnStatus = new Set<string>();
-
-function mapEspnStatus(name: string, state: string): { status: string; duration?: 'REGULAR' | 'EXTRA_TIME' | 'PENALTY_SHOOTOUT' } {
-  switch (name) {
-    case 'STATUS_SCHEDULED':
-    case 'STATUS_DELAYED':
-      return { status: 'SCHEDULED' };
-    case 'STATUS_IN_PROGRESS':
-    case 'STATUS_FIRST_HALF':
-    case 'STATUS_SECOND_HALF':
-    case 'STATUS_EXTRA_TIME':
-    case 'STATUS_SHOOTOUT':
-      return { status: 'IN_PLAY' };
-    case 'STATUS_HALFTIME':
-    case 'STATUS_END_OF_REGULATION':
-    case 'STATUS_END_OF_EXTRATIME':
-      return { status: 'PAUSED' };
-    case 'STATUS_FULL_TIME':
-      return { status: 'FINISHED', duration: 'REGULAR' };
-    case 'STATUS_FINAL_AET':
-      return { status: 'FINISHED', duration: 'EXTRA_TIME' };
-    case 'STATUS_FINAL_PEN':
-      return { status: 'FINISHED', duration: 'PENALTY_SHOOTOUT' };
-    case 'STATUS_POSTPONED':
-      return { status: 'POSTPONED' };
-    case 'STATUS_CANCELED':
-    case 'STATUS_CANCELLED':
-      return { status: 'CANCELLED' };
-    case 'STATUS_SUSPENDED':
-    case 'STATUS_ABANDONED':
-      return { status: 'IN_PLAY' }; // never voided automatically on an undocumented feed — legs just stay pending
-  }
-  if (state === 'pre') return { status: 'SCHEDULED' };
-  if (!warnedEspnStatus.has(name)) {
-    warnedEspnStatus.add(name);
-    console.warn(`[sportybet] ESPN sent an unrecognised match status "${name}" (state "${state}") — treating it as in play, its legs stay pending`);
-  }
-  return { status: 'IN_PLAY' };
-}
-
-function espnGoals(v: unknown): number | null {
-  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN;
-  return Number.isInteger(n) && n >= 0 ? n : null;
-}
-
-function espnEventToMatch(ev: EspnEvent, info: LeagueInfo): FootballDataMatch | null {
-  const competitors = ev.competitions?.[0]?.competitors ?? [];
-  const homeC = competitors.find((c) => c.homeAway === 'home');
-  const awayC = competitors.find((c) => c.homeAway === 'away');
-  const homeName = homeC?.team?.displayName;
-  const awayName = awayC?.team?.displayName;
-  if (!ev.id || !ev.date || !homeC || !awayC || !homeName || !awayName) return null;
-  const kickoff = new Date(ev.date);
-  if (Number.isNaN(kickoff.getTime())) return null;
-
-  const { status, duration } = mapEspnStatus(ev.status?.type?.name ?? '', ev.status?.type?.state ?? '');
-  const started = status !== 'SCHEDULED' && status !== 'POSTPONED' && status !== 'CANCELLED';
-  const home = started ? espnGoals(homeC.score) : null;
-  const away = started ? espnGoals(awayC.score) : null;
-  const winner =
-    status === 'FINISHED' && duration === 'REGULAR' && home !== null && away !== null ? (home > away ? 'HOME_TEAM' : home < away ? 'AWAY_TEAM' : 'DRAW') : null;
-  const team = (c: EspnCompetitor, name: string): FootballDataTeam => ({ id: Number(c.team?.id) || 0, name, shortName: c.team?.shortDisplayName || undefined });
-
-  return {
-    id: Number(ev.id) || 0,
-    league: info.id,
-    stage: 'ESPN',
-    utcDate: kickoff.toISOString(),
-    status,
-    matchday: 0,
-    homeTeam: team(homeC, homeName),
-    awayTeam: team(awayC, awayName),
-    score: { winner, duration, fullTime: { home, away } },
-  };
-}
-
-const espnLogged = new Set<string>();
-
-async function fetchEspnMatches(info: LeagueInfo, daysBack: number, daysForward: number): Promise<FootballDataMatch[]> {
-  if (!info.espnSlug) throw new Error(`${info.name}: no ESPN slug configured`);
-  const ymd = (offsetDays: number): string => new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10).replace(/-/g, '');
-  const url = `${ESPN_BASE}/${info.espnSlug}/scoreboard?dates=${ymd(-daysBack)}-${ymd(daysForward)}&limit=500`;
-  const res = await fetch(url, { headers: { 'User-Agent': ESPN_USER_AGENT, Accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
-  if (!res.ok) throw new Error(`ESPN ${info.espnSlug} scoreboard responded ${res.status}${res.status === 403 ? ' — set ESPN_USER_AGENT to "<name>/1.0 (+https://your-repo-url)"' : ''}`);
-  const data = (await res.json()) as EspnScoreboard;
-  const raw = data.events ?? [];
-  const matches = raw.map((e) => espnEventToMatch(e, info)).filter((m): m is FootballDataMatch => m !== null);
-  if (!espnLogged.has(info.id) || (raw.length > 0 && matches.length === 0)) {
-    espnLogged.add(info.id);
-    const sample = matches[0];
-    console.log(
-      `[sportybet] ESPN ${info.name}: ${raw.length} event(s) in ${daysBack}d back / ${daysForward}d ahead, ${matches.length} usable` +
-        (sample ? ` — e.g. ${sample.homeTeam.name} v ${sample.awayTeam.name} (${sample.status}, ${sample.utcDate.slice(0, 10)})` : '')
-    );
-  }
-  return matches;
-}
-
 /** Bettable fixture list — not-yet-played matches of ONE league. */
 export async function fetchUpcomingFixtures(league: LeagueId = DEFAULT_LEAGUE): Promise<FootballDataMatch[]> {
   const info = getLeague(league);
   return cached(`sportybet:upcoming:${info.id}`, FIXTURES_CACHE_TTL_MS, async () => {
-    if (info.provider === 'espn') return (await fetchEspnMatches(info, 0, 45)).filter((m) => m.status === 'SCHEDULED' && teamsKnown(m));
     const data = await footballDataGet<FootballDataMatchesResponse>(`/competitions/${info.footballDataCode}/matches?status=SCHEDULED`);
     return data.matches.filter(teamsKnown).map((m): FootballDataMatch => ({ ...m, league: info.id }));
   });
@@ -759,7 +607,6 @@ export async function fetchAllSeasonMatches(league: LeagueId = DEFAULT_LEAGUE, o
     `sportybet:season:${info.id}`,
     SEASON_MATCHES_CACHE_TTL_MS,
     async () => {
-      if (info.provider === 'espn') return (await fetchEspnMatches(info, 40, 60)).filter(teamsKnown);
       const data = await footballDataGet<FootballDataMatchesResponse>(`/competitions/${info.footballDataCode}/matches`);
       return data.matches.filter(teamsKnown).map((m): FootballDataMatch => ({ ...m, league: info.id }));
     },
@@ -1475,7 +1322,6 @@ export async function fetchCoreMarkets(eventId: string, league: LeagueId = DEFAU
 
 /** EXTRA bundle (1st-half BTTS / double chance, HT/FT). <= 3 credits, cached 24h. Call ONLY on an explicit "More markets" tap. */
 export function fetchExtraMarkets(eventId: string, league: LeagueId = DEFAULT_LEAGUE, opts: FreshnessOpts = {}): Promise<EventMarkets> {
-  if (!leagueHasHalfTimeData(league)) return Promise.resolve({}); // ESPN leagues have no half-time score to settle these on — nothing to sell, nothing to spend
   return fetchEventBundle(eventId, EXTRA_MARKET_KEYS, 'extra', league, opts);
 }
 
@@ -2888,6 +2734,8 @@ export interface SettlementPassResult {
 
 const LIVE_WINDOW_MS = 4 * 60 * 60_000; // a match is treated as "under way" for this long after kick-off (extra time and delays included)
 
+let warnedOrphanedLeagues = false;
+
 async function runSettlementPass(): Promise<SettlementPassResult> {
   // Which leagues even have a pending leg? (A read for planning only — the real read happens under the lock below.)
   // No pending legs means nothing to settle and no reason to spend a football-data call.
@@ -2897,6 +2745,14 @@ async function runSettlementPass(): Promise<SettlementPassResult> {
     for (const c of coupons) if (c.status === 'pending') for (const l of c.legs) if (l.status === 'pending') leagues.add(l.league ?? DEFAULT_LEAGUE);
   }
   if (!leagues.size) return { couponsChecked: 0, couponsSettled: 0, legsSettledEarly: 0, live: false, msToNextKickoff: null };
+
+  // A league that was removed from LEAGUES (the Europa League was tried and dropped) can still sit on stored legs. They
+  // can't be matched to a result any more, so they stay pending — harmless, but say so rather than leave stakes silently stuck.
+  const orphaned = [...leagues].filter((id) => !LEAGUES.some((l) => l.id === id));
+  if (orphaned.length && !warnedOrphanedLeagues) {
+    warnedOrphanedLeagues = true;
+    console.warn(`[sportybet] pending leg(s) belong to league(s) no longer offered (${orphaned.join(', ')}) — they cannot settle automatically; refund or void them by hand`);
+  }
 
   // The slow part (the network) happens first, with no lock held. The coupons are read only AFTER it,
   // inside the lock, so what gets written back is never older than the moment it was read.
