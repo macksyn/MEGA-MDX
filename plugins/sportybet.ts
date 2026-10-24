@@ -19,8 +19,8 @@
  *
  * A coupon can hold more than one leg (accumulator: all legs must win,
  * odds multiply), one leg per match. Markets: Match Winner, Total Goals
- * (ladder of lines), Both Teams to Score, Double Chance, Draw No Bet and Team
- * Goals (ladder per team), plus — behind a "More markets" button — the 1st-half
+ * (ladder of lines), Both Teams to Score, Double Chance, Draw No Bet, Asian
+ * Handicap and Team Goals (ladder per team), plus — behind a "More markets" button — the 1st-half
  * markets (BTTS, Double Chance) and Half-time/Full-time. Only markets the odds
  * provider actually prices for a match are ever shown. Prices for everything
  * beyond Match Winner are fetched when a match is OPENED (core) or when "More
@@ -84,6 +84,8 @@ import {
   isCashOutOpen,
   formatCoupon,
   legPickLabel,
+  formatHandicap,
+  leagueHasHalfTimeData,
   MIN_STAKE,
   MAX_STAKE,
   MAX_LEGS_PER_COUPON,
@@ -142,6 +144,8 @@ function marketLabel(market: Market): string {
       return 'Total Goals';
     case 'team_totals':
       return 'Team Goals';
+    case 'asian_handicap':
+      return 'Asian Handicap — a goal head start for one side';
     case 'btts':
       return 'Both Teams to Score';
     case 'btts_h1':
@@ -163,6 +167,7 @@ const MARKET_MENU_LABEL: Record<Market, string> = {
   btts: '🎯 Both Teams to Score',
   double_chance: '🛡️ Double Chance',
   draw_no_bet: '🔁 Draw No Bet',
+  asian_handicap: '⚖️ Asian Handicap',
   team_totals: '🏟️ Team Goals',
   btts_h1: '🎯 1st Half BTTS',
   double_chance_h1: '🛡️ 1st Half Double Chance',
@@ -315,6 +320,8 @@ function optionLabel(market: Market, o: MarketOption, fixture: FixtureWithOdds):
       return o.selection === 'home' ? `🏠 ${home}` : o.selection === 'away' ? `✈️ ${away}` : '🤝 Draw';
     case 'draw_no_bet':
       return o.selection === 'home' ? `🏠 ${home}` : `✈️ ${away}`;
+    case 'asian_handicap':
+      return `${o.selection === 'home' ? '🏠' : '✈️'} ${o.selection === 'home' ? home : away} ${formatHandicap(o.point)}`;
     case 'totals':
     case 'team_totals':
       return `${o.selection === 'over' ? '⬆️ Over' : '⬇️ Under'} ${o.point}`;
@@ -355,6 +362,7 @@ async function runSelectionPicker(
     textLines.push(`${shortClubName(team === 'home' ? fixture.homeTeam : fixture.awayTeam)} goals`);
   }
   if (market === 'halftime_fulltime') textLines.push('First name = leading at half-time, second = winning at full-time.');
+  if (market === 'asian_handicap') textLines.push('Your team gets the head start shown (+) or must win by more (-). Landing exactly on a whole-number line returns your stake.');
 
   const result = await promptMenu(sock, message, chatId, userId, {
     title: `${shortClubName(fixture.homeTeam)} vs ${shortClubName(fixture.awayTeam)}`,
@@ -459,10 +467,16 @@ async function runMarketPicker(
   const options: { label: string; value: string; description?: string }[] = availableMarkets(fixture, em).map((m) => ({
     label: MARKET_MENU_LABEL[m],
     value: m,
-    description: m === 'totals' && em.totals?.length ? `Lines ${em.totals[0].point}–${em.totals[em.totals.length - 1].point}` : undefined,
+    description:
+      m === 'totals' && em.totals?.length
+        ? `Lines ${em.totals[0].point}–${em.totals[em.totals.length - 1].point}`
+        : m === 'asian_handicap' && em.asian_handicap?.length
+          ? `Lines ${formatHandicap(em.asian_handicap[0].point)} to ${formatHandicap(em.asian_handicap[em.asian_handicap.length - 1].point)} (home side)`
+          : undefined,
   }));
 
-  if (fixture.eventId && coreLoaded && extra === null) {
+  // ESPN-fed leagues (Europa League) have no half-time score, so there is nothing to offer — or settle — behind "More markets".
+  if (fixture.eventId && coreLoaded && extra === null && leagueHasHalfTimeData(fixture.league)) {
     options.push({ label: '➕ More markets', value: 'more', description: '1st half & half-time/full-time' });
   }
 
@@ -1270,7 +1284,7 @@ function ago(ts: number | null, now: number): string {
 }
 const plural = (n: number, word: string): string => `${num(n)} ${word}${n === 1 ? '' : 's'}`;
 
-const KIND_LABEL: Record<string, string> = { bulk: 'Odds lists', event_core: 'Match markets', event_extra: 'More markets' };
+const KIND_LABEL: Record<string, string> = { bulk: 'Odds lists', event_core: 'Match markets', event_lines: 'Handicap & team goals', event_extra: 'More markets' };
 const PURPOSE_LABEL: Record<string, string> = { betting: 'betting', cashout: 'cash out', booking: 'booking codes' };
 const leagueName = (id: string): string => (LEAGUES.some((l) => l.id === id) ? getLeague(id as LeagueId).name : id);
 

@@ -18,6 +18,10 @@
  *    /epl/matches turned out to be stuck serving stale matchday 1-2 data),
  *    and odds come straight from The Odds API (richer market access than
  *    Malvin's h2h-only wrapper allowed).
+ * 3. Optional: SPORTYBET_LINES_BOOKMAKERS (comma list, <= 10 books) overrides which
+ *    bookmakers are asked for Asian handicap / team-goal ladders; ESPN_USER_AGENT
+ *    overrides the header sent to ESPN (Europa League feed); SPORTYBET_DISABLE_ESPN_LEAGUES=1
+ *    switches the Europa League off entirely.
  */
 
 import { createHash } from 'node:crypto';
@@ -66,14 +70,17 @@ const keyTag = (key: string): string => `…${key.slice(-4)}`;
 //
 // Spend plan (1 region = uk):
 //   bulk h2h, 12h cache, PER LEAGUE ...... <= 2 calls/day x 1 credit  = <= 60/month/league
-//   CORE bundle (<= 5 markets) ........... <= 5 credits per match, once per 24h,
+//   CORE bundle (<= 4 markets) ........... <= 4 credits per match, once per 24h,
 //                                          only when a player opens that match
+//   LINES bundle (<= 3 markets) .......... <= 3 credits per match, fetched together with CORE:
+//                                          Asian handicap + team-goal ladders, asked of a PINNED
+//                                          list of bookmakers (see LINES_BOOKMAKERS), not region uk
 //   EXTRA bundle (<= 3 markets) .......... <= 3 credits per match, only if a player
 //                                          taps "More markets"
 //   reserve .............................. 40 credits per-match fetches never touch
 // ~38 matches a month PER LEAGUE, so even if every one is opened (and half also tap
-// "More markets") that's roughly 38x5 + 19x3 = ~250 per league, plus <= 60 bulk each.
-// With three leagues the worst case (everything opened) can exceed 500 — which is what
+// "More markets") that's roughly 38x7 + 19x3 = ~320 per league, plus <= 60 bulk each.
+// With four leagues the worst case (everything opened) far exceeds 500 — which is what
 // ODDS_CREDIT_RESERVE is for: per-match fetches simply stop (players keep 1X2 + the
 // bulk list) while the account is within the reserve of empty, instead of overspending.
 // All odds caches are also persisted to the plugin store, so a bot restart
@@ -90,7 +97,22 @@ const ODDS_CREDIT_RESERVE = 40;
 // contain the main line, so the plain `totals` / `team_totals` keys are not
 // requested (one credit each saved per match). If a one-off curl on a real match
 // shows the ladder missing the main line, add the plain key back here.
-const CORE_MARKET_KEYS = ['btts', 'double_chance', 'draw_no_bet', 'alternate_totals', 'alternate_team_totals'] as const;
+const CORE_MARKET_KEYS = ['btts', 'double_chance', 'draw_no_bet', 'alternate_totals'] as const;
+
+// LINES bundle — Asian handicap and the per-team goal ladders ("home over 1.5", "away over 1.5").
+// UK-region books don't list these; a live pull of Arsenal v Everton showed them on a handful of
+// specific books only (alternate_spreads: Pinnacle, FanDuel, DraftKings, BetRivers, Bovada, Fanatics…;
+// alternate_asian_handicap: Betfair Exchange; alternate_team_totals: FanDuel, DraftKings, BetMGM,
+// BetRivers, Fanatics, Bovada, PointsBet AU, TABtouch). So this bundle names its bookmakers instead of a
+// region. The Odds API counts every 10 bookmakers as one region, so keep this list at 10 or fewer —
+// beyond that every call costs double. Both handicap keys are pooled into ONE ladder; lay (_lay)
+// variants are never requested.
+const LINES_MARKET_KEYS = ['alternate_spreads', 'alternate_asian_handicap', 'alternate_team_totals'] as const;
+const DEFAULT_LINES_BOOKMAKERS = ['pinnacle', 'betfair_ex_uk', 'fanduel', 'draftkings', 'betrivers', 'bovada', 'fanatics', 'betmgm', 'pointsbetau', 'tabtouch'];
+const LINES_BOOKMAKERS: string[] = (() => {
+  const fromEnv = parseKeyList(process.env.SPORTYBET_LINES_BOOKMAKERS).map((b) => b.toLowerCase());
+  return fromEnv.length ? fromEnv : DEFAULT_LINES_BOOKMAKERS;
+})();
 const EXTRA_MARKET_KEYS = ['btts_h1', 'double_chance_h1', 'halftime_fulltime'] as const;
 
 /** Bets close this long before kickoff — pre-match only, and half-time markets must never be bettable mid-game. */
@@ -109,7 +131,7 @@ export const MAX_LEGS_PER_COUPON = 10;
 // football-data.org competition code, `oddsSportKey` is The Odds API sport key.
 // ─────────────────────────────────────────────────────────────────────────
 
-export type LeagueId = 'PL' | 'PD' | 'CL';
+export type LeagueId = 'PL' | 'PD' | 'CL' | 'EL';
 
 export interface LeagueInfo {
   id: LeagueId;
@@ -117,9 +139,13 @@ export interface LeagueInfo {
   flag: string;
   footballDataCode: string;
   oddsSportKey: string;
+  /** Where fixtures/results come from. Default 'football-data'; 'espn' = ESPN's public scoreboard (football-data.org's free tier lacks the competition). */
+  provider?: 'football-data' | 'espn';
+  /** ESPN league slug, e.g. 'uefa.europa'. Only for provider 'espn'. */
+  espnSlug?: string;
 }
 
-export const LEAGUES: readonly LeagueInfo[] = [
+const ALL_LEAGUES: readonly LeagueInfo[] = [
   {
     id: 'PL',
     name: 'Premier League',
@@ -141,13 +167,31 @@ export const LEAGUES: readonly LeagueInfo[] = [
     footballDataCode: 'CL',
     oddsSportKey: 'soccer_uefa_champs_league',
   },
+  {
+    id: 'EL',
+    name: 'Europa League',
+    flag: '\u{1F7E0}', // orange circle
+    footballDataCode: 'EL', // unused — football-data.org's free tier doesn't carry this competition
+    oddsSportKey: 'soccer_uefa_europa_league', // confirm once against GET /v4/sports (costs no credits)
+    provider: 'espn',
+    espnSlug: 'uefa.europa',
+  },
 ];
+
+/** The leagues players can bet on. ESPN-fed leagues can be switched off with SPORTYBET_DISABLE_ESPN_LEAGUES=1. */
+export const LEAGUES: readonly LeagueInfo[] = ALL_LEAGUES.filter((l) => l.provider !== 'espn' || process.env.SPORTYBET_DISABLE_ESPN_LEAGUES !== '1');
 
 /** Coupons placed before La Liga existed carry no league — they are Premier League. */
 export const DEFAULT_LEAGUE: LeagueId = 'PL';
 
 export function getLeague(id: LeagueId | undefined | null): LeagueInfo {
-  return LEAGUES.find((l) => l.id === (id ?? DEFAULT_LEAGUE)) ?? LEAGUES[0];
+  // ALL_LEAGUES, not LEAGUES: a coupon placed on a league that is switched off now must still show its own name.
+  return ALL_LEAGUES.find((l) => l.id === (id ?? DEFAULT_LEAGUE)) ?? ALL_LEAGUES[0];
+}
+
+/** The ESPN feed carries no half-time score, so 1st-half markets (and their settlement) only exist for football-data leagues. */
+export function leagueHasHalfTimeData(id: LeagueId | undefined | null): boolean {
+  return getLeague(id).provider !== 'espn';
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -215,6 +259,7 @@ export type Market =
   | 'draw_no_bet'
   | 'double_chance'
   | 'team_totals' // over/under ONE team's goals — any line from alternate_team_totals
+  | 'asian_handicap' // 2-way goal handicap, whole and half lines (a whole line landing exactly on it is a push)
   | 'btts_h1'
   | 'double_chance_h1'
   | 'halftime_fulltime';
@@ -247,7 +292,7 @@ export interface Leg {
   kickoff: string;
   market: Market;
   selection: Selection;
-  point?: number; // only for 'totals' / 'team_totals' — the over/under line, e.g. 2.5
+  point?: number; // 'totals' / 'team_totals': the over/under line, e.g. 2.5.  'asian_handicap': THIS selection's own handicap, e.g. -1.5 for home or +1.5 for away
   team?: TeamSide; // only for 'team_totals' — whose goals the line applies to
   oddsAtPlacement: number;
   status: LegStatus;
@@ -313,7 +358,7 @@ export interface OddsDay {
   calls: number;
   credits: number;
   errors: number;
-  byKind: Record<string, { calls: number; credits: number }>; // bulk | event_core | event_extra
+  byKind: Record<string, { calls: number; credits: number }>; // bulk | event_core | event_lines | event_extra
   byLeague: Record<string, number>; // credits
   byPurpose: Record<string, number>; // credits
 }
@@ -328,7 +373,7 @@ export interface FdDay {
 interface DayStats {
   odds: Record<string, OddsDay>; // by hashed key
   fd: Record<string, FdDay>; // by hashed token
-  cacheHits: Record<string, number>; // bulk | event_core | event_extra
+  cacheHits: Record<string, number>; // bulk | event_core | event_lines | event_extra
 }
 interface MonthStats {
   month: string;
@@ -415,7 +460,7 @@ const emptyOddsDay = (): OddsDay => ({ calls: 0, credits: 0, errors: 0, byKind: 
 const emptyFdDay = (): FdDay => ({ calls: 0, rateLimited: 0, forbidden: 0, errors: 0, peakPerMinute: 0, byEndpoint: {} });
 
 interface OddsCallMeta {
-  kind: 'bulk' | 'event_core' | 'event_extra';
+  kind: 'bulk' | 'event_core' | 'event_extra' | 'event_lines';
   league: LeagueId;
   purpose: Purpose;
 }
@@ -448,7 +493,7 @@ function recordFdStat(tokenHash: string, endpoint: string, status: number, perMi
 
 /** A cache hit on odds data = a request (and its credits) that never had to be made. */
 function recordCacheHit(cacheKey: string): Promise<void> {
-  const kind = cacheKey.startsWith('bulk') ? 'bulk' : cacheKey.endsWith('_extra') ? 'event_extra' : cacheKey.endsWith('_core') ? 'event_core' : null;
+  const kind = cacheKey.startsWith('bulk') ? 'bulk' : cacheKey.endsWith('_extra') ? 'event_extra' : cacheKey.endsWith('_core') ? 'event_core' : cacheKey.endsWith('_lines') ? 'event_lines' : null;
   if (!kind) return Promise.resolve();
   return mutateToday((day) => {
     day.cacheHits[kind] = (day.cacheHits[kind] ?? 0) + 1;
@@ -570,10 +615,138 @@ function teamsKnown(m: FootballDataMatch): boolean {
   return !!m.homeTeam?.name && !!m.awayTeam?.name;
 }
 
+// ── ESPN scoreboard (Europa League) ──────────────────────────────────────
+// football-data.org's free tier has no Europa League, so leagues flagged provider 'espn' take their
+// fixtures and results from ESPN's public scoreboard instead (no key, no published quota). It is an
+// UNDOCUMENTED API, so everything here is conservative:
+//   * ESPN answers 403 unless the request carries an identifying User-Agent. If you ever see
+//     "responded 403" in the log, set ESPN_USER_AGENT to  "<name>/1.0 (+https://your-repo-url)".
+//   * Only a plain STATUS_FULL_TIME result settles legs. Extra time / penalties and any status name we
+//     don't recognise are held as "in play" (legs stay pending) rather than guessed — a knockout tie
+//     decided after 120 minutes needs a regular-time score this feed doesn't give us.
+//   * ESPN matches never settle early (stage 'ESPN' is not in NO_EXTRA_TIME_STAGES) and carry no
+//     half-time score, so 1st-half markets aren't offered for these leagues (leagueHasHalfTimeData).
+const ESPN_BASE = 'https://site.api.espn.com/apis/site/v2/sports/soccer';
+const ESPN_USER_AGENT = process.env.ESPN_USER_AGENT?.trim() || 'sportybet-bot/1.0 (+https://github.com/macksyn/MEGA-MDX)';
+
+interface EspnCompetitor {
+  homeAway?: string;
+  score?: string | number;
+  team?: { id?: string | number; displayName?: string; shortDisplayName?: string };
+}
+interface EspnEvent {
+  id?: string | number;
+  date?: string;
+  status?: { type?: { name?: string; state?: string } };
+  competitions?: { competitors?: EspnCompetitor[] }[];
+}
+interface EspnScoreboard {
+  events?: EspnEvent[];
+}
+
+const warnedEspnStatus = new Set<string>();
+
+function mapEspnStatus(name: string, state: string): { status: string; duration?: 'REGULAR' | 'EXTRA_TIME' | 'PENALTY_SHOOTOUT' } {
+  switch (name) {
+    case 'STATUS_SCHEDULED':
+    case 'STATUS_DELAYED':
+      return { status: 'SCHEDULED' };
+    case 'STATUS_IN_PROGRESS':
+    case 'STATUS_FIRST_HALF':
+    case 'STATUS_SECOND_HALF':
+    case 'STATUS_EXTRA_TIME':
+    case 'STATUS_SHOOTOUT':
+      return { status: 'IN_PLAY' };
+    case 'STATUS_HALFTIME':
+    case 'STATUS_END_OF_REGULATION':
+    case 'STATUS_END_OF_EXTRATIME':
+      return { status: 'PAUSED' };
+    case 'STATUS_FULL_TIME':
+      return { status: 'FINISHED', duration: 'REGULAR' };
+    case 'STATUS_FINAL_AET':
+      return { status: 'FINISHED', duration: 'EXTRA_TIME' };
+    case 'STATUS_FINAL_PEN':
+      return { status: 'FINISHED', duration: 'PENALTY_SHOOTOUT' };
+    case 'STATUS_POSTPONED':
+      return { status: 'POSTPONED' };
+    case 'STATUS_CANCELED':
+    case 'STATUS_CANCELLED':
+      return { status: 'CANCELLED' };
+    case 'STATUS_SUSPENDED':
+    case 'STATUS_ABANDONED':
+      return { status: 'IN_PLAY' }; // never voided automatically on an undocumented feed — legs just stay pending
+  }
+  if (state === 'pre') return { status: 'SCHEDULED' };
+  if (!warnedEspnStatus.has(name)) {
+    warnedEspnStatus.add(name);
+    console.warn(`[sportybet] ESPN sent an unrecognised match status "${name}" (state "${state}") — treating it as in play, its legs stay pending`);
+  }
+  return { status: 'IN_PLAY' };
+}
+
+function espnGoals(v: unknown): number | null {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN;
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+function espnEventToMatch(ev: EspnEvent, info: LeagueInfo): FootballDataMatch | null {
+  const competitors = ev.competitions?.[0]?.competitors ?? [];
+  const homeC = competitors.find((c) => c.homeAway === 'home');
+  const awayC = competitors.find((c) => c.homeAway === 'away');
+  const homeName = homeC?.team?.displayName;
+  const awayName = awayC?.team?.displayName;
+  if (!ev.id || !ev.date || !homeC || !awayC || !homeName || !awayName) return null;
+  const kickoff = new Date(ev.date);
+  if (Number.isNaN(kickoff.getTime())) return null;
+
+  const { status, duration } = mapEspnStatus(ev.status?.type?.name ?? '', ev.status?.type?.state ?? '');
+  const started = status !== 'SCHEDULED' && status !== 'POSTPONED' && status !== 'CANCELLED';
+  const home = started ? espnGoals(homeC.score) : null;
+  const away = started ? espnGoals(awayC.score) : null;
+  const winner =
+    status === 'FINISHED' && duration === 'REGULAR' && home !== null && away !== null ? (home > away ? 'HOME_TEAM' : home < away ? 'AWAY_TEAM' : 'DRAW') : null;
+  const team = (c: EspnCompetitor, name: string): FootballDataTeam => ({ id: Number(c.team?.id) || 0, name, shortName: c.team?.shortDisplayName || undefined });
+
+  return {
+    id: Number(ev.id) || 0,
+    league: info.id,
+    stage: 'ESPN',
+    utcDate: kickoff.toISOString(),
+    status,
+    matchday: 0,
+    homeTeam: team(homeC, homeName),
+    awayTeam: team(awayC, awayName),
+    score: { winner, duration, fullTime: { home, away } },
+  };
+}
+
+const espnLogged = new Set<string>();
+
+async function fetchEspnMatches(info: LeagueInfo, daysBack: number, daysForward: number): Promise<FootballDataMatch[]> {
+  if (!info.espnSlug) throw new Error(`${info.name}: no ESPN slug configured`);
+  const ymd = (offsetDays: number): string => new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10).replace(/-/g, '');
+  const url = `${ESPN_BASE}/${info.espnSlug}/scoreboard?dates=${ymd(-daysBack)}-${ymd(daysForward)}&limit=500`;
+  const res = await fetch(url, { headers: { 'User-Agent': ESPN_USER_AGENT, Accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`ESPN ${info.espnSlug} scoreboard responded ${res.status}${res.status === 403 ? ' — set ESPN_USER_AGENT to "<name>/1.0 (+https://your-repo-url)"' : ''}`);
+  const data = (await res.json()) as EspnScoreboard;
+  const raw = data.events ?? [];
+  const matches = raw.map((e) => espnEventToMatch(e, info)).filter((m): m is FootballDataMatch => m !== null);
+  if (!espnLogged.has(info.id) || (raw.length > 0 && matches.length === 0)) {
+    espnLogged.add(info.id);
+    const sample = matches[0];
+    console.log(
+      `[sportybet] ESPN ${info.name}: ${raw.length} event(s) in ${daysBack}d back / ${daysForward}d ahead, ${matches.length} usable` +
+        (sample ? ` — e.g. ${sample.homeTeam.name} v ${sample.awayTeam.name} (${sample.status}, ${sample.utcDate.slice(0, 10)})` : '')
+    );
+  }
+  return matches;
+}
+
 /** Bettable fixture list — not-yet-played matches of ONE league. */
 export async function fetchUpcomingFixtures(league: LeagueId = DEFAULT_LEAGUE): Promise<FootballDataMatch[]> {
   const info = getLeague(league);
   return cached(`sportybet:upcoming:${info.id}`, FIXTURES_CACHE_TTL_MS, async () => {
+    if (info.provider === 'espn') return (await fetchEspnMatches(info, 0, 45)).filter((m) => m.status === 'SCHEDULED' && teamsKnown(m));
     const data = await footballDataGet<FootballDataMatchesResponse>(`/competitions/${info.footballDataCode}/matches?status=SCHEDULED`);
     return data.matches.filter(teamsKnown).map((m): FootballDataMatch => ({ ...m, league: info.id }));
   });
@@ -586,6 +759,7 @@ export async function fetchAllSeasonMatches(league: LeagueId = DEFAULT_LEAGUE, o
     `sportybet:season:${info.id}`,
     SEASON_MATCHES_CACHE_TTL_MS,
     async () => {
+      if (info.provider === 'espn') return (await fetchEspnMatches(info, 40, 60)).filter(teamsKnown);
       const data = await footballDataGet<FootballDataMatchesResponse>(`/competitions/${info.footballDataCode}/matches`);
       return data.matches.filter(teamsKnown).map((m): FootballDataMatch => ({ ...m, league: info.id }));
     },
@@ -963,6 +1137,13 @@ export interface TotalsLine {
   under: number;
 }
 
+/** One Asian-handicap line. `point` is the HOME side's handicap; away gets -point. Home wins if home goals + point > away goals. */
+export interface HandicapLine {
+  point: number;
+  home: number;
+  away: number;
+}
+
 /** Everything priced for ONE match beyond 1X2. Any key can be absent — the books simply may not list it. */
 export interface EventMarkets {
   btts?: { yes: number; no: number };
@@ -972,6 +1153,7 @@ export interface EventMarkets {
   double_chance_h1?: Record<DoubleChanceSel, number>;
   totals?: TotalsLine[]; // total-goals ladder, ascending by line
   team_totals?: { home: TotalsLine[]; away: TotalsLine[] };
+  asian_handicap?: HandicapLine[]; // ascending by the home side's handicap
   halftime_fulltime?: Partial<Record<HtFtSel, number>>;
 }
 
@@ -1138,12 +1320,53 @@ function parseLadder(outcomes: OddsApiOutcome[]): TotalsLine[] {
   return trimLadder(lines);
 }
 
+/** Keeps the lines nearest the "main" one (the pair of prices closest to level), ascending by home handicap. */
+function trimHandicap(lines: HandicapLine[]): HandicapLine[] {
+  const sorted = [...lines].sort((a, b) => a.point - b.point);
+  if (sorted.length <= MAX_LADDER_LINES) return sorted;
+  const main = sorted.reduce((best, l) => (Math.abs(l.home - l.away) < Math.abs(best.home - best.away) ? l : best));
+  return [...sorted]
+    .sort((a, b) => Math.abs(a.point - main.point) - Math.abs(b.point - main.point) || a.point - b.point)
+    .slice(0, MAX_LADDER_LINES)
+    .sort((a, b) => a.point - b.point);
+}
+
+/**
+ * Handicap outcomes arrive as { name: <team>, point: <that team's handicap>, price }. Home at -1.5 pairs with
+ * away at +1.5 — both must be priced or the line is dropped. Only whole and half lines are offered: quarter
+ * lines (-0.25, -0.75…) settle as half-win/half-loss, which a won/lost/voided leg can't express. The 0 line is
+ * skipped because Draw No Bet already is that market.
+ */
+function parseHandicap(outcomes: OddsApiOutcome[], home: string, away: string): HandicapLine[] {
+  const sideOf = (o: OddsApiOutcome): 'home' | 'away' | null =>
+    sameTeam(o.name, home) ? 'home' : sameTeam(o.name, away) ? 'away' : sameTeam(o.description, home) ? 'home' : sameTeam(o.description, away) ? 'away' : null;
+
+  const best = bestByBucket(outcomes, (o) => {
+    if (typeof o.point !== 'number' || !Number.isFinite(o.point)) return null;
+    const side = sideOf(o);
+    return side ? `${side}|${o.point}` : null;
+  });
+
+  const homePoints = new Set<number>();
+  for (const bucket of best.keys()) if (bucket.startsWith('home|')) homePoints.add(Number(bucket.slice(5)));
+
+  const lines: HandicapLine[] = [];
+  for (const point of homePoints) {
+    if (point === 0 || !Number.isInteger(point * 2)) continue;
+    const h = best.get(`home|${point}`);
+    const a = best.get(`away|${-point}`);
+    if (h !== undefined && a !== undefined) lines.push({ point, home: h, away: a });
+  }
+  return trimHandicap(lines);
+}
+
 /** Pure: raw event JSON -> EventMarkets. Exported so it can be tested without spending a credit. */
 export function parseEventMarkets(ev: OddsApiEvent, keys: readonly string[]): EventMarkets {
   const home = ev.home_team;
   const away = ev.away_team;
   const label = `${home} v ${away}`;
   const out: EventMarkets = {};
+  let handicapParsed = false;
 
   for (const key of keys) {
     const outcomes = outcomesFor(ev, key);
@@ -1189,6 +1412,16 @@ export function parseEventMarkets(ev: OddsApiEvent, keys: readonly string[]): Ev
         else console.warn(`[sportybet] ${label} ${key}: no outcome carried a recognisable team in "description" — market skipped`);
         break;
       }
+      case 'alternate_spreads':
+      case 'alternate_asian_handicap': {
+        // Two keys, one market: pool both so the best price per line wins, and only parse once.
+        if (handicapParsed) break;
+        handicapParsed = true;
+        const lines = parseHandicap([...outcomesFor(ev, 'alternate_spreads'), ...outcomesFor(ev, 'alternate_asian_handicap')], home, away);
+        if (lines.length) out.asian_handicap = lines;
+        else console.warn(`[sportybet] ${label} ${key}: no usable whole/half handicap line with both sides priced — market skipped`);
+        break;
+      }
       case 'halftime_fulltime': {
         const v = parseHtFt(outcomes, home, away, unparsed);
         if (v) out.halftime_fulltime = v;
@@ -1200,13 +1433,17 @@ export function parseEventMarkets(ev: OddsApiEvent, keys: readonly string[]): Ev
   return out;
 }
 
-async function fetchEventBundle(eventId: string, keys: readonly string[], tag: 'core' | 'extra', league: LeagueId, opts: FreshnessOpts = {}): Promise<EventMarkets> {
+async function fetchEventBundle(eventId: string, keys: readonly string[], tag: 'core' | 'extra' | 'lines', league: LeagueId, opts: FreshnessOpts = {}): Promise<EventMarkets> {
   return persistentCached<EventMarkets>(`evodds_${eventId}_${tag}`, EVENT_ODDS_CACHE_TTL_MS, async () => {
+    // LINES names its bookmakers (handicap / team-goal ladders live on a few specific books, not the UK region);
+    // every 10 bookmakers bill as one region.
+    const scope = tag === 'lines' ? `bookmakers=${LINES_BOOKMAKERS.join(',')}` : 'regions=uk';
+    const regionCount = tag === 'lines' ? Math.max(1, Math.ceil(LINES_BOOKMAKERS.length / 10)) : 1;
     const res = await oddsApiFetch(
       `/sports/${getLeague(league).oddsSportKey}/events/${eventId}/odds/`,
-      `regions=uk&markets=${keys.join(',')}&oddsFormat=decimal`,
+      `${scope}&markets=${keys.join(',')}&oddsFormat=decimal`,
       `event ${eventId} ${tag}`,
-      { worstCaseCost: keys.length, respectReserve: true, meta: { kind: tag === 'core' ? 'event_core' : 'event_extra', league, purpose: opts.purpose ?? 'betting' } } // worst case: every requested market comes back
+      { worstCaseCost: keys.length * regionCount, respectReserve: true, meta: { kind: tag === 'core' ? 'event_core' : tag === 'lines' ? 'event_lines' : 'event_extra', league, purpose: opts.purpose ?? 'betting' } } // worst case: every requested market comes back
     );
     if (!res.ok) throw new Error(`The Odds API event odds (${tag}) responded ${res.status}`);
     const ev = (await res.json()) as OddsApiEvent;
@@ -1221,13 +1458,24 @@ async function fetchEventBundle(eventId: string, keys: readonly string[], tag: '
   }, opts);
 }
 
-/** CORE bundle (btts, double chance, draw no bet, goal ladders). <= 5 credits, cached 24h. Call when a match is opened. */
-export function fetchCoreMarkets(eventId: string, league: LeagueId = DEFAULT_LEAGUE, opts: FreshnessOpts = {}): Promise<EventMarkets> {
-  return fetchEventBundle(eventId, CORE_MARKET_KEYS, 'core', league, opts);
+/**
+ * CORE bundle (btts, double chance, draw no bet, total-goals ladder; <= 4 credits) MERGED with the LINES bundle
+ * (Asian handicap + team-goal ladders; <= 3 credits, pinned bookmakers). Both cached 24h. Call when a match is
+ * opened. Every existing caller (match menu, booking codes, cash out) gets the handicap and team-goal markets
+ * through this one function. A LINES failure never takes the core markets down with it.
+ */
+export async function fetchCoreMarkets(eventId: string, league: LeagueId = DEFAULT_LEAGUE, opts: FreshnessOpts = {}): Promise<EventMarkets> {
+  const lines = fetchEventBundle(eventId, LINES_MARKET_KEYS, 'lines', league, opts).catch((err): EventMarkets => {
+    console.warn(`[sportybet] handicap / team-goal markets unavailable for event ${eventId}:`, err instanceof Error ? err.message : err);
+    return {};
+  });
+  const [core, extraLines] = await Promise.all([fetchEventBundle(eventId, CORE_MARKET_KEYS, 'core', league, opts), lines]);
+  return { ...core, ...extraLines };
 }
 
 /** EXTRA bundle (1st-half BTTS / double chance, HT/FT). <= 3 credits, cached 24h. Call ONLY on an explicit "More markets" tap. */
 export function fetchExtraMarkets(eventId: string, league: LeagueId = DEFAULT_LEAGUE, opts: FreshnessOpts = {}): Promise<EventMarkets> {
+  if (!leagueHasHalfTimeData(league)) return Promise.resolve({}); // ESPN leagues have no half-time score to settle these on — nothing to sell, nothing to spend
   return fetchEventBundle(eventId, EXTRA_MARKET_KEYS, 'extra', league, opts);
 }
 
@@ -1253,6 +1501,7 @@ export function availableMarkets(fixture: FixtureWithOdds, em: EventMarkets): Ma
   if (em.btts) markets.push('btts');
   if (em.double_chance) markets.push('double_chance');
   if (em.draw_no_bet) markets.push('draw_no_bet');
+  if (em.asian_handicap?.length) markets.push('asian_handicap');
   if (em.team_totals && (em.team_totals.home.length || em.team_totals.away.length)) markets.push('team_totals');
   if (em.btts_h1) markets.push('btts_h1');
   if (em.double_chance_h1) markets.push('double_chance_h1');
@@ -1285,6 +1534,12 @@ export function getMarketOptions(market: Market, fixture: FixtureWithOdds, em: E
       return ladder(em.totals);
     case 'team_totals':
       return team ? ladder(em.team_totals?.[team], team) : [];
+    case 'asian_handicap':
+      // Each option carries ITS OWN handicap: home at -1.5 sits next to away at +1.5.
+      return (em.asian_handicap ?? []).flatMap((l): MarketOption[] => [
+        { selection: 'home', point: l.point, odds: l.home },
+        { selection: 'away', point: -l.point, odds: l.away },
+      ]);
     case 'btts':
       return yesNo(em.btts);
     case 'btts_h1':
@@ -1918,7 +2173,7 @@ export const CASHOUT_MARGIN = 0.03;
 export const MIN_CASHOUT = 1;
 const CASHOUT_CLOSES_BEFORE_KICKOFF_MS = 10 * 60_000;
 const CASHOUT_BULK_MAX_AGE_MS = 15 * 60_000; // 1X2 prices (1 credit per league to refresh)
-const CASHOUT_EVENT_MAX_AGE_MS = 30 * 60_000; // other markets (core bundle: 5 credits per match to refresh)
+const CASHOUT_EVENT_MAX_AGE_MS = 30 * 60_000; // other markets (core + lines bundles: up to 7 credits per match to refresh)
 const CASHOUT_QUOTE_VALID_MS = 2 * 60_000; // an offer can only be taken this long after it was priced
 const FALLBACK_OVERROUND = 1.06; // assumed margin when a market's full set of prices isn't available
 
@@ -1956,6 +2211,16 @@ export function noVigProbability(market: Market, option: MarketOption, options: 
     case 'btts_h1':
     case 'draw_no_bet':
       siblings = options;
+      expectedSize = 2;
+      break;
+    case 'asian_handicap':
+      // The two sides of ONE line: this option plus the opposite team at the mirrored handicap.
+      siblings = options.filter(
+        (o) =>
+          o.point !== undefined &&
+          option.point !== undefined &&
+          ((o.selection === option.selection && o.point === option.point) || (o.selection !== option.selection && o.point === -option.point))
+      );
       expectedSize = 2;
       break;
     case 'double_chance':
@@ -2268,8 +2533,8 @@ export async function getUsageReport(): Promise<UsageReport> {
   }
   const cacheHitsMonth: Record<string, number> = {};
   for (const day of Object.values(thisMonth.days)) for (const [k, v] of Object.entries(day.cacheHits)) cacheHitsMonth[k] = (cacheHitsMonth[k] ?? 0) + v;
-  // What those hits would have cost as fresh calls: 1 credit for the bulk list, ~5 for a core bundle, ~3 for the extras.
-  const cacheSavedEstimate = (cacheHitsMonth.bulk ?? 0) * 1 + (cacheHitsMonth.event_core ?? 0) * 5 + (cacheHitsMonth.event_extra ?? 0) * 3;
+  // What those hits would have cost as fresh calls: 1 credit for the bulk list, ~4 for a core bundle, ~3 each for the lines and extras.
+  const cacheSavedEstimate = (cacheHitsMonth.bulk ?? 0) * 1 + (cacheHitsMonth.event_core ?? 0) * 4 + (cacheHitsMonth.event_lines ?? 0) * 3 + (cacheHitsMonth.event_extra ?? 0) * 3;
 
   // ── football-data.org ──
   const tokens: FdTokenReport[] = [];
@@ -2381,6 +2646,16 @@ function doubleChanceWins(selection: Selection, home: number, away: number): boo
 function settleLine(total: number, point: number, selection: Selection): 'won' | 'lost' | 'void' {
   if (total === point) return 'void';
   return (selection === 'over') === (total > point) ? 'won' : 'lost';
+}
+
+/**
+ * Asian handicap on a whole or half line: your goals + your handicap against theirs. Ahead -> won, level ->
+ * void (a whole line that lands exactly on it is a push, the stake stays in the coupon at 1.00), behind -> lost.
+ */
+function settleHandicap(own: number, opp: number, point: number): 'won' | 'lost' | 'void' {
+  const adjusted = own + point;
+  if (adjusted === opp) return 'void';
+  return adjusted > opp ? 'won' : 'lost';
 }
 
 /**
@@ -2520,6 +2795,12 @@ export function resolveLegResult(leg: Leg, match: FootballDataMatch): 'won' | 'l
     case 'halftime_fulltime': {
       const [ht, ft] = leg.selection.split('/');
       return resultCode(htHome!, htAway!) === ht && resultCode(home, away) === ft ? 'won' : 'lost';
+    }
+
+    case 'asian_handicap': {
+      if (leg.selection !== 'home' && leg.selection !== 'away') return null;
+      if (leg.point === undefined || leg.point === null || !Number.isInteger(leg.point * 2)) return null; // quarter / missing line — leave pending rather than guess
+      return leg.selection === 'home' ? settleHandicap(home, away, leg.point) : settleHandicap(away, home, leg.point);
     }
 
     default:
@@ -2781,6 +3062,12 @@ function doubleChanceLabel(selection: Selection, home: string, away: string): st
   return `${home} or ${away}`;
 }
 
+/** "-1.5", "+1.5", "0" — the sign always shown on a handicap. */
+export function formatHandicap(point: number | undefined): string {
+  if (point === undefined) return '';
+  return point > 0 ? `+${point}` : String(point);
+}
+
 /** Shared with plugins/sportybet.ts's slip preview so a leg reads the same way everywhere. */
 export function legPickLabel(leg: {
   market: Market;
@@ -2801,6 +3088,8 @@ export function legPickLabel(leg: {
       return overUnder;
     case 'team_totals':
       return `${leg.team === 'away' ? away : home} ${overUnder}`;
+    case 'asian_handicap':
+      return `${leg.selection === 'away' ? away : home} ${formatHandicap(leg.point)} (Asian Handicap)`;
     case 'btts':
       return leg.selection === 'yes' ? 'BTTS: Yes' : 'BTTS: No';
     case 'btts_h1':
