@@ -210,7 +210,7 @@ export async function checkEligibility(userId: string): Promise<EligibilityResul
     return { eligible: false, reason: 'defaulted_loan' };
   }
 
-  const repaidStreak = computeRepaidStreak(history);
+  const repaidStreak = computeRepaidStreak(hist6ory);
   // BUG FIX: this used to call getLevelInfo(wallet.exchangeCount) directly,
   // omitting rollingCount and level2SinceTs. Both default to values that
   // ALWAYS demote a Level 2+ member back to Level 1 (rollingCount defaults
@@ -251,10 +251,13 @@ export type ApplyResult =
   | { success: false; reason: 'bank_capacity'; maxAvailable: number }
   | { success: true; loan: Loan };
 
-export async function applyForLoan(userId: string, requestedAmount: number): Promise<ApplyResult> {
+async function _applyForLoan(userId: string, requestedAmount: number): Promise<ApplyResult> {
   if (!Number.isFinite(requestedAmount) || requestedAmount < MIN_LOAN_AMOUNT) {
     return { success: false, reason: 'below_minimum' };
   }
+
+  export const applyForLoan = (userId: string, requestedAmount: number): Promise<ApplyResult> =>
+  withUserLock(`loan:${userId}`, () => _applyForLoan(userId, requestedAmount));
 
   const eligibility = await checkEligibility(userId);
   if (!eligibility.eligible) return { success: false, reason: 'ineligible', eligibility };
@@ -310,9 +313,12 @@ export type RepayResult =
   | { success: false; reason: 'insufficient_funds'; needed: number }
   | { success: true; loan: Loan; paid: number; remaining: number; fullyRepaid: boolean; onTime: boolean };
 
-export async function repayLoan(userId: string, amount: number | 'all'): Promise<RepayResult> {
+async function _repayLoan(userId: string, amount: number | 'all'): Promise<RepayResult> {
   const loan = await getRepayableLoan(userId);
   if (!loan) return { success: false, reason: 'no_outstanding_loan' };
+
+  export const repayLoan = (userId: string, amount: number | 'all'): Promise<RepayResult> =>
+  withUserLock(`loan:${userId}`, () => _repayLoan(userId, amount));
 
   const requested = amount === 'all' ? loan.balance : Math.floor(amount);
   if (!requested || requested <= 0) return { success: false, reason: 'invalid_amount' };

@@ -24,7 +24,7 @@ import {
 } from '../lib/bank/ledger.js';
 import { runApp, askAmount, parseAmount, type Screen, type BankCtx } from '../lib/bank/ui.js';
 
-export const command = 'bank';
+export const command = 'banktest';
 export const aliases = ['atm', 'savings'];
 export const category = 'economy';
 export const cooldown = 3000;
