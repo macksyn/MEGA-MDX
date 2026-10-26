@@ -1,6 +1,6 @@
 // @ts-nocheck
 /***
- * lib/bank/ui.ts
+ * lib/bankUi.ts
  *
  * Screen router for the bank app, built on lib/buttonSession.ts's promptMenu.
  * buttonSession is one-shot ("send a menu, await one tap"); a banking app is
@@ -24,9 +24,9 @@
  * Swapping menu backend: the import below can point at lib/menuSession.js
  * (numbered replies) — same promptMenu signature — if list menus misbehave.
  */
-import { promptMenu, type MenuOption } from '../buttonSession.js';
-import { cleanJid } from '../isOwner.js';
-import config from '../../config.js';
+import { promptMenu, type MenuOption } from './buttonSession.js';
+import { cleanJid } from './isOwner.js';
+import config from '../config.js';
 
 export interface BankCtx {
   sock: any;

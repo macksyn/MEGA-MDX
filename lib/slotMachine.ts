@@ -79,18 +79,22 @@ export async function getJackpotPool(): Promise<number> {
  * lose, the stake just stays banked.
  */
 export async function contributeToJackpot(bet: number): Promise<number> {
+  // mutate() holds the store's per-key lock — the old get-then-set let two
+  // simultaneous bets overwrite each other and the bankroll silently drifted.
   return jackpotTbl.mutate('pool', (cur: any) => (typeof cur === 'number' ? cur : JACKPOT_SEED) + bet);
 }
 
 /** Pays a payout out of the jackpot pool, respecting the protected floor seed. */
 export async function deductFromJackpot(amount: number): Promise<number> {
-  const pool = await getJackpotPool();
-  const newPool = Math.max(JACKPOT_SEED, pool - amount);
-  await jackpotTbl.set('pool', newPool);
-  return newPool;
+  return jackpotTbl.mutate('pool', (cur: any) =>
+    Math.max(JACKPOT_SEED, (typeof cur === 'number' ? cur : JACKPOT_SEED) - amount));
 }
 
-/** Strict draw: succeeds only if the pool stays >= JACKPOT_SEED afterwards. Atomic. */
+/**
+ * STRICT, atomic draw for anything that must not be short-paid or clamped
+ * (loans, bank interest). Succeeds only if the pool stays >= JACKPOT_SEED
+ * afterwards; otherwise nothing is taken and ok is false.
+ */
 export async function drawFromReserve(amount: number): Promise<{ ok: boolean; pool: number }> {
   let ok = false;
   const pool = await jackpotTbl.mutate('pool', (cur: any) => {
@@ -227,9 +231,12 @@ export async function getTodayProfit(): Promise<number> {
 
 /** Records house activity for a specific spin or game */
 export async function recordHouseActivity(bet: number, payout: number): Promise<void> {
-  const day = new Date().toISOString().split('T')[0];
-  await houseStatsTbl.mutate(`${day}_bet`, (c: any) => (Number(c) || 0) + bet);
-  await houseStatsTbl.mutate(`${day}_won`, (c: any) => (Number(c) || 0) + payout);
+  const todayStr = new Date().toISOString().split('T')[0];
+  const betKey = `${todayStr}_bet`;
+  const wonKey = `${todayStr}_won`;
+
+  await houseStatsTbl.mutate(betKey, (c: any) => (Number(c) || 0) + bet);
+  await houseStatsTbl.mutate(wonKey, (c: any) => (Number(c) || 0) + payout);
 }
 
 // ── Bank solvency & house mood ──────────────────────────────────────────────

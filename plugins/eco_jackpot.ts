@@ -23,7 +23,7 @@ import isOwnerOrSudo, { cleanJid } from '../lib/isOwner.js';
 import { checkEligibility } from '../lib/loans.js';
 
 export const command = 'reserve';
-export const aliases = ['jackpot', 'bank'];
+export const aliases = ['jackpot']; // 'bank' now belongs to plugins/bank.ts
 export const category = 'economy-games';
 export const cooldown = 3000;
 

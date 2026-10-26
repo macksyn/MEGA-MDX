@@ -1,6 +1,6 @@
 // @ts-nocheck
 /***
- * lib/bank/ledger.ts
+ * lib/bankLedger.ts
  *
  * Customer savings accounts for the community bank. Pure money logic — no
  * WhatsApp / sock code — so every screen, command and scheduled job goes
@@ -26,9 +26,9 @@
  * account write therefore bumps `rev` and is read back; a mismatch throws, so
  * a silently-failed write can't be reported to the player as a success.
  */
-import { createStore } from '../pluginStore.js';
-import { addCoins, deductCoins } from '../economy.js';
-import { withUserLock } from './lock.js';
+import { createStore } from './pluginStore.js';
+import { addCoins, deductCoins } from './economy.js';
+import { withUserLock } from './bankLock.js';
 
 const root = createStore('bank');
 const accountsTbl = root.table('accounts'); // userId -> Account

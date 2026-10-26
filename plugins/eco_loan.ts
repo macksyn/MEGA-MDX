@@ -28,7 +28,7 @@ import {
   LOAN_TIERS, INTEREST_RATE, DEFAULT_INTEREST_RATE, MIN_LOAN_AMOUNT, GRACE_PERIOD_MS, GARNISHMENT_RATE,
 } from '../lib/loans.js';
 import { promptMenu } from '../lib/menuSession.js';
-import { cleanJid, isOwnerOnly } from '../lib/isOwner.js';
+import isOwnerOrSudo, { cleanJid } from '../lib/isOwner.js';
 
 export const command = 'loan';
 export const aliases = ['loans', 'borrow'];
@@ -423,7 +423,7 @@ async function handleRepayDirect(sock, message, context, userId, args) {
 async function handleAdmin(sock, message, context, userId, args) {
   const { chatId, channelInfo } = context;
 
-  if (!isOwnerOnly(userId)) {
+  if (!(await isOwnerOrSudo(context.senderId, sock, chatId))) {
     await sock.sendMessage(chatId, { text: `❌ That view is for admins only.`, ...channelInfo }, { quoted: message });
     return;
   }

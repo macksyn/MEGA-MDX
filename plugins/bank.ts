@@ -3,7 +3,7 @@
  * plugins/bank.ts
  *
  * {prefix}bank — the community bank as a button-menu app. Phase 1: home
- * dashboard, deposit, withdraw, statement. Savings live in lib/bank/ledger.ts
+ * dashboard, deposit, withdraw, statement. Savings live in lib/bankLedger.ts
  * (separate from the jackpot pool); see that file for the money model.
  *
  * Bare `{prefix}bank` opens the menu. Typed shortcuts skip it:
@@ -21,10 +21,10 @@ import { getJackpotPool, JACKPOT_SEED } from '../lib/slotMachine.js';
 import {
   BANK_CONFIG, getAccount, getStatement, getBankTotals, getUnfinishedMoves,
   deposit, withdraw, recoverPending,
-} from '../lib/bank/ledger.js';
-import { runApp, askAmount, parseAmount, type Screen, type BankCtx } from '../lib/bank/ui.js';
+} from '../lib/bankLedger.js';
+import { runApp, askAmount, parseAmount, type Screen, type BankCtx } from '../lib/bankUi.js';
 
-export const command = 'banktest';
+export const command = 'bank';
 export const aliases = ['atm', 'savings'];
 export const category = 'economy';
 export const cooldown = 3000;
@@ -251,7 +251,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 export const handler = withEconomyGuard(_handler);
 export const usage = `${BANK} — opens the bank. Or: ${BANK} <deposit|withdraw|statement> [amount|all]`;
 
-// Rolls forward any deposit/withdrawal that died halfway (see lib/bank/ledger.ts).
+// Rolls forward any deposit/withdrawal that died halfway (see lib/bankLedger.ts).
 export const schedules = [
   {
     every: 5 * 60 * 1000,

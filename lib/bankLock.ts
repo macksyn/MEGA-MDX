@@ -1,6 +1,6 @@
 // @ts-nocheck
 /***
- * lib/bank/lock.ts
+ * lib/bankLock.ts
  *
  * Per-key async mutex. pluginStore's mutate() only protects ONE record at a
  * time; a bank operation touches several (wallet + savings account + journal),

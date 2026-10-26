@@ -47,9 +47,8 @@
  */
 import { createStore } from './pluginStore.js';
 import { getPlayerLevel, addCoins, deductCoins, registerGarnishmentHandler, type TransactionMeta } from './economy.js';
-import { getJackpotPool, deductFromJackpot, contributeToJackpot, settleWin } from './slotMachine.js';
-import { drawFromReserve, contributeToJackpot, JACKPOT_SEED } from './slotMachine.js';
-import { withUserLock } from './bank/lock.js';
+import { getJackpotPool, deductFromJackpot, contributeToJackpot, settleWin, drawFromReserve, JACKPOT_SEED } from './slotMachine.js';
+import { withUserLock } from './bankLock.js';
 
 const root = createStore('loans');
 const loansTbl = root.table('loans'); // userId -> Loan[] (full history, most recent first)
@@ -210,7 +209,7 @@ export async function checkEligibility(userId: string): Promise<EligibilityResul
     return { eligible: false, reason: 'defaulted_loan' };
   }
 
-  const repaidStreak = computeRepaidStreak(hist6ory);
+  const repaidStreak = computeRepaidStreak(history);
   // BUG FIX: this used to call getLevelInfo(wallet.exchangeCount) directly,
   // omitting rollingCount and level2SinceTs. Both default to values that
   // ALWAYS demote a Level 2+ member back to Level 1 (rollingCount defaults
@@ -251,13 +250,15 @@ export type ApplyResult =
   | { success: false; reason: 'bank_capacity'; maxAvailable: number }
   | { success: true; loan: Loan };
 
+// Serialized per user so a double-tap / spammed command can't open two loans.
+export function applyForLoan(userId: string, requestedAmount: number): Promise<ApplyResult> {
+  return withUserLock(`loan:${userId}`, () => _applyForLoan(userId, requestedAmount));
+}
+
 async function _applyForLoan(userId: string, requestedAmount: number): Promise<ApplyResult> {
   if (!Number.isFinite(requestedAmount) || requestedAmount < MIN_LOAN_AMOUNT) {
     return { success: false, reason: 'below_minimum' };
   }
-
-  export const applyForLoan = (userId: string, requestedAmount: number): Promise<ApplyResult> =>
-  withUserLock(`loan:${userId}`, () => _applyForLoan(userId, requestedAmount));
 
   const eligibility = await checkEligibility(userId);
   if (!eligibility.eligible) return { success: false, reason: 'ineligible', eligibility };
@@ -271,6 +272,9 @@ async function _applyForLoan(userId: string, requestedAmount: number): Promise<A
   // explicit ask with explicit interest terms; giving less than requested
   // while still charging interest as if the full amount was disbursed would
   // be a bait-and-switch.
+  // Atomic + strict: drawFromReserve() checks the floor and takes the money in
+  // ONE locked step, so two simultaneous applicants can't both pass the check
+  // and overdraw the bank (the old settleWin-then-deduct pair could).
   const draw = await drawFromReserve(amount);
   if (!draw.ok) {
     return { success: false, reason: 'bank_capacity', maxAvailable: Math.max(0, draw.pool - JACKPOT_SEED) };
@@ -313,12 +317,13 @@ export type RepayResult =
   | { success: false; reason: 'insufficient_funds'; needed: number }
   | { success: true; loan: Loan; paid: number; remaining: number; fullyRepaid: boolean; onTime: boolean };
 
+export function repayLoan(userId: string, amount: number | 'all'): Promise<RepayResult> {
+  return withUserLock(`loan:${userId}`, () => _repayLoan(userId, amount));
+}
+
 async function _repayLoan(userId: string, amount: number | 'all'): Promise<RepayResult> {
   const loan = await getRepayableLoan(userId);
   if (!loan) return { success: false, reason: 'no_outstanding_loan' };
-
-  export const repayLoan = (userId: string, amount: number | 'all'): Promise<RepayResult> =>
-  withUserLock(`loan:${userId}`, () => _repayLoan(userId, amount));
 
   const requested = amount === 'all' ? loan.balance : Math.floor(amount);
   if (!requested || requested <= 0) return { success: false, reason: 'invalid_amount' };
@@ -513,7 +518,8 @@ export async function markReminderSent(userId: string, loanId: string, kind: 'du
 // wallet. Peer-to-peer transfers are explicitly exempted — a friend's gift
 // shouldn't get clawed toward a stranger's debt.
 
-const GARNISHMENT_EXEMPT_TYPES = new Set(['transfer_in','bank_withdraw','bank_refund']);
+// bank_withdraw / bank_refund: moving your OWN savings back to your wallet isn't new income.
+const GARNISHMENT_EXEMPT_TYPES = new Set(['transfer_in', 'bank_withdraw', 'bank_refund']);
 
 async function garnishIncomingCredit(
   userId: string,
