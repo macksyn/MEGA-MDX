@@ -6,6 +6,12 @@
  * dashboard, deposit, withdraw, statement. Savings live in lib/bankLedger.ts
  * (separate from the jackpot pool); see that file for the money model.
  *
+ * The HOME screen is the public reserve board players already know from
+ * {prefix}reserve (pool, protected floor, available, today's flow, house
+ * mood) with the member's own wallet / savings / loan underneath and the menu
+ * buttons below. Same disclosure rules as {prefix}reserve: nothing here names
+ * the solvency level, pressure, RTP or the mood mechanic — that stays admin-only.
+ *
  * Bare `{prefix}bank` opens the menu. Typed shortcuts skip it:
  *   {prefix}bank deposit <amount|all>     {prefix}bank withdraw <amount|all>
  *   {prefix}bank statement                {prefix}bank admin   (owner/sudo)
@@ -16,8 +22,8 @@
 import { formatNumber, getWallet, withEconomyGuard } from '../lib/economy.js';
 import config from '../config.js';
 import isOwnerOrSudo, { cleanJid } from '../lib/isOwner.js';
-import { getRepayableLoan } from '../lib/loans.js';
-import { getJackpotPool, JACKPOT_SEED } from '../lib/slotMachine.js';
+import { getRepayableLoan, checkEligibility } from '../lib/loans.js';
+import { getJackpotPool, getTodayStats, getHouseMood, JACKPOT_SEED } from '../lib/slotMachine.js';
 import {
   BANK_CONFIG, getAccount, getStatement, getBankTotals, getUnfinishedMoves,
   deposit, withdraw, recoverPending,
@@ -42,10 +48,46 @@ function duration(ms: number): string {
 }
 
 function loanLine(loan: any): string {
-  if (!loan) return `💳 Loan       none`;
-  if (loan.status === 'defaulted') return `💳 Loan       owes ${fmt(loan.balance)} · 🔴 default`;
+  if (!loan) return `💳 Loan: none`;
+  if (loan.status === 'defaulted') return `💳 Loan: owes *${fmt(loan.balance)}* · 🔴 in default`;
   const left = loan.dueAt - Date.now();
-  return `💳 Loan       owes ${fmt(loan.balance)} · ${left >= 0 ? `due in ${duration(left)}` : '⚠️ overdue'}`;
+  return `💳 Loan: owes *${fmt(loan.balance)}* · ${left >= 0 ? `due in ${duration(left)}` : '⚠️ overdue'}`;
+}
+
+// Same ambient copy as the public {prefix}reserve board — deliberately vague so the board can't be
+// used to time bets around the house mood window.
+const MOOD_FLAVOR: Record<string, string> = {
+  hot:     `🌤️ The bank's been feeling generous lately.`,
+  cold:    `🌥️ The bank's been playing it a little safe lately.`,
+  neutral: `⛅ The bank's running steady as usual.`,
+};
+
+const BAR_SIZE = 10;
+const RULE = '━━━━━━━━━━━━━━';
+// Interactive message bodies are capped (~1024 chars on WhatsApp); stay safely under it.
+const BODY_LIMIT = 980;
+
+const bar = (fraction: number) => {
+  const filled = Math.max(0, Math.min(BAR_SIZE, Math.round(fraction * BAR_SIZE)));
+  return `${'█'.repeat(filled)}${'░'.repeat(BAR_SIZE - filled)}`;
+};
+
+// Member-savings total scans every account, so cache it briefly. Bank moves in THIS plugin
+// invalidate it so a player never sees their own deposit missing from the board.
+let totalsCache = { at: 0, value: { accounts: 0, totalDeposits: 0 } };
+async function cachedTotals() {
+  if (Date.now() - totalsCache.at < 15_000) return totalsCache.value;
+  const value = await getBankTotals();
+  totalsCache = { at: Date.now(), value };
+  return value;
+}
+const invalidateTotals = () => { totalsCache.at = 0; };
+
+function boardStamp(): string {
+  return new Date().toLocaleString('en-GB', {
+    timeZone: config.timeZone || 'Africa/Lagos', weekday: 'short', day: '2-digit', month: 'short',
+    hour: '2-digit', minute: '2-digit',
+  });
 }
 
 const KIND_ICON: Record<string, string> = {
@@ -79,27 +121,89 @@ function chipAmounts(base: number, ceiling = Infinity): number[] {
 
 const home: Screen = {
   async view(ctx) {
-    const [wallet, account, loan] = await Promise.all([
+    const [wallet, account, loan, pool, today, mood, totals] = await Promise.all([
       getWallet(ctx.userId),
       getAccount(ctx.userId),
       getRepayableLoan(ctx.userId).catch(() => null),
+      getJackpotPool(),
+      getTodayStats(),
+      getHouseMood().catch(() => null),
+      cachedTotals().catch(() => null),
     ]);
+
+    // Same silent hint as {prefix}reserve: only ever shown to someone who is actually eligible right now.
+    let loanHint = '';
+    if (!loan) {
+      try {
+        const e = await checkEligibility(ctx.userId);
+        if (e.eligible) loanHint = `✨ _You can borrow up to ${fmt(e.maxAmount)} coins — type *${PREFIX}loan*_`;
+      } catch (_) { /* best-effort */ }
+    }
+
+    const surplus = Math.max(0, pool - JACKPOT_SEED);
+    const insured = pool > 0 ? Math.min(1, JACKPOT_SEED / pool) : 1;
+    const netSign = today.net > 0 ? '+' : '';
+
+    // ── Reserve board ──
+    const reserve = [
+      `🏛️ *RESERVE*`,
+      `💰 Balance: *${fmt(pool)}* coins`,
+      `🛡️ Insurance: ${fmt(JACKPOT_SEED)}`,
+      `🎯 Available to win: *${fmt(surplus)}*`,
+      `${bar(insured)} ${Math.round(insured * 100)}% insured`,
+    ].join('\n');
+
+    const todayBlock = [
+      `📊 *TODAY*`,
+      `⬆️ Income ${fmt(today.bet)}  ·  ⬇️ Paid out ${fmt(today.won)}`,
+      `⚖️ Profit: *${netSign}${fmt(today.net)}*`,
+    ].join('\n');
+
+    const moodLine = mood ? (MOOD_FLAVOR[mood.mood] || MOOD_FLAVOR.neutral) : '';
+    const heldLine = totals && totals.totalDeposits > 0
+      ? `🔐 Member savings vault: *${fmt(totals.totalDeposits)}* _(kept apart from the reserve)_`
+      : '';
+
+    // ── Your account ──
+    const you = [
+      `👤 *YOUR ACCOUNT*`,
+    //`💰 Wallet: ${fmt(wallet.coins)}`,
+      `🔐 Savings: *${fmt(account.balance)}*`,
+      `📦 Total: *${fmt(wallet.coins + account.balance)}*`,
+      loanLine(loan),
+    ].join('\n');
+
+    // Required sections first; optional extras are dropped (last-added first) if the body runs long.
+    const optional = { mood: moodLine, held: heldLine, hint: loanHint };
+    const compose = () => [
+      reserve,
+      [todayBlock, optional.mood].filter(Boolean).join('\n'),
+      optional.held,
+      `${RULE}\n${you}${optional.hint ? `\n${optional.hint}` : ''}`,
+    ].filter(Boolean).join('\n\n');
+
+    let text = compose();
+    for (const key of ['hint', 'held', 'mood'] as const) {
+      if (text.length <= BODY_LIMIT) break;
+      optional[key] = '';
+      text = compose();
+    }
+
     return {
-      title: '🏦 COMMUNITY BANK',
-      text:
-        `💰 Wallet     ${fmt(wallet.coins)}\n` +
-        `🔐 Savings    ${fmt(account.balance)}\n` +
-        `━━━━━━━━━━━━━━\n` +
-        `📦 Total       ${fmt(wallet.coins + account.balance)}\n` +
-        `${loanLine(loan)}`,
+      title: '🏦 COMMUNITY BANK',          // doubles as the list-button label — keep short
+      subtitle: `Live board · ${boardStamp()}`,
+      text,
+      footer: 'Fed by Jungle Hunt · Coinflip · Dice',
       options: [
         { label: '📥 Deposit', value: 'deposit', description: 'Wallet → savings' },
         { label: '📤 Withdraw', value: 'withdraw', description: 'Savings → wallet' },
-        { label: '🧾 Statement', value: 'statement', description: 'Recent activity' },
+        { label: '🧾 Statement', value: 'statement', description: 'Your recent activity' },
+        { label: '🔄 Refresh', value: 'refresh', description: 'Update the live numbers' },
       ],
     };
   },
   async select(value) {
+    if (value === 'refresh') return { stay: true };
     return { go: value };
   },
 };
@@ -132,6 +236,7 @@ const depositScreen: Screen = {
       amount = parseInt(value, 10);
     }
     const r = await deposit(ctx.userId, amount as number);
+    invalidateTotals();
     if (!r.ok) return { stay: true, notice: failureText(r) };
     return {
       go: 'home', reset: true,
@@ -167,6 +272,7 @@ const withdrawScreen: Screen = {
       amount = parseInt(value, 10);
     }
     const r = await withdraw(ctx.userId, amount);
+    invalidateTotals();
     if (!r.ok) return { stay: true, notice: failureText(r) };
     return {
       go: 'home', reset: true,
@@ -227,6 +333,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
       const amount = raw === 'all' ? wallet.coins : parseAmount(raw);
       if (!amount) return reply(sock, message, chatId, channelInfo, `❌ Usage: ${BANK} deposit <amount|all>`);
       const r = await deposit(userId, amount as number);
+      invalidateTotals();
       return reply(sock, message, chatId, channelInfo, r.ok
         ? `✅ Deposited *${fmt(r.entry.amount)} coins*\nSavings balance: *${fmt(r.account.balance)}*`
         : failureText(r));
@@ -234,6 +341,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     const amount = parseAmount(raw, true);
     if (!amount) return reply(sock, message, chatId, channelInfo, `❌ Usage: ${BANK} withdraw <amount|all>`);
     const r = await withdraw(userId, amount);
+    invalidateTotals();
     return reply(sock, message, chatId, channelInfo, r.ok
       ? `✅ Withdrew *${fmt(Math.abs(r.entry.amount))} coins*\nSavings balance: *${fmt(r.account.balance)}*`
       : failureText(r));

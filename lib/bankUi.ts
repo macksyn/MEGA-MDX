@@ -38,9 +38,10 @@ export interface BankCtx {
 }
 
 export interface ScreenView {
-  title: string;
+  title: string;       // also the label on the list-menu button, so keep it SHORT (~20 chars)
   subtitle?: string;
   text: string;
+  footer?: string;     // overrides the default "Expires in N mins" footer
   options: MenuOption[];
 }
 
@@ -61,6 +62,8 @@ const SCREEN_TTL_MS = 3 * 60_000;
 
 export async function runApp(ctx: BankCtx, screens: Record<string, Screen>, start: string): Promise<void> {
   const stack: Array<{ id: string; params?: any }> = [{ id: start }];
+  let lastView: ScreenView | null = null;
+  let anyMenuSent = false;
 
   try {
     for (let step = 0; step < MAX_STEPS && stack.length > 0; step++) {
@@ -69,6 +72,7 @@ export async function runApp(ctx: BankCtx, screens: Record<string, Screen>, star
       if (!screen) throw new Error(`unknown bank screen "${top.id}"`);
 
       const view = await screen.view(ctx, top.params);
+      lastView = view;
       const options = [...view.options];
       if (stack.length > 1) options.push({ label: '⬅️ Back', value: BACK });
 
@@ -80,8 +84,10 @@ export async function runApp(ctx: BankCtx, screens: Record<string, Screen>, star
         subtitle: view.subtitle,
         text,
         options,
+        footer: view.footer,
         ttlMs: SCREEN_TTL_MS,
       });
+      anyMenuSent = true;
 
       if (res.cancelled || res.timedOut || res.value == null) return;
       if (res.value === BACK) { stack.pop(); continue; }
@@ -99,8 +105,19 @@ export async function runApp(ctx: BankCtx, screens: Record<string, Screen>, star
     }
   } catch (err: any) {
     console.error('[bank/ui] session error:', err);
+    const prefix = config.prefix || '.';
+
+    // The very first menu failed to send (button transport problem). Players are used to typing
+    // "bank" to read the reserve, so still show them the board as plain text instead of an error.
+    if (!anyMenuSent && lastView) {
+      const plain =
+        `*${lastView.title}*\n` + (lastView.subtitle ? `_${lastView.subtitle}_\n` : '') + `\n${lastView.text}\n\n` +
+        `_Menu buttons are unavailable right now — use *${prefix}bank deposit <amount>*, *${prefix}bank withdraw <amount>* or *${prefix}bank statement*._`;
+      const sent = await ctx.sock.sendMessage(ctx.chatId, { text: plain, ...ctx.channelInfo }, { quoted: ctx.message }).then(() => true, () => false);
+      if (sent) return;
+    }
     await ctx.sock.sendMessage(ctx.chatId, {
-      text: `⚠️ Something went wrong. Your coins are safe — run *${config.prefix || '.'}bank* to try again.`,
+      text: `⚠️ Something went wrong. Your coins are safe — run *${prefix}bank* to try again.`,
       ...ctx.channelInfo,
     }, { quoted: ctx.message }).catch(() => {});
   }
