@@ -169,7 +169,7 @@ const home: Screen = {
       `👤 *YOUR ACCOUNT*`,
     //`💰 Wallet: ${fmt(wallet.coins)}`,
       `🔐 Savings: *${fmt(account.balance)}*`,
-      `📦 Total: *${fmt(wallet.coins + account.balance)}*`,
+      `📦 Total: *${fmt(account.balance)}*`,
       loanLine(loan),
     ].join('\n');
 
