@@ -93,6 +93,17 @@ export async function deductFromJackpot(amount: number): Promise<number> {
   return newPool;
 }
 
+/** Strict draw: succeeds only if the pool stays >= JACKPOT_SEED afterwards. Atomic. */
+export async function drawFromReserve(amount: number): Promise<{ ok: boolean; pool: number }> {
+  let ok = false;
+  const pool = await jackpotTbl.mutate('pool', (cur: any) => {
+    const p = typeof cur === 'number' ? cur : JACKPOT_SEED;
+    if (amount > 0 && p - amount >= JACKPOT_SEED) { ok = true; return p - amount; }
+    return p;
+  });
+  return { ok, pool };
+}
+
 export interface SettledPayout {
   payout: number;
   capped: boolean; // true if the bank couldn't afford the full rolled payout and this was capped down

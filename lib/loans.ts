@@ -48,6 +48,8 @@
 import { createStore } from './pluginStore.js';
 import { getPlayerLevel, addCoins, deductCoins, registerGarnishmentHandler, type TransactionMeta } from './economy.js';
 import { getJackpotPool, deductFromJackpot, contributeToJackpot, settleWin } from './slotMachine.js';
+import { drawFromReserve, contributeToJackpot, JACKPOT_SEED } from './slotMachine.js';
+import { withUserLock } from './bank/lock.js';
 
 const root = createStore('loans');
 const loansTbl = root.table('loans'); // userId -> Loan[] (full history, most recent first)
@@ -266,13 +268,10 @@ export async function applyForLoan(userId: string, requestedAmount: number): Pro
   // explicit ask with explicit interest terms; giving less than requested
   // while still charging interest as if the full amount was disbursed would
   // be a bait-and-switch.
-  const pool = await getJackpotPool();
-  const { payout: maxAvailable } = settleWin(amount, pool);
-  if (maxAvailable < amount) {
-    return { success: false, reason: 'bank_capacity', maxAvailable };
+  const draw = await drawFromReserve(amount);
+  if (!draw.ok) {
+    return { success: false, reason: 'bank_capacity', maxAvailable: Math.max(0, draw.pool - JACKPOT_SEED) };
   }
-
-  await deductFromJackpot(amount);
 
   const now = Date.now();
   const standardInterest = Math.round(amount * INTEREST_RATE);
@@ -508,7 +507,7 @@ export async function markReminderSent(userId: string, loanId: string, kind: 'du
 // wallet. Peer-to-peer transfers are explicitly exempted — a friend's gift
 // shouldn't get clawed toward a stranger's debt.
 
-const GARNISHMENT_EXEMPT_TYPES = new Set(['transfer_in']);
+const GARNISHMENT_EXEMPT_TYPES = new Set(['transfer_in','bank_withdraw','bank_refund']);
 
 async function garnishIncomingCredit(
   userId: string,

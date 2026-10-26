@@ -317,6 +317,7 @@ export type TransactionType =
   | 'exchange_out' | 'exchange_in'
   | 'convert' | 'sportybet'
   | 'slots' | 'coinflip' | 'dice'
+  | 'bank_deposit' | 'bank_withdraw' | 'bank_refund'
   | 'admin_credit' | 'admin_debit' | 'admin_reset'
   | 'withdrawal_hold' | 'withdrawal_refund'
   | 'other';
