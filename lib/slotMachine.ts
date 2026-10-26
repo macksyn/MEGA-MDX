@@ -79,10 +79,7 @@ export async function getJackpotPool(): Promise<number> {
  * lose, the stake just stays banked.
  */
 export async function contributeToJackpot(bet: number): Promise<number> {
-  const pool = await getJackpotPool();
-  const newPool = pool + bet;
-  await jackpotTbl.set('pool', newPool);
-  return newPool;
+  return jackpotTbl.mutate('pool', (cur: any) => (typeof cur === 'number' ? cur : JACKPOT_SEED) + bet);
 }
 
 /** Pays a payout out of the jackpot pool, respecting the protected floor seed. */
@@ -230,15 +227,9 @@ export async function getTodayProfit(): Promise<number> {
 
 /** Records house activity for a specific spin or game */
 export async function recordHouseActivity(bet: number, payout: number): Promise<void> {
-  const todayStr = new Date().toISOString().split('T')[0];
-  const betKey = `${todayStr}_bet`;
-  const wonKey = `${todayStr}_won`;
-
-  const currentBet = ((await houseStatsTbl.get(betKey)) as number) || 0;
-  const currentWon = ((await houseStatsTbl.get(wonKey)) as number) || 0;
-
-  await houseStatsTbl.set(betKey, currentBet + bet);
-  await houseStatsTbl.set(wonKey, currentWon + payout);
+  const day = new Date().toISOString().split('T')[0];
+  await houseStatsTbl.mutate(`${day}_bet`, (c: any) => (Number(c) || 0) + bet);
+  await houseStatsTbl.mutate(`${day}_won`, (c: any) => (Number(c) || 0) + payout);
 }
 
 // ── Bank solvency & house mood ──────────────────────────────────────────────
