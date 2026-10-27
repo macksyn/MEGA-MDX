@@ -140,7 +140,7 @@ const home: Screen = {
     const loan = access.loan;
     const loanOption = loanMenuOption(access);
     const loanHint = !loan && access.eligibility?.eligible
-      ? `✨ _You can borrow up to ${fmt(access.eligibility.maxAmount)} coins — tap *💳 Get a loan* below_`
+      ? `✨ _You can borrow up to ${fmt(access.eligibility.maxAmount)} coins — *💳 Get a loan* below_`
       : '';
 
     const surplus = Math.max(0, pool - JACKPOT_SEED);
@@ -151,28 +151,28 @@ const home: Screen = {
     const reserve = [
       `🏛️ *RESERVE*`,
       `💰 Balance: *${fmt(pool)}* coins`,
-      `🛡️ Protected floor: ${fmt(JACKPOT_SEED)}`,
+      `🛡️ Insurance: ${fmt(JACKPOT_SEED)}`,
       `🎯 Available to win: *${fmt(surplus)}*`,
       `${bar(insured)} ${Math.round(insured * 100)}% insured`,
     ].join('\n');
 
     const todayBlock = [
       `📊 *TODAY*`,
-      `⬆️ Wagered ${fmt(today.bet)}  ·  ⬇️ Paid out ${fmt(today.won)}`,
+      `⬆️ Income ${fmt(today.bet)}  ·  ⬇️ Paid out ${fmt(today.won)}`,
       `⚖️ Net: *${netSign}${fmt(today.net)}*`,
     ].join('\n');
 
     const moodLine = mood ? (MOOD_FLAVOR[mood.mood] || MOOD_FLAVOR.neutral) : '';
     const heldLine = totals && totals.totalDeposits > 0
-      ? `🔐 Member savings held: *${fmt(totals.totalDeposits)}* _(kept apart from the reserve)_`
+      ? `🔐 Member savings vault: *${fmt(totals.totalDeposits)}* _(kept apart from the reserve)_`
       : '';
 
     // ── Your account ──
     const you = [
       `👤 *YOUR ACCOUNT*`,
-      `💰 Wallet: ${fmt(wallet.coins)}`,
+    //`💰 Wallet: ${fmt(wallet.coins)}`,
       `🔐 Savings: *${fmt(account.balance)}*`,
-      `📦 Total: *${fmt(wallet.coins + account.balance)}*`,
+      `📦 Total: *${fmt(account.balance)}*`,
       loanLine(loan),
     ].join('\n');
 

@@ -130,10 +130,13 @@ function defaultedLoanCard(loan: any, walletCoins: number): string {
 function eligibleCard(e: any, walletCoins: number): string {
   const s = e.signals;
   return [
-    `✅ Approved — *${e.grade.name}* credit`,
-    `Borrow up to *${fmt(e.maxAmount)}* coins`,
-    `📈 Last ${CREDIT_CONFIG.WINDOW_DAYS} days: *${fmt(s.turnover)}* coins played · ${s.activeDays} active days`,
-    `⏳ ${e.grade.termWeeks}-week term · 💸 ${pct(INTEREST_RATE)} interest, included upfront`,
+    `✅ Eligible — *${e.grade.name}* credit`,
+    `You can borrow up to *${fmt(e.maxAmount)}* coins`,
+    ``,
+    `📈 *Activity in the last ${CREDIT_CONFIG.WINDOW_DAYS} days*`,
+    ` ${fmt(s.turnover)}* coins played · ${s.activeDays} active days`,
+    `⏳ *Loan term:* ${e.grade.termWeeks} week`,
+    `💸 *Interest:* ${pct(INTEREST_RATE)}`,
     ``,
     `💰 Wallet: ${fmt(walletCoins)}`,
   ].join('\n');
@@ -144,7 +147,7 @@ function notEligibleCard(e: any): string {
   const gates = (e?.assessment?.gates || []).map(g => `${g.met ? '✅' : '❌'} ${g.label}: ${fmt(g.have)} / ${fmt(g.need)}`);
   return [
     `🔒 *NOT YET ELIGIBLE*`,
-    `Loans go to active players. In the last ${CREDIT_CONFIG.WINDOW_DAYS} days you need:`,
+    `Loan offers are giving to active Casino and sportybet players. In the last ${CREDIT_CONFIG.WINDOW_DAYS} days you need:`,
     ...gates,
     `_Coins staked on games and Sportybet count._`,
   ].join('\n');
@@ -155,15 +158,15 @@ function infoText(): string {
   const grades = CREDIT_CONFIG.GRADES.map((g, i) =>
     `${GRADE_ICON[i] || '•'} ${g.name} — ${fmt(g.minTurnover)}+ played → up to ${fmt(g.baseMaxAmount)}`).join('\n');
   return [
-    `*Who qualifies:* active players. In the last ${CREDIT_CONFIG.WINDOW_DAYS} days you need ${fmt(CREDIT_CONFIG.GRADES[0].minTurnover)}+ coins staked on games or Sportybet, across ${CREDIT_CONFIG.MIN_ACTIVE_DAYS}+ different days.`,
+    `*Who qualifies:* active players who, within the last ${CREDIT_CONFIG.WINDOW_DAYS} days, have staked at least ${fmt(CREDIT_CONFIG.GRADES[0].minTurnover)}+ coins on games or Sportybet across at least ${CREDIT_CONFIG.MIN_ACTIVE_DAYS}+ different days.`,
     ``,
     `*Your limit* grows with how much you play:`,
     grades,
     ``,
-    `• ${pct(INTEREST_RATE)} interest is added upfront — even if you repay the same day.`,
-    `• Due after the term, then a ${duration(GRACE_PERIOD_MS)} grace with no extra charge.`,
-    `• After grace it defaults: +${pct(DEFAULT_INTEREST_RATE)} added daily until cleared, and ${pct(GARNISHMENT_RATE)} of your earnings go toward it.`,
-    `• Repay on time and your limit grows +15% per loan (max 2×).`,
+    `• A ${pct(INTEREST_RATE)} interest is applied upfront, including for loans repaid the same day.`,
+    `• Repayment is due at the end of the loan term, followed by a ${duration(GRACE_PERIOD_MS)} grace period with no edditional charge.`,
+    `• After the grace period, the loan is in default. An additional +${pct(DEFAULT_INTEREST_RATE)} is added daily until the balance is cleared, and ${pct(GARNISHMENT_RATE)} of your earnings will be applied to repayment.`,
+    `• Repaying on time increase your limit by +15% per loan (max 2×).`,
   ].join('\n');
 }
 
@@ -366,13 +369,15 @@ const loanProfile: Screen = {
 
     const lines = [
       a.grade
-        ? `Grade: *${a.grade.name}*${a.nextGrade ? `  →  next: *${a.nextGrade.name}* at ${fmt(a.nextGrade.minTurnover)}` : '  _(top grade)_'}`
+        ? `*Credit Grade:* ${a.grade.name}*${a.nextGrade ? `  /n  *Next Tier:* *${a.nextGrade.name}* at ${fmt(a.nextGrade.minTurnover)}` : '  _(top grade)_'}`
         : `Grade: _none yet_ — ${first.name} starts at ${fmt(first.minTurnover)} played`,
-      `Play volume  ${bar(a.progress * 100)}  ${fmt(s.turnover)}${a.nextGrade ? ` / ${fmt(a.nextGrade.minTurnover)}` : ''}`,
-      `   🎰 Games ${fmt(s.bySource.games)} · ⚽ Sportybet ${fmt(s.bySource.sportybet)}`,
-      `Active days  *${s.activeDays}* ${daysGate?.met ? '✅' : `❌ _(need ${CREDIT_CONFIG.MIN_ACTIVE_DAYS})_`}`,
+      `📈*Activity Overview`,
+      `Progress  ${bar(a.progress * 100)}  ${fmt(s.turnover)}${a.nextGrade ? ` / ${fmt(a.nextGrade.minTurnover)}` : ''}`,
+      `🎰 Games: ${fmt(s.bySource.games)} coins`,
+      `⚽ Sportybet: ${fmt(s.bySource.sportybet)} coins`,
+      `📆 Active days:  *${s.activeDays}* ${daysGate?.met ? '✅' : `❌ _(need ${CREDIT_CONFIG.MIN_ACTIVE_DAYS})_`}`,
       p.repaidStreak > 0
-        ? `Repayment record: *${p.repaidStreak}* on time in a row (+${Math.min(100, p.repaidStreak * 15)}% limit)`
+        ? `On-Time Repayments: ${p.repaidStreak} /n Potential Credit Limit Increase (+${Math.min(100, p.repaidStreak * 15)}%)`
         : `Repayment record: no on-time streak yet`,
       p.maxAmount ? `Your limit: *${fmt(p.maxAmount)}* coins` : `Your limit: _not yet_`,
     ];
