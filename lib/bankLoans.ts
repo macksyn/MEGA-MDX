@@ -109,7 +109,7 @@ function activeLoanCard(loan: any, walletCoins: number): string {
     `Owed now: *${fmt(loan.balance)}* coins`,
     `Repaid  ${bar(paidPct)} ${paidPct.toFixed(0)}%`,
     dueLabel(loan),
-    `_${pct(INTEREST_RATE)} interest was included upfront._`,
+    `_plus ${pct(INTEREST_RATE)}._`,
     ``,
     `💰 Wallet: ${fmt(walletCoins)}`,
   ].join('\n');
@@ -118,7 +118,7 @@ function activeLoanCard(loan: any, walletCoins: number): string {
 function defaultedLoanCard(loan: any, walletCoins: number): string {
   return [
     `🔴 *LOAN IN DEFAULT*`,
-    `Still owed: *${fmt(loan.balance)}* coins`,
+    `You are still owing *${fmt(loan.balance)}* coins`,
     ``,
     `*${pct(GARNISHMENT_RATE)}* of every attendance / work / game-win credit goes toward it until it's cleared. Transfers you receive are never touched.`,
     `New loans are on hold until this clears. Paying it down yourself works too.`,
@@ -264,7 +264,7 @@ const loanApply: Screen = {
     if (max > MIN_LOAN_AMOUNT) options.push({ label: '✍️ Custom amount', value: 'custom' });
     return {
       title: '💳 APPLY',
-      subtitle: `${e.grade.name} credit · up to ${fmt(max)} · ${pct(INTEREST_RATE)} interest`,
+      subtitle: `Eligible for up to ${fmt(max)} coins`,
       text: 'How much would you like to borrow?',
       options,
     };
@@ -295,12 +295,12 @@ const loanConfirm: Screen = {
     return {
       title: '💳 CONFIRM LOAN',
       text: [
-        `Borrow: *${fmt(amount)}* coins → into your wallet`,
-        `Interest: *${fmt(interest)}* coins (${pct(INTEREST_RATE)}, charged upfront)`,
-        `You'll owe: *${fmt(amount + interest)}* coins`,
-        `⏳ Due in ${termDays} days, then ${duration(GRACE_PERIOD_MS)} grace`,
+        `*Loan Amount:* ${fmt(amount)} coins`,
+        `*Interest:* ${fmt(interest)} coins`,
+        `*Total Repayment:* ${fmt(amount + interest)} coins`,
+        `⏳ Due in ${termDays} days.`,
         ``,
-        `⚠️ If it isn't repaid after grace: +${pct(DEFAULT_INTEREST_RATE)} is added daily, ${pct(GARNISHMENT_RATE)} of your earnings go toward it, and new loans are paused.`,
+        `⚠️ If it isn't repaid before due date: +${pct(DEFAULT_INTEREST_RATE)} is added daily, ${pct(GARNISHMENT_RATE)} of your earnings will go towards outstanding debt, and you lose future loan eligibility..`,
       ].join('\n'),
       options: [{ label: '✅ Confirm loan', value: 'confirm' }],
     };
