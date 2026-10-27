@@ -12,15 +12,19 @@
  * wagering activity, and mixing loan cashflow in would make "today's
  * wagered/paid" misleading. Loans get their own stats via getLoanBookStats().
  *
- * ── Eligibility: economy level ────────────────────────────────────────────
- * A member becomes eligible as soon as their economy level reaches Level 2.
- * Account age, wagering, wallet balance, and any other financial activity are
- * deliberately not eligibility gates. The level is already maintained by the
- * economy module from the member's exchange activity.
+ * ── Eligibility: credit assessment (recent play) ─────────────────────────
+ * Like a lender underwriting an applicant, we look at what a member actually
+ * does. Their coin STAKES on games and Sportybet over the last 30 days
+ * (lib/wagers.ts) must reach a minimum volume AND be spread across a minimum
+ * number of different days (lib/credit.ts) — consistency, not one big
+ * session. Volume then sets a credit grade (Bronze..Platinum) and its base
+ * limit. Economy level, exchange activity and wallet balance are NOT part of
+ * this. An outstanding loan, or a default that is still being recovered,
+ * blocks a new one regardless of play.
  *
- * ── Capacity grows gradually, not just at tier boundaries ───────────────
+ * ── Capacity grows gradually with a clean repayment record ───────────────
  * Each consecutive fully-repaid loan that is repaid by its due date adds
- * +15% onto the level's base max, capped at 2x. The streak resets to zero
+ * +15% onto the grade's base limit, capped at 2x. The streak resets to zero
  * after a default or a late repayment.
  *
  * ── Default: garnishment, not a permanent block ──────────────────────────
@@ -46,7 +50,9 @@
  * is garnished.
  */
 import { createStore } from './pluginStore.js';
-import { getPlayerLevel, addCoins, deductCoins, registerGarnishmentHandler, type TransactionMeta } from './economy.js';
+import { addCoins, deductCoins, registerGarnishmentHandler, type TransactionMeta } from './economy.js';
+import { getWagerSummary } from './wagers.js';
+import { assessCredit, CREDIT_CONFIG, type CreditGrade, type CreditAssessment, type CreditSignals } from './credit.js';
 import { getJackpotPool, deductFromJackpot, contributeToJackpot, settleWin, drawFromReserve, JACKPOT_SEED } from './slotMachine.js';
 import { withUserLock } from './bankLock.js';
 
@@ -63,20 +69,11 @@ export const GARNISHMENT_RATE = 0.50; // share of each future earning diverted t
 export const MIN_LOAN_AMOUNT = 100;
 
 const REPAID_BONUS_PER_LOAN = 0.15;    // +15% capacity per consecutive fully-repaid loan
-const MAX_REPAID_BONUS_MULTIPLIER = 2.0; // capacity growth caps at 2x tier base
+const MAX_REPAID_BONUS_MULTIPLIER = 2.0; // capacity growth caps at 2x the grade's base limit
 
-// ── Tiers ────────────────────────────────────────────────────────────────────
-
-export interface LoanTier {
-  name: string;
-  minLevel: number;
-  baseMaxAmount: number;
-  termWeeks: number;
-}
-
-export const LOAN_TIERS: LoanTier[] = [
-  { name: 'Active',  minLevel: 2, baseMaxAmount: 100,  termWeeks: 1 },
-];
+// ── Credit grades (Bronze..Platinum), thresholds and limits live in lib/credit.ts ──
+export { CREDIT_CONFIG };
+export type { CreditGrade, CreditAssessment };
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -100,16 +97,21 @@ export interface Loan {
   remindersSent: string[]; // e.g. ['due_soon', 'grace'] — dedupes the hourly reminder sweep in eco_loan.ts
 }
 
+export interface CreditProfile {
+  signals: CreditSignals & { bets: number; bySource: { games: number; sportybet: number }; lifetimeTurnover: number };
+  assessment: CreditAssessment;
+  repaidStreak: number;
+  maxAmount: number | null;   // grade base limit scaled by the repayment record; null when no grade is earned yet
+}
+
 export interface EligibilityResult {
   eligible: boolean;
-  reason?: 'active_loan' | 'defaulted_loan' | 'below_minimum_tier';
-  tier?: LoanTier;
-  maxAmount?: number;        // streak-bonus-adjusted max for this tier
+  reason?: 'active_loan' | 'defaulted_loan' | 'not_qualified';
+  grade?: CreditGrade;        // the credit grade their recent play earns
+  maxAmount?: number;         // repayment-bonus-adjusted limit for that grade
   repaidStreak?: number;
-  economyLevel?: Awaited<ReturnType<typeof getPlayerLevel>>;
-  // populated on below_minimum_tier — the first loan level they're working toward
-  nextTier?: LoanTier;
-  progress?: { economyLevel: number };
+  signals?: CreditProfile['signals'];
+  assessment?: CreditAssessment; // populated whenever play was assessed (eligible or not_qualified)
 }
 
 // ── Repayment streak (drives the gradual-growth bonus) ───────────────────────
@@ -196,6 +198,20 @@ export async function getRepayableLoan(userId: string): Promise<Loan | null> {
 
 // ── Eligibility ───────────────────────────────────────────────────────────────
 
+/**
+ * A member's credit standing from recent play and repayment record, independent of whether they
+ * currently hold a loan — used by checkEligibility() and by admin/"credit profile" views.
+ */
+export async function getCreditProfile(userId: string, history?: Loan[]): Promise<CreditProfile> {
+  const hist = history || await getLoanHistory(userId);
+  const signals = await getWagerSummary(userId, CREDIT_CONFIG.WINDOW_DAYS);
+  const assessment = assessCredit(signals);
+  const repaidStreak = computeRepaidStreak(hist);
+  const bonusMultiplier = Math.min(MAX_REPAID_BONUS_MULTIPLIER, 1 + repaidStreak * REPAID_BONUS_PER_LOAN);
+  const maxAmount = assessment.grade ? Math.round(assessment.grade.baseMaxAmount * bonusMultiplier) : null;
+  return { signals, assessment, repaidStreak, maxAmount };
+}
+
 export async function checkEligibility(userId: string): Promise<EligibilityResult> {
   const history = await getLoanHistory(userId);
 
@@ -209,36 +225,13 @@ export async function checkEligibility(userId: string): Promise<EligibilityResul
     return { eligible: false, reason: 'defaulted_loan' };
   }
 
-  const repaidStreak = computeRepaidStreak(history);
-  // BUG FIX: this used to call getLevelInfo(wallet.exchangeCount) directly,
-  // omitting rollingCount and level2SinceTs. Both default to values that
-  // ALWAYS demote a Level 2+ member back to Level 1 (rollingCount defaults
-  // to 0, which is always below the maintenance threshold, and no grace
-  // period applies without a real level2SinceTs) — so loans.ts silently
-  // treated every player as Level 1 regardless of actual standing.
-  // getPlayerLevel() gathers all three inputs correctly from the wallet
-  // and rolling exchange history, so this can't happen again here.
-  const economyLevel = await getPlayerLevel(userId);
-  const qualifiedTier = [...LOAN_TIERS]
-    .reverse()
-    .find(t => economyLevel.levelNumber >= t.minLevel) || null;
+  const { signals, assessment, repaidStreak, maxAmount } = await getCreditProfile(userId, history);
 
-  if (!qualifiedTier) {
-    const t = LOAN_TIERS[0];
-    return {
-      eligible: false,
-      reason: 'below_minimum_tier',
-      nextTier: t,
-      repaidStreak,
-      economyLevel,
-      progress: { economyLevel: Math.min(1, economyLevel.progressPercent / 100) },
-    };
+  if (!assessment.qualifies || maxAmount === null) {
+    return { eligible: false, reason: 'not_qualified', repaidStreak, signals, assessment };
   }
 
-  const bonusMultiplier = Math.min(MAX_REPAID_BONUS_MULTIPLIER, 1 + repaidStreak * REPAID_BONUS_PER_LOAN);
-  const maxAmount = Math.round(qualifiedTier.baseMaxAmount * bonusMultiplier);
-
-  return { eligible: true, tier: qualifiedTier, maxAmount, repaidStreak, economyLevel };
+  return { eligible: true, grade: assessment.grade!, maxAmount, repaidStreak, signals, assessment };
 }
 
 // ── Issuance ─────────────────────────────────────────────────────────────────
@@ -246,7 +239,7 @@ export async function checkEligibility(userId: string): Promise<EligibilityResul
 export type ApplyResult =
   | { success: false; reason: 'below_minimum' }
   | { success: false; reason: 'ineligible'; eligibility: EligibilityResult }
-  | { success: false; reason: 'exceeds_tier_max'; maxAmount: number }
+  | { success: false; reason: 'exceeds_limit'; maxAmount: number }
   | { success: false; reason: 'bank_capacity'; maxAvailable: number }
   | { success: true; loan: Loan };
 
@@ -265,7 +258,7 @@ async function _applyForLoan(userId: string, requestedAmount: number): Promise<A
 
   const amount = Math.floor(requestedAmount);
   if (amount > eligibility.maxAmount!) {
-    return { success: false, reason: 'exceeds_tier_max', maxAmount: eligibility.maxAmount! };
+    return { success: false, reason: 'exceeds_limit', maxAmount: eligibility.maxAmount! };
   }
 
   // Solvency check — reject rather than silently short-pay. A loan is an
@@ -290,13 +283,13 @@ async function _applyForLoan(userId: string, requestedAmount: number): Promise<A
     interestRate: INTEREST_RATE,
     standardInterestApplied: true,
     issuedAt: now,
-    dueAt: now + eligibility.tier!.termWeeks * WEEK_MS,
+    dueAt: now + eligibility.grade!.termWeeks * WEEK_MS,
     lastAccrualAt: now,
     status: 'active',
     repaidAt: null,
     totalRepaid: 0,
-    tier: eligibility.tier!.name,
-    termWeeks: eligibility.tier!.termWeeks,
+    tier: eligibility.grade!.name,          // stored as `tier` for compatibility with existing loan records
+    termWeeks: eligibility.grade!.termWeeks,
     remindersSent: [],
   };
 
@@ -304,7 +297,7 @@ async function _applyForLoan(userId: string, requestedAmount: number): Promise<A
   list.unshift(loan);
   await loansTbl.set(userId, list);
 
-  await addCoins(userId, amount, { type: 'loan_disbursement', note: `${loan.tier} tier loan, ${loan.termWeeks}w term` });
+  await addCoins(userId, amount, { type: 'loan_disbursement', note: `${loan.tier} credit loan, ${loan.termWeeks}w term` });
 
   return { success: true, loan };
 }

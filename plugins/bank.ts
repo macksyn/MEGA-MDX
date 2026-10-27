@@ -6,6 +6,9 @@
  * dashboard, deposit, withdraw, statement. Savings live in lib/bankLedger.ts
  * (separate from the jackpot pool); see that file for the money model.
  *
+ * Loans are part of this menu (lib/bankLoans.ts) and nowhere else: the Loans
+ * button only appears for members who are eligible or already hold a loan.
+ *
  * The HOME screen is the public reserve board players already know from
  * {prefix}reserve (pool, protected floor, available, today's flow, house
  * mood) with the member's own wallet / savings / loan underneath and the menu
@@ -22,13 +25,14 @@
 import { formatNumber, getWallet, withEconomyGuard } from '../lib/economy.js';
 import config from '../config.js';
 import isOwnerOrSudo, { cleanJid } from '../lib/isOwner.js';
-import { getRepayableLoan, checkEligibility } from '../lib/loans.js';
+import { getLoanAccess, loanMenuOption, LOAN_SCREENS } from '../lib/bankLoans.js';
 import { getJackpotPool, getTodayStats, getHouseMood, JACKPOT_SEED } from '../lib/slotMachine.js';
 import {
   BANK_CONFIG, getAccount, getStatement, getBankTotals, getUnfinishedMoves,
   deposit, withdraw, recoverPending,
 } from '../lib/bankLedger.js';
 import { runApp, askAmount, parseAmount, type Screen, type BankCtx } from '../lib/bankUi.js';
+import { ingestAllWagers } from '../lib/wagers.js';
 
 export const command = 'bank';
 export const aliases = ['atm', 'savings'];
@@ -121,24 +125,23 @@ function chipAmounts(base: number, ceiling = Infinity): number[] {
 
 const home: Screen = {
   async view(ctx) {
-    const [wallet, account, loan, pool, today, mood, totals] = await Promise.all([
+    const [wallet, account, access, pool, today, mood, totals] = await Promise.all([
       getWallet(ctx.userId),
       getAccount(ctx.userId),
-      getRepayableLoan(ctx.userId).catch(() => null),
+      getLoanAccess(ctx.userId),
       getJackpotPool(),
       getTodayStats(),
       getHouseMood().catch(() => null),
       cachedTotals().catch(() => null),
     ]);
 
-    // Same silent hint as {prefix}reserve: only ever shown to someone who is actually eligible right now.
-    let loanHint = '';
-    if (!loan) {
-      try {
-        const e = await checkEligibility(ctx.userId);
-        if (e.eligible) loanHint = `✨ _You can borrow up to ${fmt(e.maxAmount)} coins — type *${PREFIX}loan*_`;
-      } catch (_) { /* best-effort */ }
-    }
+    // Loans live in this menu now. The button (and this hint) only exist for members who are eligible
+    // right now or already hold a loan — everyone else sees nothing.
+    const loan = access.loan;
+    const loanOption = loanMenuOption(access);
+    const loanHint = !loan && access.eligibility?.eligible
+      ? `✨ _You can borrow up to ${fmt(access.eligibility.maxAmount)} coins — tap *💳 Get a loan* below_`
+      : '';
 
     const surplus = Math.max(0, pool - JACKPOT_SEED);
     const insured = pool > 0 ? Math.min(1, JACKPOT_SEED / pool) : 1;
@@ -148,28 +151,28 @@ const home: Screen = {
     const reserve = [
       `🏛️ *RESERVE*`,
       `💰 Balance: *${fmt(pool)}* coins`,
-      `🛡️ Insurance: ${fmt(JACKPOT_SEED)}`,
+      `🛡️ Protected floor: ${fmt(JACKPOT_SEED)}`,
       `🎯 Available to win: *${fmt(surplus)}*`,
       `${bar(insured)} ${Math.round(insured * 100)}% insured`,
     ].join('\n');
 
     const todayBlock = [
       `📊 *TODAY*`,
-      `⬆️ Income ${fmt(today.bet)}  ·  ⬇️ Paid out ${fmt(today.won)}`,
-      `⚖️ Profit: *${netSign}${fmt(today.net)}*`,
+      `⬆️ Wagered ${fmt(today.bet)}  ·  ⬇️ Paid out ${fmt(today.won)}`,
+      `⚖️ Net: *${netSign}${fmt(today.net)}*`,
     ].join('\n');
 
     const moodLine = mood ? (MOOD_FLAVOR[mood.mood] || MOOD_FLAVOR.neutral) : '';
     const heldLine = totals && totals.totalDeposits > 0
-      ? `🔐 Member savings vault: *${fmt(totals.totalDeposits)}* _(kept apart from the reserve)_`
+      ? `🔐 Member savings held: *${fmt(totals.totalDeposits)}* _(kept apart from the reserve)_`
       : '';
 
     // ── Your account ──
     const you = [
       `👤 *YOUR ACCOUNT*`,
-    //`💰 Wallet: ${fmt(wallet.coins)}`,
+      `💰 Wallet: ${fmt(wallet.coins)}`,
       `🔐 Savings: *${fmt(account.balance)}*`,
-      `📦 Total: *${fmt(account.balance)}*`,
+      `📦 Total: *${fmt(wallet.coins + account.balance)}*`,
       loanLine(loan),
     ].join('\n');
 
@@ -197,6 +200,7 @@ const home: Screen = {
       options: [
         { label: '📥 Deposit', value: 'deposit', description: 'Wallet → savings' },
         { label: '📤 Withdraw', value: 'withdraw', description: 'Savings → wallet' },
+        ...(loanOption ? [loanOption] : []),
         { label: '🧾 Statement', value: 'statement', description: 'Your recent activity' },
         { label: '🔄 Refresh', value: 'refresh', description: 'Update the live numbers' },
       ],
@@ -296,7 +300,7 @@ const statementScreen: Screen = {
   },
 };
 
-const SCREENS = { home, deposit: depositScreen, withdraw: withdrawScreen, statement: statementScreen };
+const SCREENS = { home, deposit: depositScreen, withdraw: withdrawScreen, statement: statementScreen, ...LOAN_SCREENS };
 
 // ── Typed shortcuts + admin ──────────────────────────────────────────────────
 
@@ -359,7 +363,11 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 export const handler = withEconomyGuard(_handler);
 export const usage = `${BANK} — opens the bank. Or: ${BANK} <deposit|withdraw|statement> [amount|all]`;
 
-// Rolls forward any deposit/withdrawal that died halfway (see lib/bankLedger.ts).
+// 1) Rolls forward any deposit/withdrawal that died halfway (see lib/bankLedger.ts).
+// 2) Folds everyone's new game / Sportybet stakes into the play ledger that loan eligibility is
+//    judged on (lib/wagers.ts). It also runs per member whenever their credit is assessed; this
+//    hourly sweep just keeps members who aren't opening the bank from falling out of the
+//    200-entry transaction log.
 export const schedules = [
   {
     every: 5 * 60 * 1000,
@@ -369,5 +377,9 @@ export const schedules = [
         console.warn(`[bank] recovery sweep: ${report.recovered} recovered, ${report.needsReview} need review`);
       }
     },
+  },
+  {
+    every: 60 * 60 * 1000,
+    handler: async () => { await ingestAllWagers(); },
   },
 ];

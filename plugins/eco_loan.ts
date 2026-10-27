@@ -2,32 +2,28 @@
 /***
  * plugins/eco_loan.ts
  *
- * {prefix}loan — borrow coins from the community bank. Eligibility starts at
- * economy Level 2. The maximum grows after consecutive on-time full
- * repayments, and late repayments/defaults do not increase it. See
- * lib/loans.ts for the full engine and rationale.
+ * Loans now live INSIDE the bank menu (plugins/bank.ts + lib/bankLoans.ts) and
+ * nowhere else. This plugin keeps only what can't live in a player menu:
  *
- * UX mirrors plugins/antilink.ts: bare `{prefix}loan` opens a USSD-style
- * promptMenu flow (numbered replies, no native buttons — confirmed
- * unreliable path per lib/menuSession.ts). Amount entry uses numbered
- * quick-picks with a "Custom amount" fallback to a typed command, same
- * pattern antilink uses for its freeform domain-add step. Typed
- * subcommands (`{prefix}loan apply 200`, `{prefix}loan repay all`, etc.) still work
- * directly for anyone who doesn't want the menu.
+ *   • {prefix}loan admin [forgive @user | assess @user | credit]
+ *                                          — owner/sudo loan book, forgiveness, and the credit tools
+ *   • the hourly due-date / grace reminder DMs (self-contained `schedules`)
+ *   • a redirect, so {prefix}loan / {prefix}loans / {prefix}borrow (and the old
+ *     typed `apply` / `repay` / `history` forms) point players to the bank
+ *     instead of silently doing nothing.
  *
- * Also registers its own hourly reminder sweep via the standard `schedules`
- * export (see lib/pluginLoader.ts's plugin contract) — fully self-contained,
- * no dependency on any other plugin's reminder infra.
+ * The engine (eligibility, interest, garnishment, the reserve draw) is
+ * unchanged — see lib/loans.ts.
  */
 import { formatNumber, getWallet, withEconomyGuard } from '../lib/economy.js';
 import config from '../config.js';
 import {
-  checkEligibility, applyForLoan, repayLoan, getLoanHistory, getActiveLoan,
-  getLoanBookStats, getAllActiveLoans, getAllDefaultedLoans, forgiveLoan,
-  getLoansDueForReminder, markReminderSent,
-  LOAN_TIERS, INTEREST_RATE, DEFAULT_INTEREST_RATE, MIN_LOAN_AMOUNT, GRACE_PERIOD_MS, GARNISHMENT_RATE,
+  getLoanHistory, getLoanBookStats, getAllActiveLoans, getAllDefaultedLoans, forgiveLoan,
+  getLoansDueForReminder, markReminderSent, getCreditProfile,
+  DEFAULT_INTEREST_RATE, GRACE_PERIOD_MS, GARNISHMENT_RATE,
 } from '../lib/loans.js';
-import { promptMenu } from '../lib/menuSession.js';
+import { CREDIT_CONFIG, assessCredit } from '../lib/credit.js';
+import { listWagerSummaries } from '../lib/wagers.js';
 import isOwnerOrSudo, { cleanJid } from '../lib/isOwner.js';
 
 export const command = 'loan';
@@ -36,13 +32,7 @@ export const category = 'economy';
 export const cooldown = 3000;
 const PREFIX = config.prefix || '.';
 const LOAN_COMMAND = `${PREFIX}loan`;
-
-// ── Formatting helpers ────────────────────────────────────────────────────────
-
-function bar(percent: number, size = 10): string {
-  const filled = Math.max(0, Math.min(size, Math.round((percent / 100) * size)));
-  return `${'█'.repeat(filled)}${'░'.repeat(size - filled)}`;
-}
+const BANK_COMMAND = `${PREFIX}bank`;
 
 function formatDuration(ms: number): string {
   const totalHrs = Math.max(0, Math.round(Math.abs(ms) / 3600000));
@@ -52,16 +42,6 @@ function formatDuration(ms: number): string {
   return `${h}h`;
 }
 
-function dueLabel(loan: any): string {
-  const now = Date.now();
-  const remaining = loan.dueAt - now;
-  if (remaining >= 0) return `⏳ Due in ${formatDuration(remaining)}`;
-  const graceLeft = loan.dueAt + GRACE_PERIOD_MS - now;
-  return graceLeft > 0
-    ? `⚠️ Overdue by ${formatDuration(remaining)} — ${formatDuration(graceLeft)} grace left`
-    : `🔴 In default`;
-}
-
 function extractTargetUser(message: any): string | null {
   const contextInfo = message.message?.extendedTextMessage?.contextInfo;
   if (contextInfo?.participant) return contextInfo.participant;
@@ -69,361 +49,13 @@ function extractTargetUser(message: any): string | null {
   return null;
 }
 
-// ── Shared senders ─────────────────────────────────────────────────────────────
-
-async function sendGarnishmentStatus(sock, message, chatId, channelInfo, userId) {
-  const history = await getLoanHistory(userId);
-  const loan = history.find(l => l.status === 'defaulted');
-
-  if (!loan) {
-    // Shouldn't happen if this was called because of reason === 'defaulted_loan',
-    // but fail gracefully rather than crash on a race.
-    await sock.sendMessage(chatId, { text: `❌ You're not eligible for a loan right now.`, ...channelInfo }, { quoted: message });
-    return;
-  }
-
-  await sock.sendMessage(chatId, {
-    text:
-      `🔴 *LOAN IN DEFAULT* 🔴\n\n` +
-      `Still owed: *${formatNumber(loan.balance)} coins*\n\n` +
-      `New loans are on hold until this clears. It's being recovered automatically — *${(GARNISHMENT_RATE * 100).toFixed(0)}%* of every attendance/work/game-win credit goes toward it until it's paid off. Peer ${PREFIX}transfer gifts you receive are never touched.\n\n` +
-      `Paying it down faster works too: ${LOAN_COMMAND} repay <amount>\n\n` +
-      `_Once this clears, you can borrow again at the Level 2+ base limit. Your repayment progress is reset, and future increases must be earned through on-time repayments._`,
-    ...channelInfo
-  }, { quoted: message });
-}
-
-async function sendLoanDetails(sock, message, chatId, channelInfo, loan) {
-  const paidPct = loan.principal > 0
-    ? Math.min(100, (loan.totalRepaid / (loan.totalRepaid + loan.balance)) * 100)
-    : 0;
-
-  await sock.sendMessage(chatId, {
-    text:
-      `┏━━━ 💳 *ACTIVE LOAN* ━━━┓\n\n` +
-      `Tier: *${loan.tier}*\n` +
-      `Borrowed: ${formatNumber(loan.principal)} coins\n` +
-      `Owed now: *${formatNumber(loan.balance)} coins* _(20% standard interest included; defaulted loans add 5% daily after grace)_\n\n` +
-      `Repaid so far  ${bar(paidPct)} ${paidPct.toFixed(0)}%\n\n` +
-      `${dueLabel(loan)}\n\n` +
-      `┗━━━━━━━━━━━━━━━━━━┛\n` +
-      `💵 ${LOAN_COMMAND} repay <amount>  ·  ${LOAN_COMMAND} repay all`,
-    ...channelInfo
-  }, { quoted: message });
-}
-
-async function sendHistory(sock, message, chatId, channelInfo, userId) {
-  const history = await getLoanHistory(userId);
-
-  if (history.length === 0) {
-    await sock.sendMessage(chatId, {
-      text: `📜 No loan history yet. Run ${LOAN_COMMAND} to see if you're eligible.`,
-      ...channelInfo
-    }, { quoted: message });
-    return;
-  }
-
-  const icons: Record<string, string> = { active: '💳', repaid: '✅', defaulted: '⚠️', recovered: '🔓', forgiven: '🕊️' };
-  const lines = history.slice(0, 10).map(l => {
-    const date = new Date(l.issuedAt).toLocaleDateString();
-    return `${icons[l.status] || '•'} ${date} — ${l.tier}, borrowed ${formatNumber(l.principal)}, *${l.status}*`;
-  });
-
-  await sock.sendMessage(chatId, {
-    text: `📜 *LOAN HISTORY* 📜\n\n${lines.join('\n')}`,
-    ...channelInfo
-  }, { quoted: message });
-}
-
-async function sendTiersInfo(sock, message, chatId, channelInfo) {
-  const lines = LOAN_TIERS.map(t => {
-    return (
-      `*Level ${t.minLevel}+ · ${t.name}* — base limit ${formatNumber(t.baseMaxAmount)} coins, ${t.termWeeks}w term`
-    );
-  });
-
-  await sock.sendMessage(chatId, {
-    text:
-      `💳 *HOW LOAN TIERS WORK* 💳\n\n` +
-      lines.join('\n\n') +
-      `\n\n_Level 2 is the minimum to qualify. Loans expire after 7 days with a 1-day grace period. The ${(INTEREST_RATE * 100).toFixed(0)}% standard interest is included upfront, even for same-day repayment. After grace, defaulters are charged an additional ${(DEFAULT_INTEREST_RATE * 100).toFixed(0)}% daily until fully repaid. Each loan fully repaid by its due date adds +15% capacity (capped at 2x); late repayments and defaults do not increase your limit._`,
-    ...channelInfo
-  }, { quoted: message });
-}
-
-async function sendEligibilityBreakdown(sock, message, chatId, channelInfo, eligibility) {
-  const t = eligibility.nextTier;
-  const level = eligibility.economyLevel;
-  const progress = eligibility.progress?.economyLevel || 0;
-
-  await sock.sendMessage(chatId, {
-    text:
-      `🔒 *NOT YET ELIGIBLE* 🔒\n\n` +
-      `You are currently *Level ${level?.levelNumber} · ${level?.levelName}*.\n` +
-      `Loan access starts at *Level ${t.minLevel} · ${t.name}*.\n\n` +
-      `Economy level  ${bar(progress * 100)} ${(progress * 100).toFixed(0)}%\n\n` +
-      `_Keep using the economy to reach Level 2, then you can apply for a loan. Your limit grows when you fully repay loans by their due date._`,
-    ...channelInfo
-  }, { quoted: message });
-}
-
-async function doApply(sock, message, chatId, channelInfo, userId, amount) {
-  const result = await applyForLoan(userId, amount);
-
-  if (result.success) {
-    const l = result.loan;
-    await sock.sendMessage(chatId, {
-      text:
-        `✅ *LOAN APPROVED* ✅\n\n` +
-        `${formatNumber(l.principal)} coins deposited into your wallet.\n\n` +
-        `Tier: ${l.tier}\n` +
-        `Interest: ${(INTEREST_RATE * 100).toFixed(0)}% standard included upfront; defaulters add ${(DEFAULT_INTEREST_RATE * 100).toFixed(0)}% daily after grace\n` +
-        `Due: 7 days from now, followed by 1 day grace\n\n` +
-        `Check anytime with ${LOAN_COMMAND} · repay with ${LOAN_COMMAND} repay <amount>`,
-      ...channelInfo
-    }, { quoted: message });
-    return;
-  }
-
-  if (result.reason === 'ineligible') {
-    return renderStatus(sock, message, chatId, channelInfo, userId, { forceText: true });
-  }
-
-  const messages: Record<string, string> = {
-    below_minimum: `❌ Minimum loan amount is ${formatNumber(MIN_LOAN_AMOUNT)} coins.`,
-    exceeds_tier_max: `❌ That's above your current limit — max is ${formatNumber((result as any).maxAmount)} coins.`,
-    bank_capacity: `❌ The bank can't cover that right now — max available: ${formatNumber((result as any).maxAvailable)} coins. Try a smaller amount, or check back later.`,
-  };
-  await sock.sendMessage(chatId, {
-    text: messages[result.reason] || `❌ Couldn't process that loan.`,
-    ...channelInfo
-  }, { quoted: message });
-}
-
-async function doRepay(sock, message, chatId, channelInfo, userId, amount) {
-  const result = await repayLoan(userId, amount);
-
-  if (!result.success) {
-    const messages: Record<string, string> = {
-      no_outstanding_loan: `❌ You don't have an outstanding loan.`,
-      invalid_amount: `❌ Enter a valid amount, or "all".`,
-      insufficient_funds: `❌ You don't have enough coins — need ${formatNumber((result as any).needed)}.`,
-    };
-    await sock.sendMessage(chatId, {
-      text: messages[result.reason] || `❌ Couldn't process that repayment.`,
-      ...channelInfo
-    }, { quoted: message });
-    return;
-  }
-
-  await sock.sendMessage(chatId, {
-    text: result.fullyRepaid
-      ? result.onTime
-        ? `🎉 *LOAN FULLY REPAID ON TIME!* 🎉\n\nPaid ${formatNumber(result.paid)} coins.\nYour repayment streak grew — your borrowing limit increases as you keep repaying on time.`
-        : `✅ *LOAN FULLY REPAID!* \n\nPaid ${formatNumber(result.paid)} coins.\nThis repayment was after the due date, so your borrowing limit did not increase.`
-      : `✅ Paid ${formatNumber(result.paid)} coins.\nRemaining balance: *${formatNumber(result.remaining)} coins*`,
-    ...channelInfo
-  }, { quoted: message });
-}
-
-// ── Interactive USSD menu (bare loan command) ─────────────────────────────────
-
-async function runApplyAmountMenu(sock, message, chatId, userId, channelInfo, eligibility) {
-  const max = eligibility.maxAmount;
-  const presets = Array.from(new Set(
-    [0.25, 0.5, 0.75, 1].map(f => Math.round(max * f)).filter(n => n >= MIN_LOAN_AMOUNT)
-  )).sort((a, b) => a - b);
-
-  const options = presets.map(a => ({
-    label: `${formatNumber(a)} coins`,
-    value: String(a),
-    description: a === max ? 'Full limit' : undefined,
-  }));
-  options.push({ label: 'Custom amount', value: 'custom' });
-
-  const result = await promptMenu(sock, message, chatId, userId, {
-    title: `💳 APPLY · ${eligibility.tier.name} tier`,
-    subtitle: `7-day term · 1-day grace · ${(INTEREST_RATE * 100).toFixed(0)}% standard · +${(DEFAULT_INTEREST_RATE * 100).toFixed(0)}%/day if defaulted`,
-    text: 'How much would you like to borrow?',
-    options,
-  });
-
-  if (result.cancelled || result.timedOut || !result.value) return;
-
-  if (result.value === 'custom') {
-    await sock.sendMessage(chatId, {
-      text: `✍️ Type the exact amount:\n\n\`${LOAN_COMMAND} apply <amount>\`\n\n_Max: ${formatNumber(max)} coins_`,
-      ...channelInfo
-    }, { quoted: message });
-    return;
-  }
-
-  return doApply(sock, message, chatId, channelInfo, userId, parseInt(result.value, 10));
-}
-
-async function runRepayAmountMenu(sock, message, chatId, userId, channelInfo, loan) {
-  const presets = Array.from(new Set(
-    [0.25, 0.5, 0.75, 1].map(f => Math.round(loan.balance * f)).filter(n => n > 0)
-  )).sort((a, b) => a - b);
-
-  const options = presets.map(a => ({
-    label: `${formatNumber(a)} coins`,
-    value: String(a),
-    description: a >= loan.balance ? 'Clears the loan' : undefined,
-  }));
-  options.push({ label: 'Custom amount', value: 'custom' });
-
-  const result = await promptMenu(sock, message, chatId, userId, {
-    title: `💳 REPAY`,
-    subtitle: `Owe ${formatNumber(loan.balance)} coins · ${dueLabel(loan)}`,
-    text: 'How much would you like to pay?',
-    options,
-  });
-
-  if (result.cancelled || result.timedOut || !result.value) return;
-
-  if (result.value === 'custom') {
-    await sock.sendMessage(chatId, {
-        text: `✍️ Type the exact amount:\n\n\`${LOAN_COMMAND} repay <amount>\`  or  \`${LOAN_COMMAND} repay all\``,
-      ...channelInfo
-    }, { quoted: message });
-    return;
-  }
-
-  return doRepay(sock, message, chatId, channelInfo, userId, parseInt(result.value, 10));
-}
-
-async function runMainMenu(sock, message, chatId, userId, channelInfo) {
-  const active = await getActiveLoan(userId);
-
-  if (active) {
-    const result = await promptMenu(sock, message, chatId, userId, {
-      title: '💳 LOANS',
-      subtitle: `Active — owe ${formatNumber(active.balance)} · ${dueLabel(active)}`,
-      text: 'What would you like to do?',
-      options: [
-        { label: 'View loan details', value: 'details' },
-        { label: 'Make a payment', value: 'pay', description: 'Pick an amount to pay down' },
-        { label: 'Pay in full', value: 'payfull', description: `Clears ${formatNumber(active.balance)} owed` },
-        { label: 'Loan history', value: 'history' },
-      ],
-    });
-    if (result.cancelled || result.timedOut) return;
-
-    switch (result.value) {
-      case 'details': return sendLoanDetails(sock, message, chatId, channelInfo, active);
-      case 'pay': return runRepayAmountMenu(sock, message, chatId, userId, channelInfo, active);
-      case 'payfull': return doRepay(sock, message, chatId, channelInfo, userId, 'all');
-      case 'history': return sendHistory(sock, message, chatId, channelInfo, userId);
-    }
-    return;
-  }
-
-  const eligibility = await checkEligibility(userId);
-
-  if (eligibility.eligible) {
-    const result = await promptMenu(sock, message, chatId, userId, {
-      title: '💳 LOANS',
-      subtitle: `✅ Eligible — Level ${eligibility.economyLevel.levelNumber} · ${eligibility.tier.name}, up to ${formatNumber(eligibility.maxAmount)} coins`,
-      text: 'What would you like to do?',
-      options: [
-        { label: 'Apply for a loan', value: 'apply', description: `Up to ${formatNumber(eligibility.maxAmount)} coins` },
-        { label: 'Loan history', value: 'history' },
-        { label: 'How tiers work', value: 'tiers' },
-      ],
-    });
-    if (result.cancelled || result.timedOut) return;
-
-    switch (result.value) {
-      case 'apply': return runApplyAmountMenu(sock, message, chatId, userId, channelInfo, eligibility);
-      case 'history': return sendHistory(sock, message, chatId, channelInfo, userId);
-      case 'tiers': return sendTiersInfo(sock, message, chatId, channelInfo);
-    }
-    return;
-  }
-
-  if (eligibility.reason === 'defaulted_loan') {
-    return sendGarnishmentStatus(sock, message, chatId, channelInfo, userId);
-  }
-
-  const result = await promptMenu(sock, message, chatId, userId, {
-    title: '💳 LOANS',
-    subtitle: `🔒 Not yet eligible`,
-    text: 'What would you like to see?',
-    options: [
-      { label: 'Why am I not eligible?', value: 'why' },
-      { label: 'Loan history', value: 'history' },
-      { label: 'How tiers work', value: 'tiers' },
-    ],
-  });
-  if (result.cancelled || result.timedOut) return;
-
-  switch (result.value) {
-    case 'why': return sendEligibilityBreakdown(sock, message, chatId, channelInfo, eligibility);
-    case 'history': return sendHistory(sock, message, chatId, channelInfo, userId);
-    case 'tiers': return sendTiersInfo(sock, message, chatId, channelInfo);
-  }
-}
-
-// ── Status view used both by menu entry and by doApply's ineligible fallback ──
-
-async function renderStatus(sock, message, chatId, channelInfo, userId, opts: { forceText?: boolean } = {}) {
-  const active = await getActiveLoan(userId);
-  if (active) return sendLoanDetails(sock, message, chatId, channelInfo, active);
-
-  const eligibility = await checkEligibility(userId);
-  if (eligibility.eligible) {
-    await sock.sendMessage(chatId, {
-      text:
-        `💳 *LOANS* 💳\n\n✅ Eligible — *Level ${eligibility.economyLevel.levelNumber} · ${eligibility.tier.name}*\n` +
-        `Max loan: *${formatNumber(eligibility.maxAmount)} coins*\n` +
-        `Term: ${eligibility.tier.termWeeks} week${eligibility.tier.termWeeks > 1 ? 's' : ''}\n\n` +
-       `Borrow with: ${LOAN_COMMAND} apply <amount>`,
-      ...channelInfo
-    }, { quoted: message });
-    return;
-  }
-  if (eligibility.reason === 'defaulted_loan') {
-    return sendGarnishmentStatus(sock, message, chatId, channelInfo, userId);
-  }
-  return sendEligibilityBreakdown(sock, message, chatId, channelInfo, eligibility);
-}
-
-// ── Direct typed subcommands (bypass the menu) ───────────────────────────────
-
-async function handleApplyDirect(sock, message, context, userId, args) {
-  const { chatId, channelInfo } = context;
-  const amount = parseInt(args[1], 10);
-  if (!amount || amount < MIN_LOAN_AMOUNT) {
-    await sock.sendMessage(chatId, {
-      text: `❌ Enter a valid amount, minimum ${formatNumber(MIN_LOAN_AMOUNT)} coins. Example: ${LOAN_COMMAND} apply 200`,
-      ...channelInfo
-    }, { quoted: message });
-    return;
-  }
-  return doApply(sock, message, chatId, channelInfo, userId, amount);
-}
-
-async function handleRepayDirect(sock, message, context, userId, args) {
-  const { chatId, channelInfo } = context;
-  const raw = (args[1] || '').toLowerCase();
-  const amount = raw === 'all' ? 'all' : parseInt(raw, 10);
-  if (raw !== 'all' && (!amount || amount <= 0)) {
-    await sock.sendMessage(chatId, {
-      text: `❌ Enter a valid amount, or "all". Example: ${LOAN_COMMAND} repay 100  ·  ${LOAN_COMMAND} repay all`,
-      ...channelInfo
-    }, { quoted: message });
-    return;
-  }
-  return doRepay(sock, message, chatId, channelInfo, userId, amount);
-}
-
 // ── Admin ────────────────────────────────────────────────────────────────────
 
-async function handleAdmin(sock, message, context, userId, args) {
-  const { chatId, channelInfo } = context;
+async function handleAdmin(sock, message, context, args) {
+  const { chatId, senderId, channelInfo } = context;
 
-  if (!(await isOwnerOrSudo(context.senderId, sock, chatId))) {
+  // Same gate as the jackpot plugin: isOwnerOnly misses sudo users and group @lid identities.
+  if (!(await isOwnerOrSudo(senderId, sock, chatId))) {
     await sock.sendMessage(chatId, { text: `❌ That view is for admins only.`, ...channelInfo }, { quoted: message });
     return;
   }
@@ -455,6 +87,58 @@ async function handleAdmin(sock, message, context, userId, args) {
     return;
   }
 
+  if (sub === 'assess') {
+    const mentioned = extractTargetUser(message);
+    if (!mentioned) {
+      await sock.sendMessage(chatId, { text: `❌ Tag or reply to the member: ${LOAN_COMMAND} admin assess @user`, ...channelInfo }, { quoted: message });
+      return;
+    }
+    const targetId = cleanJid(mentioned);
+    const [p, history, wallet] = await Promise.all([getCreditProfile(targetId), getLoanHistory(targetId), getWallet(targetId)]);
+    const a = p.assessment;
+    const standing = history.find(l => l.status === 'defaulted') ? '🔴 in default'
+      : history.find(l => l.status === 'active') ? '💳 active loan' : '✅ no loan outstanding';
+    await sock.sendMessage(chatId, {
+      text:
+        `📊 *CREDIT FILE — ${wallet.name || targetId}*\n\n` +
+        `Play (${CREDIT_CONFIG.WINDOW_DAYS}d): *${formatNumber(p.signals.turnover)}* staked · ${p.signals.bets} bets · ${p.signals.activeDays} active days\n` +
+        `   🎰 Games ${formatNumber(p.signals.bySource.games)} · ⚽ Sportybet ${formatNumber(p.signals.bySource.sportybet)}\n` +
+        `Lifetime staked (tracked): ${formatNumber(p.signals.lifetimeTurnover)}\n\n` +
+        a.gates.map(g => `${g.met ? '✅' : '❌'} ${g.label}: ${formatNumber(g.have)} / ${formatNumber(g.need)}`).join('\n') + `\n\n` +
+        `Grade: *${a.grade ? a.grade.name : 'none'}*${a.nextGrade ? ` (next: ${a.nextGrade.name}, ${formatNumber(a.volumeToNext)} more)` : ''}\n` +
+        `Repayment streak: ${p.repaidStreak}\n` +
+        `Limit: *${p.maxAmount ? formatNumber(p.maxAmount) : '—'}*  ·  Qualifies on play: ${a.qualifies ? 'yes' : 'no'}\n` +
+        `Standing: ${standing}`,
+      ...channelInfo
+    }, { quoted: message });
+    return;
+  }
+
+  if (sub === 'credit') {
+    const rows = (await listWagerSummaries(CREDIT_CONFIG.WINDOW_DAYS))
+      .filter(r => r.turnover > 0)
+      .sort((x, y) => y.turnover - x.turnover);
+    const qualifying = rows.filter(r => assessCredit(r).qualifies).length;
+    const top = await Promise.all(rows.slice(0, 10).map(async (r, i) => {
+      const a = assessCredit(r);
+      const w = await getWallet(r.userId);
+      return `${i + 1}. ${w.name || r.userId} — ${formatNumber(r.turnover)} · ${r.activeDays}d · ${a.grade ? a.grade.name : '—'} ${a.qualifies ? '✅' : '❌'}`;
+    }));
+    const tiers = CREDIT_CONFIG.GRADES.map(g => `${g.name} ${formatNumber(g.minTurnover)}+ → ${formatNumber(g.baseMaxAmount)}`).join(' · ');
+    await sock.sendMessage(chatId, {
+      text:
+        `📈 *CREDIT BOOK — last ${CREDIT_CONFIG.WINDOW_DAYS} days*\n\n` +
+        `Members with recorded play: ${rows.length}\n` +
+        `Qualifying for a loan right now: ${qualifying}\n\n` +
+        (top.length ? `*Top by volume (staked · active days · grade):*\n${top.join('\n')}\n\n` : `_No play recorded yet._\n\n`) +
+        `Grades: ${tiers}\n` +
+        `Gate: ${CREDIT_CONFIG.GRADES[0].minTurnover}+ staked on ${CREDIT_CONFIG.MIN_ACTIVE_DAYS}+ days\n` +
+        `_Tune thresholds in lib/credit.ts (CREDIT_CONFIG) once you see how real members distribute._`,
+      ...channelInfo
+    }, { quoted: message });
+    return;
+  }
+
   const stats = await getLoanBookStats();
   const activeLoans = await getAllActiveLoans();
   const defaultedLoans = await getAllDefaultedLoans();
@@ -478,7 +162,8 @@ async function handleAdmin(sock, message, context, userId, args) {
       `Forgiven by admins: ${stats.forgivenCount}\n\n` +
       (activeLines.length ? `*Active:*\n${activeLines.join('\n')}\n\n` : '') +
       (defaultedLines.length ? `*In default:*\n${defaultedLines.join('\n')}\n\n` : '') +
-      `_Active/defaulted balances reflect last check-in — may lag true accrued interest/garnishment until the borrower next has activity. Forgive early with: ${LOAN_COMMAND} admin forgive @user_`,
+      `_Active/defaulted balances reflect last check-in — may lag true accrued interest/garnishment until the borrower next has activity._\n` +
+      `_Also: ${LOAN_COMMAND} admin forgive @user · ${LOAN_COMMAND} admin assess @user · ${LOAN_COMMAND} admin credit_`,
     ...channelInfo
   }, { quoted: message });
 }
@@ -486,27 +171,29 @@ async function handleAdmin(sock, message, context, userId, args) {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 async function _handler(sock, message, args, context) {
-  const { chatId, senderId, channelInfo } = context;
-  const userId = cleanJid(senderId);
+  const { chatId, channelInfo } = context;
   const sub = (args[0] || '').toLowerCase();
 
-  if (sub === 'apply') return handleApplyDirect(sock, message, context, userId, args);
-  if (sub === 'repay') return handleRepayDirect(sock, message, context, userId, args);
-  if (sub === 'history') return sendHistory(sock, message, chatId, channelInfo, userId);
-  if (sub === 'admin') return handleAdmin(sock, message, context, userId, args);
+  if (sub === 'admin') return handleAdmin(sock, message, context, args);
 
-  // No subcommand → USSD-style interactive menu
-  return runMainMenu(sock, message, chatId, userId, channelInfo);
+  // Everything else — bare command, apply, repay, history — moved into the bank.
+  return sock.sendMessage(chatId, {
+    text:
+      `💳 *Loans have moved into the bank.*\n\n` +
+      `Type *${BANK_COMMAND}* and tap *Get a loan* — or *My loan* if you already have one.\n\n` +
+      `*Who qualifies:* active players — at least ${formatNumber(CREDIT_CONFIG.GRADES[0].minTurnover)} coins staked on games or Sportybet over the last ${CREDIT_CONFIG.WINDOW_DAYS} days, across ${CREDIT_CONFIG.MIN_ACTIVE_DAYS}+ different days. The more you play, the higher your limit.\n\n` +
+      `_The Loans button appears once you qualify, or if you already have a loan._`,
+    ...channelInfo
+  }, { quoted: message });
 }
 
 export const handler = withEconomyGuard(_handler);
-export const usage = `${LOAN_COMMAND} — opens the menu. Or: ${LOAN_COMMAND} <apply|repay|history|admin>`;
+export const usage = `${LOAN_COMMAND} admin — loan book (owner/sudo). Players: use ${BANK_COMMAND}`;
 
 // ── Self-contained due-date reminders ─────────────────────────────────────────
-// Uses the plugin contract's own `schedules` field (see lib/pluginLoader.ts)
-// — no dependency on any other plugin's reminder/scheduling code. Sweeps
-// hourly; getLoansDueForReminder()/markReminderSent() in lib/loans.ts dedupe
-// so each loan only ever gets one 'due_soon' and one 'grace' DM.
+// Uses the plugin contract's own `schedules` field (see lib/pluginLoader.ts).
+// Sweeps hourly; getLoansDueForReminder()/markReminderSent() in lib/loans.ts
+// dedupe so each loan only ever gets one 'due_soon' and one 'grace' DM.
 
 async function sendReminderDM(sock: any, loan: any, kind: 'due_soon' | 'grace') {
   const wallet = await getWallet(loan.userId);
@@ -517,10 +204,10 @@ async function sendReminderDM(sock: any, loan: any, kind: 'due_soon' | 'grace') 
   const text = kind === 'due_soon'
     ? `⏰ *LOAN REMINDER* ⏰\n\n` +
       `Your loan balance of *${formatNumber(loan.balance)} coins* is due within 24 hours.\n\n` +
-       `Pay it off with ${LOAN_COMMAND} repay <amount> or ${LOAN_COMMAND} repay all. The ${formatDuration(GRACE_PERIOD_MS)} grace window after day 7 has no extra charge; after grace, a default adds ${(DEFAULT_INTEREST_RATE * 100).toFixed(0)}% daily until fully repaid.`
+      `Pay it off: type *${BANK_COMMAND}* → *My loan* → *Pay in full* (or *Make a payment*). The ${formatDuration(GRACE_PERIOD_MS)} grace window after the due date has no extra charge; after grace, a default adds ${(DEFAULT_INTEREST_RATE * 100).toFixed(0)}% daily until fully repaid.`
     : `🔴 *LOAN OVERDUE — GRACE PERIOD* 🔴\n\n` +
       `Your loan balance of *${formatNumber(loan.balance)} coins* is now overdue. You have a ${formatDuration(GRACE_PERIOD_MS)} grace window left before it defaults.\n\n` +
-       `Clear it now: ${LOAN_COMMAND} repay all`;
+      `Clear it now: type *${BANK_COMMAND}* → *My loan* → *Pay in full*`;
 
   try {
     await sock.sendMessage(wallet.jid, { text });

@@ -72,12 +72,12 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
   // Silent loan hint: only ever shown to a user who's actually eligible right
   // now. Anyone not eligible (new account, active/defaulted loan, etc.) sees
-  // nothing here — they only learn why if they run !loan themselves.
+  // nothing here — the bank menu only shows a Loans button to eligible members or borrowers.
   let loanHint = '';
   try {
     const eligibility = await checkEligibility(userId);
     if (eligibility.eligible) {
-      loanHint = `\n💳 _You're eligible for a loan up to ${formatNumber(eligibility.maxAmount)} coins — try *.loan* then apply_\n`;
+      loanHint = `\n💳 _You're eligible for a loan up to ${formatNumber(eligibility.maxAmount)} coins — open *.bank* and tap *Get a loan*_\n`;
     }
   } catch (_) {
     // Best-effort — a loan-hint failure should never break !reserve itself.
