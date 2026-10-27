@@ -208,7 +208,10 @@ server.listen(PORT, () => {
     printLog('success', `Server listening on port ${PORT}`);
 });
 
-async function startQasimDev(): Promise<any> {
+async function createQasimDevSocket(): Promise<any> {
+  let startPromise: Promise<any> | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectScheduled = false;
     try {
         const { version } = await fetchLatestBaileysVersion();
 
@@ -618,6 +621,20 @@ async function startQasimDev(): Promise<any> {
     }
 }
 
+async function startQasimDev(): Promise<any> {
+    if (startPromise) {
+        return startPromise;
+    }
+
+    startPromise = createQasimDevSocket();
+
+    try {
+        return await startPromise;
+    } finally {
+        startPromise = null;
+    }
+}
+
 async function main() {
     await compileAll();
     await commandHandler.loadCommands();
@@ -634,6 +651,7 @@ async function main() {
 main();
 
 // Session cleanup interval
+/*
 const sessionDir = path.join(__dirname, 'session');
 setInterval(() => {
     if (!fs.existsSync(sessionDir)) return;
@@ -645,7 +663,8 @@ setInterval(() => {
             fs.unlink(path.join(sessionDir, file), () => {});
         }
     });
-}, 3 * 60 * 1000);
+}, 3 * 60 * 1000); 
+*/
 
 // Temp folder setup
 const customTemp = path.join(process.cwd(), 'temp');
