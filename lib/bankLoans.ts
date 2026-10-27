@@ -369,7 +369,7 @@ const loanProfile: Screen = {
 
     const lines = [
       a.grade
-        ? `*Credit Grade:* ${a.grade.name}*${a.nextGrade ? `  /n  *Next Tier:* *${a.nextGrade.name}* at ${fmt(a.nextGrade.minTurnover)}` : '  _(top grade)_'}`
+        ? `*Credit Grade:* ${a.grade.name}${a.nextGrade ? `  \n  *Next Tier:* *${a.nextGrade.name}* at ${fmt(a.nextGrade.minTurnover)}` : '  _(top grade)_'}`
         : `Grade: _none yet_ — ${first.name} starts at ${fmt(first.minTurnover)} played`,
       `📈*Activity Overview*`,
       `Progress  ${bar(a.progress * 100)}  ${fmt(s.turnover)}${a.nextGrade ? ` / ${fmt(a.nextGrade.minTurnover)}` : ''}`,
@@ -381,7 +381,7 @@ const loanProfile: Screen = {
         : `Repayment record: no on-time streak yet`,
       p.maxAmount ? `Your limit: *${fmt(p.maxAmount)}* coins` : `Your limit: _not yet_`,
     ];
-    return { title: '📊 CREDIT PROFILE', subtitle: `Assesment Period; Last ${CREDIT_CONFIG.WINDOW_DAYS} days`, text: lines.join('\n'), options: [] };
+    return { title: '📊 CREDIT PROFILE', subtitle: `Assesment Period: Last ${CREDIT_CONFIG.WINDOW_DAYS} days`, text: lines.join('\n'), options: [] };
   },
   async select() { return { back: true }; },
 };
