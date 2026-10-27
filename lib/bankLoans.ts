@@ -134,7 +134,7 @@ function eligibleCard(e: any, walletCoins: number): string {
     `You can borrow up to *${fmt(e.maxAmount)}* coins`,
     ``,
     `📈 *Activity in the last ${CREDIT_CONFIG.WINDOW_DAYS} days*`,
-    ` ${fmt(s.turnover)}* coins played · ${s.activeDays} active days`,
+    ` ${fmt(s.turnover)} coins played · ${s.activeDays} active days`,
     `⏳ *Loan term:* ${e.grade.termWeeks} week`,
     `💸 *Interest:* ${pct(INTEREST_RATE)}`,
     ``,
@@ -371,17 +371,17 @@ const loanProfile: Screen = {
       a.grade
         ? `*Credit Grade:* ${a.grade.name}*${a.nextGrade ? `  /n  *Next Tier:* *${a.nextGrade.name}* at ${fmt(a.nextGrade.minTurnover)}` : '  _(top grade)_'}`
         : `Grade: _none yet_ — ${first.name} starts at ${fmt(first.minTurnover)} played`,
-      `📈*Activity Overview`,
+      `📈*Activity Overview*`,
       `Progress  ${bar(a.progress * 100)}  ${fmt(s.turnover)}${a.nextGrade ? ` / ${fmt(a.nextGrade.minTurnover)}` : ''}`,
       `🎰 Games: ${fmt(s.bySource.games)} coins`,
       `⚽ Sportybet: ${fmt(s.bySource.sportybet)} coins`,
       `📆 Active days:  *${s.activeDays}* ${daysGate?.met ? '✅' : `❌ _(need ${CREDIT_CONFIG.MIN_ACTIVE_DAYS})_`}`,
       p.repaidStreak > 0
-        ? `On-Time Repayments: ${p.repaidStreak} /n Potential Credit Limit Increase (+${Math.min(100, p.repaidStreak * 15)}%)`
+        ? `💳 *Repayment History* \nOn-Time Repayments: ${p.repaidStreak} \nPotential Credit Limit Increase (+${Math.min(100, p.repaidStreak * 15)}%)`
         : `Repayment record: no on-time streak yet`,
       p.maxAmount ? `Your limit: *${fmt(p.maxAmount)}* coins` : `Your limit: _not yet_`,
     ];
-    return { title: '📊 CREDIT PROFILE', subtitle: `Based on the last ${CREDIT_CONFIG.WINDOW_DAYS} days`, text: lines.join('\n'), options: [] };
+    return { title: '📊 CREDIT PROFILE', subtitle: `Assesment Period; Last ${CREDIT_CONFIG.WINDOW_DAYS} days`, text: lines.join('\n'), options: [] };
   },
   async select() { return { back: true }; },
 };
