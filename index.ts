@@ -621,20 +621,6 @@ async function createQasimDevSocket(): Promise<any> {
     }
 }
 
-async function startQasimDev(): Promise<any> {
-    if (startPromise) {
-        return startPromise;
-    }
-
-    startPromise = createQasimDevSocket();
-
-    try {
-        return await startPromise;
-    } finally {
-        startPromise = null;
-    }
-}
-
 async function main() {
     await compileAll();
     await commandHandler.loadCommands();
