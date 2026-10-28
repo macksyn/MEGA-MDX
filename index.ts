@@ -49,7 +49,7 @@ setInterval(() => store.writeToFile(), config.storeWriteInterval || 10000);
 setInterval(() => {
     if (global.gc) {
         global.gc();
-        console.log('ðŸ§¹ Garbage collection completed');
+        console.log('🧹 Garbage collection completed');
     }
 }, 60_000);
 
@@ -97,7 +97,7 @@ try {
 } catch { owner = []; }
 
 global.botname = config.botName || "GROQ-AI";
-global.themeemoji = "â€¢";
+global.themeemoji = "•";
 
 const pairingCode = !process.argv.includes("--qr-code");
 const useMobile = process.argv.includes("--mobile");
@@ -255,7 +255,7 @@ async function startQasimDev(): Promise<any> {
         QasimDev.sendPresenceUpdate = async function (...args: any[]) {
             const ghostMode = await store.getSetting('global', 'stealthMode');
             if (ghostMode && ghostMode.enabled) {
-                printLog('info', 'ðŸ‘» Blocked presence update (stealth mode)');
+                printLog('info', '👻 Blocked presence update (stealth mode)');
                 return;
             }
             return originalSendPresenceUpdate.apply(this, args);
@@ -324,7 +324,7 @@ async function startQasimDev(): Promise<any> {
                     printLog('error', `Error in handleMessages: ${err.message}`);
                     if (mek.key && mek.key.remoteJid) {
                         await QasimDev.sendMessage(mek.key.remoteJid, {
-                            text: 'âŒ An error occurred while processing your message.',
+                            text: '❌ An error occurred while processing your message.',
                             contextInfo: {
                                 forwardingScore: 1,
                                 isForwarded: false,
@@ -456,7 +456,7 @@ async function startQasimDev(): Promise<any> {
             } else if (process.env.PAIRING_NUMBER) {
                 phoneNumberInput = process.env.PAIRING_NUMBER;
             } else if (rl && !rlClosed) {
-                phoneNumberInput = await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number ðŸ˜\nFormat: 2348012345678 (without + or spaces) : `)));
+                phoneNumberInput = await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number 😍\nFormat: 2348012345678 (without + or spaces) : `)));
             } else {
                 phoneNumberInput = phoneNumber;
                 printLog('info', `Using default phone number: ${phoneNumberInput}`);
@@ -516,7 +516,7 @@ async function startQasimDev(): Promise<any> {
             if (connection === "open") {
                 printLog('success', 'Bot connected successfully!');
 
-                // Cache bot JIDs once â€” used by chatbot on every message
+                // Cache bot JIDs once — used by chatbot on every message
                 setBotJidsCache(QasimDev);
 
                 try {
@@ -535,17 +535,17 @@ async function startQasimDev(): Promise<any> {
 
                 const ghostMode = await store.getSetting('global', 'stealthMode');
                 if (ghostMode && ghostMode.enabled) {
-                    printLog('info', 'ðŸ‘» STEALTH MODE ACTIVE');
+                    printLog('info', '👻 STEALTH MODE ACTIVE');
                 }
 
                 printLog('success', 'Connected to => ' + JSON.stringify(QasimDev.user, null, 2));
 
                 try {
                     const botNumber = QasimDev.user.id.split(':')[0] + '@s.whatsapp.net';
-                    const ghostStatus = (ghostMode && ghostMode.enabled) ? '\nðŸ‘» Stealth Mode: ACTIVE' : '';
+                    const ghostStatus = (ghostMode && ghostMode.enabled) ? '\n👻 Stealth Mode: ACTIVE' : '';
 
                     await QasimDev.sendMessage(botNumber, {
-                        text: `ðŸ¤– Bot Connected Successfully!\n\nâ° Time: ${new Date().toLocaleString()}\nâœ… Status: Online and Ready!${ghostStatus}\n\nâœ…Make sure to join our channel`,
+                        text: `🤖 Bot Connected Successfully!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!${ghostStatus}\n\n✅Make sure to join our channel`,
                         contextInfo: {
                             forwardingScore: 1,
                             isForwarded: false,
@@ -690,10 +690,10 @@ folders.forEach(folder => {
                     allowAwaitOutsideFunction: true
                 });
                 if (err) {
-                    console.error(chalk.red(`âŒ Syntax error in ${filePath}:\n${err}`));
+                    console.error(chalk.red(`❌ Syntax error in ${filePath}:\n${err}`));
                 }
             } catch (e: any) {
-                console.error(chalk.yellow(`âš ï¸ Cannot read file ${filePath}:\n${e}`));
+                console.error(chalk.yellow(`⚠️ Cannot read file ${filePath}:\n${e}`));
             }
         });
 });
