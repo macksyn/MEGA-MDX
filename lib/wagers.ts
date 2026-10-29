@@ -72,6 +72,7 @@ export interface WagerSummary {
   turnover: number;        // coins staked in the window
   bets: number;            // number of stakes in the window
   activeDays: number;      // distinct days with at least one stake in the window
+  dayKeys: string[];       // those days ('YYYY-MM-DD'), for unions with other activity
   bySource: { games: number; sportybet: number };
   lifetimeTurnover: number;
   firstAt: number | null;
@@ -130,12 +131,13 @@ export async function ingestWagers(userId: string): Promise<WagerRecord> {
 export function summarize(rec: WagerRecord, windowDays: number, now = Date.now()): WagerSummary {
   const startKey = todayStr(now - (windowDays - 1) * DAY_MS);
   let games = 0, sportybet = 0, bets = 0, activeDays = 0;
+  const dayKeys: string[] = [];
   for (const [key, b] of Object.entries(rec.days)) {
     if (key < startKey) continue;
     games += b.games; sportybet += b.sportybet; bets += b.bets;
-    if (b.bets > 0) activeDays++;
+    if (b.bets > 0) { activeDays++; dayKeys.push(key); }
   }
-  return { turnover: games + sportybet, bets, activeDays, bySource: { games, sportybet }, lifetimeTurnover: rec.lifetimeStake, firstAt: rec.firstAt };
+  return { turnover: games + sportybet, bets, activeDays, dayKeys, bySource: { games, sportybet }, lifetimeTurnover: rec.lifetimeStake, firstAt: rec.firstAt };
 }
 
 /** Rolling-window play summary for one member (ingests first, so it is always current). */

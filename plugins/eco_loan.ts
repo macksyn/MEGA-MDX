@@ -24,6 +24,7 @@ import {
 } from '../lib/loans.js';
 import { CREDIT_CONFIG, assessCredit } from '../lib/credit.js';
 import { listWagerSummaries } from '../lib/wagers.js';
+import { listBankingSummaries } from '../lib/bankActivity.js';
 import isOwnerOrSudo, { cleanJid } from '../lib/isOwner.js';
 
 export const command = 'loan';
@@ -96,18 +97,21 @@ async function handleAdmin(sock, message, context, args) {
     const targetId = cleanJid(mentioned);
     const [p, history, wallet] = await Promise.all([getCreditProfile(targetId), getLoanHistory(targetId), getWallet(targetId)]);
     const a = p.assessment;
+    const s = p.signals;
     const standing = history.find(l => l.status === 'defaulted') ? '🔴 in default'
       : history.find(l => l.status === 'active') ? '💳 active loan' : '✅ no loan outstanding';
     await sock.sendMessage(chatId, {
       text:
         `📊 *CREDIT FILE — ${wallet.name || targetId}*\n\n` +
-        `Play (${CREDIT_CONFIG.WINDOW_DAYS}d): *${formatNumber(p.signals.turnover)}* staked · ${p.signals.bets} bets · ${p.signals.activeDays} active days\n` +
-        `   🎰 Games ${formatNumber(p.signals.bySource.games)} · ⚽ Sportybet ${formatNumber(p.signals.bySource.sportybet)}\n` +
-        `Lifetime staked (tracked): ${formatNumber(p.signals.lifetimeTurnover)}\n\n` +
+        `Score: *${a.score}/100*  (🎮 Play ${a.pillars.play.points}/${a.pillars.play.max} · 🏦 Banking ${a.pillars.banking.points}/${a.pillars.banking.max})\n` +
+        a.components.map(c => `   ${c.label}: ${formatNumber(c.have)} → ${c.points}/${c.max}`).join('\n') + `\n\n` +
+        `Play (${CREDIT_CONFIG.WINDOW_DAYS}d): ${formatNumber(s.turnover)} staked · ${s.bets} bets · ${s.activeDays} play days\n` +
+        `   🎰 Games ${formatNumber(s.bySource.games)} · ⚽ Sportybet ${formatNumber(s.bySource.sportybet)}\n` +
+        `Savings: avg ${formatNumber(s.avgBalance)} · now ${formatNumber(s.currentSavings)} · locked ${formatNumber(s.lockedNow)} · ${s.saveDays} saving days\n\n` +
         a.gates.map(g => `${g.met ? '✅' : '❌'} ${g.label}: ${formatNumber(g.have)} / ${formatNumber(g.need)}`).join('\n') + `\n\n` +
-        `Grade: *${a.grade ? a.grade.name : 'none'}*${a.nextGrade ? ` (next: ${a.nextGrade.name}, ${formatNumber(a.volumeToNext)} more)` : ''}\n` +
+        `Grade: *${a.grade ? a.grade.name : 'none'}*${a.nextGrade ? ` (next: ${a.nextGrade.name}, ${a.pointsToNext} pts more)` : ''}\n` +
         `Repayment streak: ${p.repaidStreak}\n` +
-        `Limit: *${p.maxAmount ? formatNumber(p.maxAmount) : '—'}*  ·  Qualifies on play: ${a.qualifies ? 'yes' : 'no'}\n` +
+        `Limit: *${p.maxAmount ? formatNumber(p.maxAmount) : '—'}*  ·  Qualifies on score: ${a.qualifies ? 'yes' : 'no'}\n` +
         `Standing: ${standing}`,
       ...channelInfo
     }, { quoted: message });
@@ -115,25 +119,35 @@ async function handleAdmin(sock, message, context, args) {
   }
 
   if (sub === 'credit') {
-    const rows = (await listWagerSummaries(CREDIT_CONFIG.WINDOW_DAYS))
-      .filter(r => r.turnover > 0)
-      .sort((x, y) => y.turnover - x.turnover);
-    const qualifying = rows.filter(r => assessCredit(r).qualifies).length;
+    // Everyone with any recorded play OR banking activity, scored from the ledgers alone (no ingest).
+    const [plays, banks] = await Promise.all([listWagerSummaries(CREDIT_CONFIG.WINDOW_DAYS), listBankingSummaries(CREDIT_CONFIG.WINDOW_DAYS)]);
+    const ids = new Set([...plays.map(r => r.userId), ...banks.map(r => r.userId)]);
+    const rows = [...ids].map(userId => {
+      const play = plays.find(r => r.userId === userId);
+      const bank = banks.find(r => r.userId === userId);
+      const activityDays = new Set([...(play?.dayKeys || []), ...(bank?.eventDays || [])]).size;
+      const a = assessCredit({
+        turnover: play?.turnover || 0, activeDays: play?.activeDays || 0,
+        saveDays: bank?.saveDays || 0, avgBalance: bank?.avgBalance || 0, lockedNow: bank?.lockedNow || 0, activityDays,
+      });
+      return { userId, a };
+    }).filter(r => r.a.score > 0).sort((x, y) => y.a.score - x.a.score);
+
+    const qualifying = rows.filter(r => r.a.qualifies).length;
     const top = await Promise.all(rows.slice(0, 10).map(async (r, i) => {
-      const a = assessCredit(r);
       const w = await getWallet(r.userId);
-      return `${i + 1}. ${w.name || r.userId} — ${formatNumber(r.turnover)} · ${r.activeDays}d · ${a.grade ? a.grade.name : '—'} ${a.qualifies ? '✅' : '❌'}`;
+      return `${i + 1}. ${w.name || r.userId} — ${r.a.score} (🎮 ${r.a.pillars.play.points} · 🏦 ${r.a.pillars.banking.points}) · ${r.a.grade ? r.a.grade.name : '—'} ${r.a.qualifies ? '✅' : '❌'}`;
     }));
-    const tiers = CREDIT_CONFIG.GRADES.map(g => `${g.name} ${formatNumber(g.minTurnover)}+ → ${formatNumber(g.baseMaxAmount)}`).join(' · ');
+    const tiers = CREDIT_CONFIG.GRADES.map(g => `${g.name} ${g.minScore}+ → ${formatNumber(g.baseMaxAmount)}`).join(' · ');
     await sock.sendMessage(chatId, {
       text:
         `📈 *CREDIT BOOK — last ${CREDIT_CONFIG.WINDOW_DAYS} days*\n\n` +
-        `Members with recorded play: ${rows.length}\n` +
+        `Members with a credit file: ${rows.length}\n` +
         `Qualifying for a loan right now: ${qualifying}\n\n` +
-        (top.length ? `*Top by volume (staked · active days · grade):*\n${top.join('\n')}\n\n` : `_No play recorded yet._\n\n`) +
+        (top.length ? `*Top by score (play · banking · grade):*\n${top.join('\n')}\n\n` : `_No activity recorded yet._\n\n`) +
         `Grades: ${tiers}\n` +
-        `Gate: ${CREDIT_CONFIG.GRADES[0].minTurnover}+ staked on ${CREDIT_CONFIG.MIN_ACTIVE_DAYS}+ days\n` +
-        `_Tune thresholds in lib/credit.ts (CREDIT_CONFIG) once you see how real members distribute._`,
+        `Gate: score ${CREDIT_CONFIG.GRADES[0].minScore}+ and activity on ${CREDIT_CONFIG.MIN_ACTIVITY_DAYS}+ days\n` +
+        `_Tune weights, thresholds and limits in lib/credit.ts (CREDIT_CONFIG) once you see how real members distribute._`,
       ...channelInfo
     }, { quoted: message });
     return;
@@ -181,7 +195,7 @@ async function _handler(sock, message, args, context) {
     text:
       `💳 *Loans have moved into the bank.*\n\n` +
       `Type *${BANK_COMMAND}* and tap *Get a loan* — or *My loan* if you already have one.\n\n` +
-      `*Who qualifies:* active players — at least ${formatNumber(CREDIT_CONFIG.GRADES[0].minTurnover)} coins staked on games or Sportybet over the last ${CREDIT_CONFIG.WINDOW_DAYS} days, across ${CREDIT_CONFIG.MIN_ACTIVE_DAYS}+ different days. The more you play, the higher your limit.\n\n` +
+      `*Who qualifies:* members with an active record. Your credit score (0–100) grows when you play on games & Sportybet *and* when you bank with us — keep savings in your account, deposit regularly and try a Money Lock. You also need activity on ${CREDIT_CONFIG.MIN_ACTIVITY_DAYS}+ different days in the last ${CREDIT_CONFIG.WINDOW_DAYS}.\n\n` +
       `_The Loans button appears once you qualify, or if you already have a loan._`,
     ...channelInfo
   }, { quoted: message });

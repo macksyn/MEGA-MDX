@@ -2,52 +2,83 @@
 /***
  * lib/credit.ts
  *
- * Credit assessment — pure functions, no storage, no sockets. Decides whether
- * a member's recent play qualifies them for a loan and what limit it earns,
- * the way a lender underwrites an applicant: look at recent activity, check
- * it's consistent rather than a one-off burst, then price the line of credit.
+ * Credit assessment — pure functions, no storage, no sockets. A member's loan
+ * standing is a 0–100 CREDIT SCORE built from two pillars, the way a lender
+ * looks at both how you transact and how you bank:
  *
- *   Gate 1  Play volume  — coins staked on games + Sportybet over the last
- *                          WINDOW_DAYS must reach the first grade's minimum.
- *   Gate 2  Consistency  — stakes on at least MIN_ACTIVE_DAYS different days
- *                          in that window (a single big session doesn't qualify).
- *   Grade   Volume sets the credit grade and its base limit.
- *   Record  lib/loans.ts then scales the base limit by the member's on-time
- *           repayment streak (+15% per loan, capped at 2x). A member with an
- *           outstanding or defaulted loan is handled there, not here.
+ *   PLAY (45 pts)      volume staked on games + Sportybet, and how many
+ *                      different days they played       (lib/wagers.ts)
+ *   BANKING (55 pts)   average savings kept with the bank, how regularly they
+ *                      pay in, and coins committed to a Money Lock
+ *                                                          (lib/bankActivity.ts)
  *
- * Everything tunable is in CREDIT_CONFIG. The numbers below are sized for an
- * economy where stakes run 5–100 coins and work pays 50–300 an hour; run
+ * Each factor earns points up to its max, scaling linearly until it reaches its
+ * `full` mark. The score sets a credit grade; a grade sets the base limit.
+ * Either pillar alone can qualify a member at the lower grades, but the top
+ * grades need both — a pure gambler tops out at Silver, a pure saver at Gold.
+ *
+ * One gate sits outside the score: the member must have been ACTIVE (a day with
+ * a stake or a bank transaction) on at least MIN_ACTIVITY_DAYS different days in
+ * the window, so a single big session or one lump deposit can't buy a loan.
+ *
+ * lib/loans.ts then scales the base limit by the member's on-time repayment
+ * streak (+15% per loan, capped at 2x). An outstanding or defaulted loan is
+ * handled there, not here.
+ *
+ * Everything tunable is in CREDIT_CONFIG. The numbers are a first guess sized
+ * for stakes of 5–100 coins and work pay of 50–300 an hour; run
  * `loan admin credit` to see how real members distribute, then adjust.
  */
 
 export interface CreditGrade {
   name: string;
-  minTurnover: number;     // coins staked in the window to earn this grade
+  minScore: number;        // credit score needed for this grade
   baseMaxAmount: number;   // credit limit before the repayment bonus
   termWeeks: number;
 }
 
+export interface CreditComponent {
+  key: 'volume' | 'playDays' | 'balance' | 'saveDays' | 'locked';
+  pillar: 'play' | 'banking';
+  label: string;
+  max: number;             // points available
+  full: number;            // value of the underlying signal that earns the full points
+}
+
 export const CREDIT_CONFIG = {
   WINDOW_DAYS: 30,
-  MIN_ACTIVE_DAYS: 4,
+  MIN_ACTIVITY_DAYS: 4,
+  COMPONENTS: [
+    { key: 'volume',   pillar: 'play',    label: 'Play volume',        max: 30, full: 3000 }, // coins staked
+    { key: 'playDays', pillar: 'play',    label: 'Play consistency',   max: 15, full: 8 },    // days with a stake
+    { key: 'balance',  pillar: 'banking', label: 'Average savings',    max: 25, full: 800 },  // avg daily savings + locked
+    { key: 'saveDays', pillar: 'banking', label: 'Saving consistency', max: 15, full: 6 },    // days with a deposit / new lock
+    { key: 'locked',   pillar: 'banking', label: 'Money Lock',         max: 15, full: 500 },  // coins currently locked
+  ] as CreditComponent[],
   GRADES: [
-    { name: 'Bronze',   minTurnover: 500,   baseMaxAmount: 100, termWeeks: 1 },
-    { name: 'Silver',   minTurnover: 2000,  baseMaxAmount: 200, termWeeks: 1 },
-    { name: 'Gold',     minTurnover: 6000,  baseMaxAmount: 350, termWeeks: 1 },
-    { name: 'Platinum', minTurnover: 15000, baseMaxAmount: 500, termWeeks: 1 },
+    { name: 'Bronze',   minScore: 12, baseMaxAmount: 100, termWeeks: 1 },
+    { name: 'Silver',   minScore: 30, baseMaxAmount: 200, termWeeks: 1 },
+    { name: 'Gold',     minScore: 50, baseMaxAmount: 350, termWeeks: 1 },
+    { name: 'Platinum', minScore: 75, baseMaxAmount: 500, termWeeks: 1 },
   ] as CreditGrade[],
 };
 
 export interface CreditSignals {
-  turnover: number;
-  activeDays: number;
-  bets?: number;
-  bySource?: { games: number; sportybet: number };
+  turnover: number;        // coins staked in the window
+  activeDays: number;      // days with a stake
+  saveDays: number;        // days with a deposit or new lock
+  avgBalance: number;      // average daily savings + locked
+  lockedNow: number;       // coins currently locked
+  activityDays: number;    // days with a stake OR a bank transaction (the gate)
+}
+
+export interface CreditComponentResult extends CreditComponent {
+  have: number;
+  points: number;
 }
 
 export interface CreditGate {
-  key: 'volume' | 'days';
+  key: 'score' | 'activity';
   label: string;
   have: number;
   need: number;
@@ -56,33 +87,60 @@ export interface CreditGate {
 
 export interface CreditAssessment {
   qualifies: boolean;
-  grade: CreditGrade | null;      // best grade this volume earns (null below the first grade)
-  nextGrade: CreditGrade | null;  // what they're working toward (null at the top)
+  score: number;                       // 0..100
+  grade: CreditGrade | null;           // best grade the score earns (null below the first)
+  nextGrade: CreditGrade | null;       // what they're working toward (null at the top)
+  pointsToNext: number;                // score still needed for nextGrade (0 at the top)
+  progress: number;                    // 0..1 toward nextGrade (1 at the top)
+  components: CreditComponentResult[];
+  pillars: { play: { points: number; max: number }; banking: { points: number; max: number } };
   gates: CreditGate[];
-  progress: number;               // 0..1 toward nextGrade's volume (1 at the top)
-  volumeToNext: number;           // coins of stake still needed for nextGrade (0 at the top)
 }
 
-export function assessCredit(signals: CreditSignals, cfg = CREDIT_CONFIG): CreditAssessment {
-  const grades = [...cfg.GRADES].sort((a, b) => a.minTurnover - b.minTurnover);
-  const turnover = Math.max(0, signals.turnover || 0);
+const round1 = (n: number) => Math.round(n * 10) / 10;
 
-  const grade = [...grades].reverse().find(g => turnover >= g.minTurnover) || null;
-  const nextGrade = grades.find(g => turnover < g.minTurnover) || null;
-  const floor = grade ? grade.minTurnover : 0;
-  const progress = nextGrade ? Math.max(0, Math.min(1, (turnover - floor) / (nextGrade.minTurnover - floor))) : 1;
+export function assessCredit(signals: Partial<CreditSignals>, cfg = CREDIT_CONFIG): CreditAssessment {
+  const value: Record<CreditComponent['key'], number> = {
+    volume: signals.turnover || 0,
+    playDays: signals.activeDays || 0,
+    balance: signals.avgBalance || 0,
+    saveDays: signals.saveDays || 0,
+    locked: signals.lockedNow || 0,
+  };
 
+  const components: CreditComponentResult[] = cfg.COMPONENTS.map(c => ({
+    ...c,
+    have: Math.max(0, value[c.key]),
+    points: round1(c.max * Math.max(0, Math.min(1, value[c.key] / c.full))),
+  }));
+
+  const pillar = (p: 'play' | 'banking') => ({
+    points: round1(components.filter(c => c.pillar === p).reduce((s, c) => s + c.points, 0)),
+    max: cfg.COMPONENTS.filter(c => c.pillar === p).reduce((s, c) => s + c.max, 0),
+  });
+  const score = round1(components.reduce((s, c) => s + c.points, 0));
+
+  const grades = [...cfg.GRADES].sort((a, b) => a.minScore - b.minScore);
+  const grade = [...grades].reverse().find(g => score >= g.minScore) || null;
+  const nextGrade = grades.find(g => score < g.minScore) || null;
+  const floor = grade ? grade.minScore : 0;
+  const progress = nextGrade ? Math.max(0, Math.min(1, (score - floor) / (nextGrade.minScore - floor))) : 1;
+
+  const activityDays = signals.activityDays || 0;
   const gates: CreditGate[] = [
-    { key: 'volume', label: `Play volume (${cfg.WINDOW_DAYS} days)`, have: turnover, need: grades[0].minTurnover, met: turnover >= grades[0].minTurnover },
-    { key: 'days', label: `Active days (${cfg.WINDOW_DAYS} days)`, have: signals.activeDays || 0, need: cfg.MIN_ACTIVE_DAYS, met: (signals.activeDays || 0) >= cfg.MIN_ACTIVE_DAYS },
+    { key: 'score', label: 'Credit score', have: score, need: grades[0].minScore, met: score >= grades[0].minScore },
+    { key: 'activity', label: `Active days (${cfg.WINDOW_DAYS} days)`, have: activityDays, need: cfg.MIN_ACTIVITY_DAYS, met: activityDays >= cfg.MIN_ACTIVITY_DAYS },
   ];
 
   return {
     qualifies: !!grade && gates.every(g => g.met),
+    score,
     grade,
     nextGrade,
-    gates,
+    pointsToNext: nextGrade ? round1(nextGrade.minScore - score) : 0,
     progress,
-    volumeToNext: nextGrade ? nextGrade.minTurnover - turnover : 0,
+    components,
+    pillars: { play: pillar('play'), banking: pillar('banking') },
+    gates,
   };
 }

@@ -67,9 +67,99 @@ export const TARGET_RTP            = 0.915;
 export const HARD_CEILING_RTP      = 0.93;
 export const EMERGENCY_CEILING_RTP = 0.90;
 
+// ── Customer capital (Money Lock) and the insurance fund ─────────────────────
+// Everything outside this file (games, loans, the reserve board) keeps calling
+// getJackpotPool(). It returns the VISIBLE pool — what the games may play with:
+//
+//   visible pool  =  house pool  +  deposit capital  −  insurance added
+//
+//   • deposit capital   members' LOCKED savings that the bank may use: the
+//     non-reserved part of them. Written ONLY by lib/bankLocks.ts, which
+//     recomputes it from the lock records every time (so it can't drift).
+//   • insurance added   coins the admin (or the weekly/monthly top-up in
+//     lib/insurance.ts) has set aside ON TOP of the JACKPOT_SEED base. They stay
+//     in the house pool but are held out of the visible pool, so games and loans
+//     can never spend them. Total insurance = JACKPOT_SEED + insurance added.
+//
+// Games keep treating JACKPOT_SEED as their floor, so no game logic changed:
+// holding coins back simply lowers the visible pool they see. The house pool
+// alone can legitimately sit below the floor when payouts have consumed deposit
+// capital; the visible pool is what is held at/above the floor.
+async function getDepositCapital(): Promise<number> {
+  const v = await jackpotTbl.get('depositCapital');
+  return typeof v === 'number' && v > 0 ? v : 0;
+}
+
+export async function setDepositCapital(amount: number): Promise<void> {
+  await jackpotTbl.set('depositCapital', Math.max(0, Math.round(amount)));
+}
+
+async function getInsuranceExtra(): Promise<number> {
+  const v = await jackpotTbl.get('insuranceExtra');
+  return typeof v === 'number' && v > 0 ? v : 0;
+}
+
+const housePool = (cur: any): number => (typeof cur === 'number' ? cur : JACKPOT_SEED);
+
+/** The bank's own pool, excluding customer deposit capital (admin/solvency views). */
+export async function getHousePool(): Promise<number> {
+  return housePool(await jackpotTbl.get('pool'));
+}
+
 export async function getJackpotPool(): Promise<number> {
-  const val = await jackpotTbl.get('pool');
-  return typeof val === 'number' ? val : JACKPOT_SEED;
+  const [house, dc, extra] = await Promise.all([getHousePool(), getDepositCapital(), getInsuranceExtra()]);
+  return house + dc - extra;
+}
+
+export interface ReserveSnapshot {
+  house: number;            // the house pool alone
+  depositCapital: number;   // locked-savings capital the bank may use
+  extra: number;            // insurance added on top of the base
+  visible: number;          // what the games and loans see
+  total: number;            // everything the bank holds: visible + insurance added
+  insurance: number;        // JACKPOT_SEED + extra — the part nothing may spend
+  available: number;        // visible − floor: what can actually be won / lent
+  underwater: boolean;      // visible pool below the floor: the insurance itself is being drawn on
+}
+
+/** One consistent reading of the whole reserve, for the boards and admin views. */
+export async function getReserveSnapshot(): Promise<ReserveSnapshot> {
+  const [house, depositCapital, extra] = await Promise.all([getHousePool(), getDepositCapital(), getInsuranceExtra()]);
+  const visible = house + depositCapital - extra;
+  return {
+    house, depositCapital, extra, visible,
+    total: visible + extra,
+    insurance: JACKPOT_SEED + extra,
+    available: Math.max(0, visible - JACKPOT_SEED),
+    underwater: visible < JACKPOT_SEED,
+  };
+}
+
+/**
+ * Sets aside `amount` more coins as insurance. They must come out of the playable surplus —
+ * you can't insure coins the bank doesn't have — so it is refused if that would take the visible
+ * pool below the floor.
+ */
+export async function addInsurance(amount: number): Promise<{ ok: boolean; reason?: 'invalid' | 'no_surplus'; extra: number; available: number }> {
+  const n = Math.floor(Number(amount));
+  const snap = await getReserveSnapshot();
+  if (!Number.isFinite(n) || n <= 0) return { ok: false, reason: 'invalid', extra: snap.extra, available: snap.available };
+  if (snap.visible - n < JACKPOT_SEED) return { ok: false, reason: 'no_surplus', extra: snap.extra, available: snap.available };
+  const extra = await jackpotTbl.mutate('insuranceExtra', (cur: any) => (typeof cur === 'number' && cur > 0 ? cur : 0) + n);
+  return { ok: true, extra, available: snap.available - n };
+}
+
+/** Sums the house's daily bets and payouts over UTC day keys (inclusive) — feeds the insurance top-up. */
+export async function getHouseProfitBetween(fromDay: string, toDay: string): Promise<{ bet: number; won: number; profit: number; days: number }> {
+  let bet = 0, won = 0, days = 0;
+  const end = Date.parse(toDay + 'T00:00:00Z');
+  for (let t = Date.parse(fromDay + 'T00:00:00Z'); t <= end; t += 86_400_000) {
+    const key = new Date(t).toISOString().split('T')[0];
+    bet += Number(await houseStatsTbl.get(`${key}_bet`)) || 0;
+    won += Number(await houseStatsTbl.get(`${key}_won`)) || 0;
+    days++;
+  }
+  return { bet, won, profit: bet - won, days };
 }
 
 /**
@@ -81,28 +171,46 @@ export async function getJackpotPool(): Promise<number> {
 export async function contributeToJackpot(bet: number): Promise<number> {
   // mutate() holds the store's per-key lock — the old get-then-set let two
   // simultaneous bets overwrite each other and the bankroll silently drifted.
-  return jackpotTbl.mutate('pool', (cur: any) => (typeof cur === 'number' ? cur : JACKPOT_SEED) + bet);
+  const house = await jackpotTbl.mutate('pool', (cur: any) => housePool(cur) + bet);
+  return house + (await getDepositCapital()) - (await getInsuranceExtra());
 }
 
 /** Pays a payout out of the jackpot pool, respecting the protected floor seed. */
 export async function deductFromJackpot(amount: number): Promise<number> {
-  return jackpotTbl.mutate('pool', (cur: any) =>
-    Math.max(JACKPOT_SEED, (typeof cur === 'number' ? cur : JACKPOT_SEED) - amount));
+  // Clamps the VISIBLE pool at the floor (house + deposit capital − insurance added >= JACKPOT_SEED).
+  const [dc, extra] = await Promise.all([getDepositCapital(), getInsuranceExtra()]);
+  const house = await jackpotTbl.mutate('pool', (cur: any) =>
+    Math.max(JACKPOT_SEED - dc + extra, housePool(cur) - amount));
+  return house + dc - extra;
 }
 
 /**
  * STRICT, atomic draw for anything that must not be short-paid or clamped
- * (loans, bank interest). Succeeds only if the pool stays >= JACKPOT_SEED
- * afterwards; otherwise nothing is taken and ok is false.
+ * (loans). Succeeds only if the VISIBLE pool stays >= JACKPOT_SEED afterwards;
+ * otherwise nothing is taken and ok is false.
  */
 export async function drawFromReserve(amount: number): Promise<{ ok: boolean; pool: number }> {
+  const [dc, extra] = await Promise.all([getDepositCapital(), getInsuranceExtra()]);
   let ok = false;
-  const pool = await jackpotTbl.mutate('pool', (cur: any) => {
-    const p = typeof cur === 'number' ? cur : JACKPOT_SEED;
-    if (amount > 0 && p - amount >= JACKPOT_SEED) { ok = true; return p - amount; }
+  const house = await jackpotTbl.mutate('pool', (cur: any) => {
+    const p = housePool(cur);
+    if (amount > 0 && p + dc - extra - amount >= JACKPOT_SEED) { ok = true; return p - amount; }
     return p;
   });
-  return { ok, pool };
+  return { ok, pool: house + dc - extra };
+}
+
+/**
+ * Pays a bank OBLIGATION (Money Lock interest) out of the house pool. Deliberately
+ * NOT floor-limited: a promise to a depositor is honoured even if it pushes the
+ * bank below its floor — the visible pool then reads below JACKPOT_SEED, which
+ * means the INSURANCE is now being drawn on: the games enter their emergency/
+ * critical state and new loans and new locks are refused until house profits
+ * rebuild it. Returns the new visible pool.
+ */
+export async function payFromReserve(amount: number): Promise<number> {
+  const house = await jackpotTbl.mutate('pool', (cur: any) => housePool(cur) - amount);
+  return house + (await getDepositCapital()) - (await getInsuranceExtra());
 }
 
 export interface SettledPayout {

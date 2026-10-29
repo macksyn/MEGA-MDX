@@ -16,7 +16,7 @@
  */
 import { withEconomyGuard, formatNumber } from '../lib/economy.js';
 import {
-  getJackpotPool, getTodayStats, getSolvencyState, getHouseMood,
+  getJackpotPool, getReserveSnapshot, getTodayStats, getSolvencyState, getHouseMood,
   TARGET_RTP, HARD_CEILING_RTP, EMERGENCY_CEILING_RTP, JACKPOT_SEED,
 } from '../lib/slotMachine.js';
 import isOwnerOrSudo, { cleanJid } from '../lib/isOwner.js';
@@ -64,10 +64,13 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     return sendAdminView(sock, chatId, message, channelInfo);
   }
 
-  const pool = await getJackpotPool();
+  // Total reserve and total insurance (base + whatever the admin/auto top-up has set aside), not just the
+  // part the games can play with.
+  const reserve = await getReserveSnapshot();
+  const pool = reserve.total;
   const today = await getTodayStats();
   const mood = await getHouseMood();
-  const surplus = Math.max(0, pool - JACKPOT_SEED);
+  const surplus = reserve.available;
   const netSign = today.net > 0 ? '+' : '';
 
   // Silent loan hint: only ever shown to a user who's actually eligible right
@@ -87,7 +90,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
     text:
       `🏦 *THE COMMUNITY BANK* 🏦\n\n` +
       `💰 Current reserve: *${formatNumber(pool)} coins*\n` +
-      `🛡️ DeFi Insurance: *${formatNumber(JACKPOT_SEED)} coins* _(guarantees your coins are never lost.)_\n` +
+      `🛡️ DeFi Insurance: *${formatNumber(reserve.insurance)} coins* _(guarantees your coins are never lost.)_\n` +
       `🎯 Available to win: *${formatNumber(surplus)} coins*\n\n` +
       `📊 *Today's activity*\n` +
       `   Wagered: ${formatNumber(today.bet)} coins\n` +
@@ -102,12 +105,13 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 }
 
 async function sendAdminView(sock: any, chatId: string, message: any, channelInfo: any) {
-  const pool = await getJackpotPool();
+  const reserve = await getReserveSnapshot();
+  const pool = reserve.visible;                 // what the games see — solvency is judged on THIS
   const today = await getTodayStats();
   const solvency = getSolvencyState(pool);
   const mood = await getHouseMood();
-  const surplus = Math.max(0, pool - JACKPOT_SEED);
-  const lifetimeNet = pool - JACKPOT_SEED; // pool = seed + Σcontributions - Σpayouts, so this IS lifetime net
+  const surplus = reserve.available;
+  const lifetimeNet = reserve.house - JACKPOT_SEED; // house pool = seed + Σcontributions - Σpayouts (customer deposit capital excluded), so this IS lifetime net
   const activeCeiling = solvency.level === 'critical' ? EMERGENCY_CEILING_RTP : HARD_CEILING_RTP;
   const netSign = today.net > 0 ? '+' : '';
   const moodRemaining = formatDuration(mood.expiresAt - Date.now());
@@ -115,7 +119,7 @@ async function sendAdminView(sock: any, chatId: string, message: any, channelInf
   await sock.sendMessage(chatId, {
     text:
       `🏦 *BANK — ADMIN VIEW* 🏦\n\n` +
-      `💰 Reserve: *${formatNumber(pool)} coins*  (floor ${formatNumber(JACKPOT_SEED)}, surplus ${formatNumber(surplus)})\n` +
+      `💰 Reserve: *${formatNumber(reserve.total)} coins*  (insurance ${formatNumber(reserve.insurance)}, surplus ${formatNumber(surplus)})\n` +
       `📈 Lifetime net: *${lifetimeNet >= 0 ? '+' : ''}${formatNumber(lifetimeNet)} coins* _(all-time wagered − paid out)_\n\n` +
       `🛡️ Solvency: *${solvency.level.toUpperCase()}*  (pressure ×${solvency.pressure.toFixed(3)})\n` +
       `🎲 House mood: *${mood.mood}*  (×${mood.multiplier.toFixed(2)}, resets in ~${moodRemaining})\n` +

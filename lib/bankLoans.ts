@@ -6,9 +6,10 @@
  * to use loans — plugins/eco_loan.ts keeps just the admin tools and the
  * due-date reminders, and points everyone else here.
  *
- * The engine (credit assessment, interest, garnishment, the strict reserve
- * draw and the per-user lock) lives in lib/loans.ts, lib/credit.ts and
- * lib/wagers.ts; this file is presentation and navigation only:
+ * The engine (credit score, interest, garnishment, the strict reserve draw and
+ * the per-user lock) lives in lib/loans.ts, lib/credit.ts, lib/wagers.ts and
+ * lib/bankActivity.ts; this file is presentation and navigation, plus the
+ * pay-from-savings helper:
  *
  *   home ─▶ loan (hub, changes with the member's state)
  *             ├─ loanApply ─▶ loanConfirm ─▶ (loan approved, back to home)
@@ -17,8 +18,8 @@
  *             ├─ loanHistory
  *             └─ loanInfo
  *
- * The Loans button on the home screen only exists for members whose recent
- * play qualifies them right now, or who already hold a loan
+ * The Loans button on the home screen only exists for members whose credit
+ * score qualifies them right now, or who already hold a loan
  * (see getLoanAccess / loanMenuOption).
  *
  * NOTE on headings: promptMenu already prints each screen's `title` (bold)
@@ -31,6 +32,7 @@ import {
   INTEREST_RATE, DEFAULT_INTEREST_RATE, MIN_LOAN_AMOUNT, GRACE_PERIOD_MS, GARNISHMENT_RATE,
 } from './loans.js';
 import { CREDIT_CONFIG } from './credit.js';
+import { withdraw as bankWithdraw, getAvailableSavings } from './bankLedger.js';
 import { askAmount, type Screen } from './bankUi.js';
 
 const fmt = formatNumber;
@@ -76,7 +78,7 @@ export interface LoanAccess {
   hasLoanButton: boolean;
 }
 
-/** Loans are visible to members whose recent play qualifies right now, or who already hold a loan — nobody else. */
+/** Loans are visible to members whose credit score qualifies right now, or who already hold a loan — nobody else. */
 export async function getLoanAccess(userId: string): Promise<LoanAccess> {
   const loan = await getRepayableLoan(userId).catch(() => null);
   let eligibility = null;
@@ -100,7 +102,10 @@ export function loanMenuOption(access: LoanAccess) {
 
 // ── Text builders ────────────────────────────────────────────────────────────
 
-function activeLoanCard(loan: any, walletCoins: number): string {
+const holdLine = (hold: number) =>
+  hold > 0 ? `🔐 *${fmt(hold)}* of your savings is held as security — repaying frees it.` : '';
+
+function activeLoanCard(loan: any, walletCoins: number, hold = 0): string {
   const paidPct = loan.principal > 0
     ? Math.min(100, (loan.totalRepaid / (loan.totalRepaid + loan.balance)) * 100)
     : 0;
@@ -110,21 +115,23 @@ function activeLoanCard(loan: any, walletCoins: number): string {
     `Repaid  ${bar(paidPct)} ${paidPct.toFixed(0)}%`,
     dueLabel(loan),
     `_plus ${pct(INTEREST_RATE)}._`,
+    holdLine(hold),
     ``,
     `💰 Wallet: ${fmt(walletCoins)}`,
-  ].join('\n');
+  ].filter((l, i, a) => l !== '' || a[i - 1] !== '').join('\n');
 }
 
-function defaultedLoanCard(loan: any, walletCoins: number): string {
+function defaultedLoanCard(loan: any, walletCoins: number, hold = 0): string {
   return [
     `🔴 *LOAN IN DEFAULT*`,
     `You are still owing *${fmt(loan.balance)}* coins`,
     ``,
     `*${pct(GARNISHMENT_RATE)}* of every attendance / work / game-win credit goes toward it until it's cleared. Transfers you receive are never touched.`,
-    `New loans are on hold until this clears. Paying it down yourself works too.`,
+    `Your savings are used to repay it automatically. New loans are on hold until it clears.`,
+    holdLine(hold),
     ``,
     `💰 Wallet: ${fmt(walletCoins)}`,
-  ].join('\n');
+  ].filter((l, i, a) => l !== '' || a[i - 1] !== '').join('\n');
 }
 
 function eligibleCard(e: any, walletCoins: number): string {
@@ -135,6 +142,8 @@ function eligibleCard(e: any, walletCoins: number): string {
     ``,
     `📈 *Activity in the last ${CREDIT_CONFIG.WINDOW_DAYS} days*`,
     ` ${fmt(s.turnover)} coins played · ${s.activeDays} active days`,
+    ` ${fmt(s.avgBalance)} average savings · saved on ${s.saveDays} days`,
+    ` Credit score: ${e.assessment.score}/100`,
     `⏳ *Loan term:* ${e.grade.termWeeks} week`,
     `💸 *Interest:* ${pct(INTEREST_RATE)}`,
     ``,
@@ -147,35 +156,54 @@ function notEligibleCard(e: any): string {
   const gates = (e?.assessment?.gates || []).map(g => `${g.met ? '✅' : '❌'} ${g.label}: ${fmt(g.have)} / ${fmt(g.need)}`);
   return [
     `🔒 *NOT YET ELIGIBLE*`,
-    `Loan offers are giving to active Casino and sportybet players. In the last ${CREDIT_CONFIG.WINDOW_DAYS} days you need:`,
+    `Loan offers are giving to active Casino and sportybet players, and to members who bank with us. In the last ${CREDIT_CONFIG.WINDOW_DAYS} days you need:`,
     ...gates,
-    `_Coins staked on games and Sportybet count._`,
+    `_Coins staked on games and Sportybet count — and so do your savings, deposits and Money Locks._`,
   ].join('\n');
 }
 
 // Keep the +15% / 2× wording in sync with REPAID_BONUS_PER_LOAN / MAX_REPAID_BONUS_MULTIPLIER in lib/loans.ts.
 function infoText(): string {
   const grades = CREDIT_CONFIG.GRADES.map((g, i) =>
-    `${GRADE_ICON[i] || '•'} ${g.name} — ${fmt(g.minTurnover)}+ played → up to ${fmt(g.baseMaxAmount)}`).join('\n');
+    `${GRADE_ICON[i] || '•'} ${g.name} — score ${g.minScore}+ → up to ${fmt(g.baseMaxAmount)}`).join('\n');
   return [
-    `*Who qualifies:* active players who, within the last ${CREDIT_CONFIG.WINDOW_DAYS} days, have staked at least ${fmt(CREDIT_CONFIG.GRADES[0].minTurnover)}+ coins on games or Sportybet across at least ${CREDIT_CONFIG.MIN_ACTIVE_DAYS}+ different days.`,
+    `*Who qualifies:* active members who, within the last ${CREDIT_CONFIG.WINDOW_DAYS} days, have built a credit score of at least ${CREDIT_CONFIG.GRADES[0].minScore} by playing games or Sportybet and banking with us (savings, regular deposits, Money Locks), across at least ${CREDIT_CONFIG.MIN_ACTIVITY_DAYS}+ different days.`,
     ``,
-    `*Your limit* grows with how much you play:`,
+    `*Your limit* grows with how much you play and save:`,
     grades,
     ``,
     `• A ${pct(INTEREST_RATE)} interest is applied upfront, including for loans repaid the same day.`,
     `• Repayment is due at the end of the loan term, followed by a ${duration(GRACE_PERIOD_MS)} grace period with no edditional charge.`,
-    `• After the grace period, the loan is in default. An additional +${pct(DEFAULT_INTEREST_RATE)} is added daily until the balance is cleared, and ${pct(GARNISHMENT_RATE)} of your earnings will be applied to repayment.`,
+    `• After the grace period, the loan is in default. An additional +${pct(DEFAULT_INTEREST_RATE)} is added daily until the balance is cleared, ${pct(GARNISHMENT_RATE)} of your earnings will be applied to repayment, and your savings are used to clear it.`,
+    `• While a loan is open, savings equal to what you owe are held as security.`,
     `• Repaying on time increase your limit by +15% per loan (max 2×).`,
   ].join('\n');
 }
 
-// ── Shared result handling ───────────────────────────────────────────────────
+/**
+ * Repays a member's loan out of their savings. Two ordinary, individually-safe steps:
+ * move the coins savings -> wallet (the only place that may bypass the collateral hold,
+ * because the coins are going straight to that member's own loan), then repay from the wallet.
+ * Also used by the default setoff sweep in plugins/bank.ts.
+ */
+export async function payLoanFromSavings(userId: string, requested: number | 'all' = 'all') {
+  const loan = await getRepayableLoan(userId);
+  if (!loan) return { success: false, reason: 'no_outstanding_loan' };
+  const { balance } = await getAvailableSavings(userId);
+  const owed = Math.ceil(loan.balance);
+  const amount = requested === 'all' ? Math.min(owed, balance) : Math.min(Math.floor(requested), owed, balance);
+  if (amount <= 0) return { success: false, reason: 'no_savings' };
+
+  const w = await bankWithdraw(userId, amount, { bypassHold: true, note: 'Loan repayment from savings' });
+  if (!w.ok) return { success: false, reason: 'no_savings' };
+  return repayLoan(userId, amount);
+}
 
 function repayNav(result: any) {
   if (!result.success) {
     const messages: Record<string, string> = {
       no_outstanding_loan: `❌ You don't have an outstanding loan.`,
+      no_savings: `❌ You have no savings to use.`,
       invalid_amount: `❌ Enter a valid amount.`,
       insufficient_funds: `❌ Not enough coins in your wallet — need ${fmt(result.needed ?? 0)}.`,
     };
@@ -201,7 +229,7 @@ function repayNav(result: any) {
 /** Hub — one screen whose content and buttons follow the member's loan state. */
 const loanHub: Screen = {
   async view(ctx) {
-    const [access, wallet] = await Promise.all([getLoanAccess(ctx.userId), getWallet(ctx.userId)]);
+    const [access, wallet, sav] = await Promise.all([getLoanAccess(ctx.userId), getWallet(ctx.userId), getAvailableSavings(ctx.userId)]);
     const profile = { label: '📊 Credit profile', value: 'profile', description: 'What sets your limit' };
     const history = { label: '📜 Loan history', value: 'history' };
     const info = { label: 'ℹ️ How loans work', value: 'info' };
@@ -211,7 +239,7 @@ const loanHub: Screen = {
       return {
         title: '💳 LOANS',
         subtitle: l.status === 'defaulted' ? undefined : `Active — ${dueShort(l)}`,
-        text: l.status === 'defaulted' ? defaultedLoanCard(l, wallet.coins) : activeLoanCard(l, wallet.coins),
+        text: l.status === 'defaulted' ? defaultedLoanCard(l, wallet.coins, sav.hold) : activeLoanCard(l, wallet.coins, sav.hold),
         options: [
           { label: '💵 Make a payment', value: 'pay', description: 'Pick an amount to pay down' },
           { label: '✅ Pay in full', value: 'payfull', description: `Clears ${fmt(l.balance)} owed` },
@@ -301,6 +329,7 @@ const loanConfirm: Screen = {
         `⏳ Due in ${termDays} days.`,
         ``,
         `⚠️ If it isn't repaid before due date: +${pct(DEFAULT_INTEREST_RATE)} is added daily, ${pct(GARNISHMENT_RATE)} of your earnings will go towards outstanding debt, and you lose future loan eligibility..`,
+        `🔐 Savings equal to what you owe are held as security until it's repaid.`,
       ].join('\n'),
       options: [{ label: '✅ Confirm loan', value: 'confirm' }],
     };
@@ -329,15 +358,21 @@ const loanConfirm: Screen = {
 
 const loanRepay: Screen = {
   async view(ctx) {
-    const [loan, wallet] = await Promise.all([getRepayableLoan(ctx.userId).catch(() => null), getWallet(ctx.userId)]);
+    const [loan, wallet, sav] = await Promise.all([getRepayableLoan(ctx.userId).catch(() => null), getWallet(ctx.userId), getAvailableSavings(ctx.userId)]);
     if (!loan) return { title: '💳 REPAY', text: `You don't have an outstanding loan.`, options: [] };
     const presets = Array.from(new Set(
       [0.25, 0.5, 0.75, 1].map(f => Math.round(loan.balance * f)).filter(n => n > 0)
     )).sort((a, b) => a - b);
-    const options = presets.map(a => ({
+    const options: any[] = presets.map(a => ({
       label: `${fmt(a)} coins`, value: String(a),
       description: a >= loan.balance ? 'Clears the loan' : undefined,
     }));
+    if (sav.balance > 0) {
+      options.push({
+        label: '🏦 Pay from savings', value: 'fromsavings',
+        description: `Uses up to ${fmt(Math.min(Math.ceil(loan.balance), sav.balance))} of your savings`,
+      });
+    }
     options.push({ label: '✍️ Custom amount', value: 'custom' });
     return {
       title: '💳 REPAY',
@@ -347,6 +382,7 @@ const loanRepay: Screen = {
     };
   },
   async select(value, ctx) {
+    if (value === 'fromsavings') return repayNav(await payLoanFromSavings(ctx.userId, 'all'));
     let amount: number | 'all' | null;
     if (value === 'custom') {
       amount = await askAmount(ctx, { prompt: `✍️ *How much do you want to pay?*`, allowAll: true });
@@ -365,17 +401,21 @@ const loanProfile: Screen = {
     const a = p.assessment;
     const s = p.signals;
     const first = CREDIT_CONFIG.GRADES[0];
-    const daysGate = a.gates.find(g => g.key === 'days');
+    const actGate = a.gates.find(g => g.key === 'activity');
 
     const lines = [
       a.grade
-        ? `*Credit Grade:* ${a.grade.name}${a.nextGrade ? `  \n  *Next Tier:* *${a.nextGrade.name}* at ${fmt(a.nextGrade.minTurnover)}` : '  _(top grade)_'}`
-        : `Grade: _none yet_ — ${first.name} starts at ${fmt(first.minTurnover)} played`,
+        ? `*Credit Grade:* ${a.grade.name}${a.nextGrade ? `  \n  *Next Tier:* *${a.nextGrade.name}* at score ${a.nextGrade.minScore}` : '  _(top grade)_'}`
+        : `Grade: _none yet_ — ${first.name} starts at score ${first.minScore}`,
+      `📊 *Credit Score:* ${a.score}/100  (🎮 ${a.pillars.play.points} · 🏦 ${a.pillars.banking.points})`,
+      `Progress  ${bar(a.progress * 100)}  ${a.score}${a.nextGrade ? ` / ${a.nextGrade.minScore}` : ''}`,
       `📈*Activity Overview*`,
-      `Progress  ${bar(a.progress * 100)}  ${fmt(s.turnover)}${a.nextGrade ? ` / ${fmt(a.nextGrade.minTurnover)}` : ''}`,
       `🎰 Games: ${fmt(s.bySource.games)} coins`,
       `⚽ Sportybet: ${fmt(s.bySource.sportybet)} coins`,
-      `📆 Active days:  *${s.activeDays}* ${daysGate?.met ? '✅' : `❌ _(need ${CREDIT_CONFIG.MIN_ACTIVE_DAYS})_`}`,
+      `🏦 *Banking Overview*`,
+      `💰 Average savings: ${fmt(s.avgBalance)} coins`,
+      `📅 Saved on ${s.saveDays} days · 🔒 Locked: ${fmt(s.lockedNow)} coins`,
+      `📆 Active days:  *${s.activityDays}* ${actGate?.met ? '✅' : `❌ _(need ${CREDIT_CONFIG.MIN_ACTIVITY_DAYS})_`}`,
       p.repaidStreak > 0
         ? `💳 *Repayment History* \nOn-Time Repayments: ${p.repaidStreak} \nPotential Credit Limit Increase (+${Math.min(100, p.repaidStreak * 15)}%)`
         : `Repayment record: no on-time streak yet`,

@@ -6,8 +6,9 @@
  * dashboard, deposit, withdraw, statement. Savings live in lib/bankLedger.ts
  * (separate from the jackpot pool); see that file for the money model.
  *
- * Loans are part of this menu (lib/bankLoans.ts) and nowhere else: the Loans
- * button only appears for members who are eligible or already hold a loan.
+ * Loans (lib/bankLoans.ts) and Money Lock (lib/bankLocksUi.ts) are part of this
+ * menu. The Loans button only appears for members whose credit score qualifies or
+ * who already hold a loan; Money Lock is open to everyone.
  *
  * The HOME screen is the public reserve board players already know from
  * {prefix}reserve (pool, protected floor, available, today's flow, house
@@ -25,10 +26,15 @@
 import { formatNumber, getWallet, withEconomyGuard } from '../lib/economy.js';
 import config from '../config.js';
 import isOwnerOrSudo, { cleanJid } from '../lib/isOwner.js';
-import { getLoanAccess, loanMenuOption, LOAN_SCREENS } from '../lib/bankLoans.js';
-import { getJackpotPool, getTodayStats, getHouseMood, JACKPOT_SEED } from '../lib/slotMachine.js';
+import { getLoanAccess, loanMenuOption, LOAN_SCREENS, payLoanFromSavings } from '../lib/bankLoans.js';
+import { LOCK_SCREENS } from '../lib/bankLocksUi.js';
+import { LOCK_CONFIG, getLockSummary, getLockTotals, getLockedPrincipal, sweepLocks, recoverLocks } from '../lib/bankLocks.js';
+import { noteBalance } from '../lib/bankActivity.js';
+import { getAllDefaultedLoans } from '../lib/loans.js';
+import { getReserveSnapshot, addInsurance, getTodayStats, getHouseMood, JACKPOT_SEED } from '../lib/slotMachine.js';
+import { INSURANCE_CONFIG, getInsuranceSettings, setAutoInsurance, nextRunDay, sweepInsurance } from '../lib/insurance.js';
 import {
-  BANK_CONFIG, getAccount, getStatement, getBankTotals, getUnfinishedMoves,
+  BANK_CONFIG, getAccount, getStatement, getBankTotals, getUnfinishedMoves, getAvailableSavings, listAccountBalances,
   deposit, withdraw, recoverPending,
 } from '../lib/bankLedger.js';
 import { runApp, askAmount, parseAmount, type Screen, type BankCtx } from '../lib/bankUi.js';
@@ -78,10 +84,11 @@ const bar = (fraction: number) => {
 
 // Member-savings total scans every account, so cache it briefly. Bank moves in THIS plugin
 // invalidate it so a player never sees their own deposit missing from the board.
-let totalsCache = { at: 0, value: { accounts: 0, totalDeposits: 0 } };
+let totalsCache = { at: 0, value: { accounts: 0, totalDeposits: 0, lockedPrincipal: 0 } };
 async function cachedTotals() {
   if (Date.now() - totalsCache.at < 15_000) return totalsCache.value;
-  const value = await getBankTotals();
+  const [bank, locks] = await Promise.all([getBankTotals(), getLockTotals()]);
+  const value = { ...bank, lockedPrincipal: locks.lockedPrincipal };
   totalsCache = { at: Date.now(), value };
   return value;
 }
@@ -111,6 +118,7 @@ function failureText(r: any): string {
     case 'insufficient_savings':return `❌ Not enough in your savings.`;
     case 'empty':               return `❌ Your savings are empty.`;
     case 'over_cap':            return `❌ Savings cap reached — room for ${fmt(r.room ?? 0)} more coins.`;
+    case 'held':                return `❌ ${fmt(r.held ?? 0)} of your savings is held as security for your loan — you can withdraw up to ${fmt(r.available ?? 0)}.`;
     default:                    return `⚠️ That didn't go through. Your coins are safe — any stray amount is restored automatically.`;
   }
 }
@@ -125,14 +133,19 @@ function chipAmounts(base: number, ceiling = Infinity): number[] {
 
 const home: Screen = {
   async view(ctx) {
-    const [wallet, account, access, pool, today, mood, totals] = await Promise.all([
+    if (ctx.notice) invalidateTotals();   // we just moved money: don't show a stale board total next to the receipt
+    // Pay out any lock that has matured BEFORE reading balances, so the savings figure and the
+    // "matured" line can never disagree.
+    const locks: any = await getLockSummary(ctx.userId).catch(() => ({ lockedPrincipal: 0, settled: [] }));
+    const [wallet, account, access, res, today, mood, totals, sav] = await Promise.all([
       getWallet(ctx.userId),
       getAccount(ctx.userId),
       getLoanAccess(ctx.userId),
-      getJackpotPool(),
+      getReserveSnapshot(),
       getTodayStats(),
       getHouseMood().catch(() => null),
       cachedTotals().catch(() => null),
+      getAvailableSavings(ctx.userId).catch(() => ({ hold: 0 })),
     ]);
 
     // Loans live in this menu now. The button (and this hint) only exist for members who are eligible
@@ -143,15 +156,15 @@ const home: Screen = {
       ? `✨ _You can borrow up to ${fmt(access.eligibility.maxAmount)} coins — *💳 Get a loan* below_`
       : '';
 
-    const surplus = Math.max(0, pool - JACKPOT_SEED);
-    const insured = pool > 0 ? Math.min(1, JACKPOT_SEED / pool) : 1;
+    const surplus = res.available;
+    const insured = res.total > 0 ? Math.min(1, res.insurance / res.total) : 1;   // insurance = base floor + whatever has been set aside
     const netSign = today.net > 0 ? '+' : '';
 
     // ── Reserve board ──
     const reserve = [
       `🏛️ *RESERVE*`,
-      `💰 Balance: *${fmt(pool)}* coins`,
-      `🛡️ Insurance: ${fmt(JACKPOT_SEED)}`,
+      `💰 Balance: *${fmt(res.total)}* coins`,
+      `🛡️ Insurance: ${fmt(res.insurance)}`,
       `🎯 Available to win: *${fmt(surplus)}*`,
       `${bar(insured)} ${Math.round(insured * 100)}% insured`,
     ].join('\n');
@@ -159,34 +172,41 @@ const home: Screen = {
     const todayBlock = [
       `📊 *TODAY*`,
       `⬆️ Income ${fmt(today.bet)}  ·  ⬇️ Paid out ${fmt(today.won)}`,
-      `⚖️ Net: *${netSign}${fmt(today.net)}*`,
+      `⚖️ Profit: *${netSign}${fmt(today.net)}*`,
     ].join('\n');
 
     const moodLine = mood ? (MOOD_FLAVOR[mood.mood] || MOOD_FLAVOR.neutral) : '';
     const heldLine = totals && totals.totalDeposits > 0
       ? `🔐 Member savings vault: *${fmt(totals.totalDeposits)}* _(kept apart from the reserve)_`
       : '';
+    const lockedLine = totals && totals.lockedPrincipal > 0
+      ? `🔒 Locked savings: *${fmt(totals.lockedPrincipal)}* _(working for the bank · ${Math.round(LOCK_CONFIG.RESERVE_REQUIREMENT * 100)}% held in reserve)_`
+      : '';
+    const maturedLines = (locks.settled || []).map((s: any) => `🔓 *${s.lock.planName}* matured — *${fmt(s.credited)}* coins paid into your savings.`);
 
     // ── Your account ──
+    const lockedMine = locks.lockedPrincipal || 0;
     const you = [
       `👤 *YOUR ACCOUNT*`,
     //`💰 Wallet: ${fmt(wallet.coins)}`,
-      `🔐 Savings: *${fmt(account.balance)}*`,
-      `📦 Total: *${fmt(account.balance)}*`,
+      `🔐 Savings: *${fmt(account.balance)}*${sav.hold > 0 ? ` _(${fmt(sav.hold)} held as loan security)_` : ''}`,
+      ...(lockedMine > 0 ? [`🔒 Locked: *${fmt(lockedMine)}*`] : []),
+      `📦 Total: *${fmt(account.balance + lockedMine)}*`,
       loanLine(loan),
     ].join('\n');
 
     // Required sections first; optional extras are dropped (last-added first) if the body runs long.
-    const optional = { mood: moodLine, held: heldLine, hint: loanHint };
+    const optional = { mood: moodLine, held: heldLine, locked: lockedLine, hint: loanHint, matured: maturedLines.join('\n') };
     const compose = () => [
+      optional.matured,
       reserve,
       [todayBlock, optional.mood].filter(Boolean).join('\n'),
-      optional.held,
+      [optional.held, optional.locked].filter(Boolean).join('\n'),
       `${RULE}\n${you}${optional.hint ? `\n${optional.hint}` : ''}`,
     ].filter(Boolean).join('\n\n');
 
     let text = compose();
-    for (const key of ['hint', 'held', 'mood'] as const) {
+    for (const key of ['hint', 'held', 'locked', 'mood'] as const) {
       if (text.length <= BODY_LIMIT) break;
       optional[key] = '';
       text = compose();
@@ -200,6 +220,7 @@ const home: Screen = {
       options: [
         { label: '📥 Deposit', value: 'deposit', description: 'Wallet → savings' },
         { label: '📤 Withdraw', value: 'withdraw', description: 'Savings → wallet' },
+        { label: '🔒 Money Lock', value: 'locks', description: `Earn up to ${Math.max(...LOCK_CONFIG.PLANS.map(p => p.rate * 100))}% on locked coins` },
         ...(loanOption ? [loanOption] : []),
         { label: '🧾 Statement', value: 'statement', description: 'Your recent activity' },
         { label: '🔄 Refresh', value: 'refresh', description: 'Update the live numbers' },
@@ -251,19 +272,22 @@ const depositScreen: Screen = {
 
 const withdrawScreen: Screen = {
   async view(ctx) {
-    const [wallet, account] = await Promise.all([getWallet(ctx.userId), getAccount(ctx.userId)]);
-    const chips = chipAmounts(account.balance);
+    const [wallet, sav] = await Promise.all([getWallet(ctx.userId), getAvailableSavings(ctx.userId)]);
+    const free = sav.available;
+    const chips = chipAmounts(free);
     // A balance under the minimum is still fully withdrawable as one "all" chip.
-    if (account.balance > 0 && account.balance < BANK_CONFIG.MIN_TXN) chips.push(account.balance);
+    if (free > 0 && free < BANK_CONFIG.MIN_TXN) chips.push(free);
     const options = chips.map(n => ({
       label: `${fmt(n)} coins`, value: String(n),
-      description: n === account.balance ? 'Everything' : undefined,
+      description: n === free ? (sav.hold > 0 ? 'Everything free' : 'Everything') : undefined,
     }));
-    if (account.balance >= BANK_CONFIG.MIN_TXN) options.push({ label: '✍️ Custom amount', value: 'custom' });
+    if (free >= BANK_CONFIG.MIN_TXN) options.push({ label: '✍️ Custom amount', value: 'custom' });
+    const lines = [free > 0 ? 'How much would you like to withdraw?' : (sav.balance > 0 ? 'Your savings are all held as security for your loan.' : 'Your savings are empty.')];
+    if (sav.hold > 0) lines.push(`_🔐 ${fmt(sav.hold)} is held as security for your loan until it's repaid._`);
     return {
       title: '📤 WITHDRAW',
-      subtitle: `Savings ${fmt(account.balance)} · Wallet ${fmt(wallet.coins)}`,
-      text: account.balance > 0 ? 'How much would you like to withdraw?' : 'Your savings are empty.',
+      subtitle: `Savings ${fmt(sav.balance)} · Wallet ${fmt(wallet.coins)}`,
+      text: lines.join('\n'),
       options,
     };
   },
@@ -300,7 +324,7 @@ const statementScreen: Screen = {
   },
 };
 
-const SCREENS = { home, deposit: depositScreen, withdraw: withdrawScreen, statement: statementScreen, ...LOAN_SCREENS };
+const SCREENS = { home, deposit: depositScreen, withdraw: withdrawScreen, statement: statementScreen, ...LOAN_SCREENS, ...LOCK_SCREENS };
 
 // ── Typed shortcuts + admin ──────────────────────────────────────────────────
 
@@ -308,16 +332,83 @@ async function reply(sock: any, message: any, chatId: string, channelInfo: any, 
   return sock.sendMessage(chatId, { text, ...channelInfo }, { quoted: message });
 }
 
+function pctOf(n: number, d: number) { return d > 0 ? `${(n / d).toFixed(1)}×` : '—'; }
+
 async function handleAdmin(sock: any, message: any, chatId: string, channelInfo: any) {
-  const [pool, totals, stuck] = await Promise.all([getJackpotPool(), getBankTotals(), getUnfinishedMoves()]);
-  const surplus = Math.max(0, pool - JACKPOT_SEED);
+  const [res, totals, locks, stuck] = await Promise.all([getReserveSnapshot(), getBankTotals(), getLockTotals(), getUnfinishedMoves()]);
   const stuckLines = stuck.slice(0, 8).map(j => `  • ${j.kind} ${fmt(j.amount)} · ${j.userId} · ${j.stage}`);
   return reply(sock, message, chatId, channelInfo,
     `🏦 *BANK — ADMIN VIEW*\n\n` +
-    `🔐 Customer deposits (liability): *${fmt(totals.totalDeposits)}* across ${totals.accounts} accounts\n` +
-    `💰 House reserve: *${fmt(pool)}*  (floor ${fmt(JACKPOT_SEED)}, surplus ${fmt(surplus)})\n` +
-    `_Deposits are held separately — the reserve never pays winnings out of them._\n\n` +
-    (stuck.length ? `⚠️ *Unfinished moves (${stuck.length}):*\n${stuckLines.join('\n')}` : `✅ No unfinished moves.`));
+    `*Reserve*\n` +
+    `💰 Total held: *${fmt(res.total)}*  ·  playable (games + loans see this): *${fmt(res.visible)}*  (available ${fmt(res.available)})\n` +
+    `🛡️ Insurance: *${fmt(res.insurance)}*  (base ${fmt(JACKPOT_SEED)} + added ${fmt(res.extra)})  ·  covers interest owed ${pctOf(res.insurance, locks.expectedInterest)}\n` +
+    `🏛️ House pool alone: ${fmt(res.house)}  ·  customer capital in use: ${fmt(res.depositCapital)}\n` +
+    (res.underwater ? `🔴 *UNDERWATER* — the playable pool is ${fmt(JACKPOT_SEED - res.visible)} below the floor, so the insurance is being drawn on. Games are in emergency mode; new locks and loans are paused until house profits rebuild it.\n` : `✅ Insurance intact.\n`) +
+    `\n*Liabilities*\n` +
+    `🔐 Savings (held 1:1, never lent): *${fmt(totals.totalDeposits)}* across ${totals.accounts} accounts\n` +
+    `🔒 Locked: *${fmt(locks.lockedPrincipal)}* in ${locks.count} locks (${locks.members} members)\n` +
+    `   ├ in use by the bank: ${fmt(locks.depositCapital)}\n` +
+    `   ├ held in reserve (${Math.round(LOCK_CONFIG.RESERVE_REQUIREMENT * 100)}%): ${fmt(locks.protectedAmount)}\n` +
+    `   └ interest owed at maturity: *${fmt(locks.expectedInterest)}*\n\n` +
+    (stuck.length ? `⚠️ *Unfinished moves (${stuck.length}):*\n${stuckLines.join('\n')}\n\n` : `✅ No unfinished moves.\n\n`) +
+    `_${BANK} admin insurance — fund, top-ups and settings_`);
+}
+
+const shortDay = (day: string) => new Date(day + 'T00:00:00Z').toLocaleDateString('en-GB', { day: '2-digit', month: 'short', timeZone: 'UTC' });
+
+async function handleInsurance(sock: any, message: any, chatId: string, channelInfo: any, args: string[]) {
+  const action = (args[2] || '').toLowerCase();
+
+  if (action === 'add') {
+    const amount = parseAmount(args[3] || '');
+    if (!amount || amount === 'all') return reply(sock, message, chatId, channelInfo, `❌ Usage: ${BANK} admin insurance add <amount>`);
+    const r = await addInsurance(amount);
+    return reply(sock, message, chatId, channelInfo, r.ok
+      ? `🛡️ Set aside *${fmt(amount)}* more as insurance.\nAdded so far: *${fmt(r.extra)}* · total insurance *${fmt(JACKPOT_SEED + r.extra)}* · still available to win: ${fmt(r.available)}`
+      : r.reason === 'no_surplus'
+        ? `❌ Only ${fmt(r.available)} coins of playable surplus are available — you can't insure coins the bank doesn't have yet. Try a smaller amount.`
+        : `❌ Enter a positive amount.`);
+  }
+
+  if (action === 'auto') {
+    const first = (args[3] || '').toLowerCase();
+    if (first === 'off') {
+      await setAutoInsurance(0);
+      return reply(sock, message, chatId, channelInfo, `🛡️ Automatic insurance top-up is *off*. Add coins by hand with: ${BANK} admin insurance add <amount>`);
+    }
+    const pct = parseFloat(first);
+    const period = (args[4] || '').toLowerCase();
+    if (!Number.isFinite(pct) || pct <= 0 || (period !== 'weekly' && period !== 'monthly')) {
+      return reply(sock, message, chatId, channelInfo, `❌ Usage: ${BANK} admin insurance auto <percent> <weekly|monthly>   (or: auto off)\nExample: ${BANK} admin insurance auto 10 weekly`);
+    }
+    const r = await setAutoInsurance(pct, period as any);
+    if (!r.ok) return reply(sock, message, chatId, channelInfo, `❌ Use a percentage between 1 and ${INSURANCE_CONFIG.MAX_RATE * 100}.`);
+    return reply(sock, message, chatId, channelInfo,
+      `🛡️ Automatic top-up: *${pct}%* of the house's game profit, every *${period === 'weekly' ? 'week' : 'month'}*.\n_Counting starts from the next completed day; the first top-up arrives after a full ${period === 'weekly' ? 'week' : 'month'}._`);
+  }
+
+  // status
+  const [res, locks, s] = await Promise.all([getReserveSnapshot(), getLockTotals(), getInsuranceSettings()]);
+  const next = nextRunDay(s);
+  const last = s.history[0];
+  const lines = [
+    `🛡️ *INSURANCE FUND*\n`,
+    `Total: *${fmt(res.insurance)}*  (base ${fmt(JACKPOT_SEED)} + added ${fmt(res.extra)}, max added ${fmt(INSURANCE_CONFIG.MAX_EXTRA)})`,
+    `Covers the interest owed on locks (${fmt(locks.expectedInterest)}) ${pctOf(res.insurance, locks.expectedInterest)} over`,
+    `Playable surplus: ${fmt(res.available)}${res.underwater ? '  🔴 UNDERWATER' : ''}`,
+    ``,
+    s.enabled
+      ? `Auto top-up: *${(s.rate * 100).toFixed(0)}%* of game profit, *${s.period}*${next ? ` · next ${shortDay(next)}` : ' · baseline is set at the next sweep'}`
+      : `Auto top-up: *off*`,
+  ];
+  if (last) {
+    lines.push(`Last run: ${shortDay(last.from)}–${shortDay(last.to)} · profit ${fmt(last.profit)} → *+${fmt(last.contributed)}*${last.note ? ` _(${last.note})_` : ''}`);
+  }
+  if (s.history.length > 1) {
+    lines.push('', '*History*', ...s.history.slice(0, 5).map(h => `• ${shortDay(h.to)}: profit ${fmt(h.profit)} → +${fmt(h.contributed)}`));
+  }
+  lines.push('', `_${BANK} admin insurance add <amount>  ·  auto <percent> <weekly|monthly>  ·  auto off_`);
+  return reply(sock, message, chatId, channelInfo, lines.join('\n'));
 }
 
 async function _handler(sock: any, message: any, args: string[], context: any) {
@@ -327,6 +418,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
   if (sub === 'admin') {
     if (!(await isOwnerOrSudo(senderId, sock, chatId))) return reply(sock, message, chatId, channelInfo, `❌ That view is for admins only.`);
+    if ((args[1] || '').toLowerCase() === 'insurance') return handleInsurance(sock, message, chatId, channelInfo, args);
     return handleAdmin(sock, message, chatId, channelInfo);
   }
 
@@ -363,23 +455,79 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 export const handler = withEconomyGuard(_handler);
 export const usage = `${BANK} — opens the bank. Or: ${BANK} <deposit|withdraw|statement> [amount|all]`;
 
-// 1) Rolls forward any deposit/withdrawal that died halfway (see lib/bankLedger.ts).
-// 2) Folds everyone's new game / Sportybet stakes into the play ledger that loan eligibility is
-//    judged on (lib/wagers.ts). It also runs per member whenever their credit is assessed; this
-//    hourly sweep just keeps members who aren't opening the bank from falling out of the
-//    200-entry transaction log.
+// ── Scheduled jobs ───────────────────────────────────────────────────────────
+
+async function dm(sock: any, userId: string, text: string) {
+  try {
+    const w = await getWallet(userId);
+    if (w.jid) await sock.sendMessage(w.jid, { text });   // wallet.jid is the only field that reliably builds a DM target
+  } catch (err) { console.error('[bank] DM failed:', err); }
+}
+
+/** Keeps the credit file's savings history current for accounts that existed before it was tracked. */
+async function syncBankActivity() {
+  for (const { userId, balance } of await listAccountBalances()) {
+    try { await noteBalance(userId, { savings: balance, locked: await getLockedPrincipal(userId) }); }
+    catch (err) { console.error('[bank] activity sync failed for', userId, err); }
+  }
+}
+
+/**
+ * Default setoff: a member whose loan is in default has their savings used to clear it (the savings
+ * were held as security for exactly this). Locked coins aren't touched — once a lock matures the
+ * coins land in savings and the next sweep applies them.
+ */
+async function sweepDefaultSetoffs(sock: any) {
+  for (const loan of await getAllDefaultedLoans()) {
+    try {
+      const r = await payLoanFromSavings(loan.userId, 'all');
+      if (r.success && r.paid > 0) {
+        invalidateTotals();
+        await dm(sock, loan.userId,
+          `🔴 *LOAN IN DEFAULT*\n\n*${fmt(r.paid)} coins* of your savings were used to repay your defaulted loan` +
+          (r.fullyRepaid ? ` — it's now cleared.` : `. *${fmt(r.remaining)}* is still owed; type *${BANK}* → *My loan* to see it.`));
+      }
+    } catch (err) { console.error('[bank] default setoff failed for', loan.userId, err); }
+  }
+}
+
 export const schedules = [
   {
+    // Rolls forward any deposit / withdrawal / lock that died halfway (lib/bankLedger.ts, lib/bankLocks.ts).
     every: 5 * 60 * 1000,
     handler: async () => {
       const report = await recoverPending();
       if (report.recovered || report.needsReview) {
         console.warn(`[bank] recovery sweep: ${report.recovered} recovered, ${report.needsReview} need review`);
       }
+      await recoverLocks();
+    },
+  },
+  {
+    // Folds everyone's new game / Sportybet stakes into the play ledger loan eligibility is judged on
+    // (lib/wagers.ts), and syncs savings history. Both also happen per member when their credit is
+    // assessed; this keeps members who aren't opening the bank from falling out of the 200-entry log.
+    every: 60 * 60 * 1000,
+    handler: async () => { await ingestAllWagers(); await syncBankActivity(); },
+  },
+  {
+    // Pays out matured Money Locks and tells the member. (Opening the bank also settles them instantly.)
+    every: 30 * 60 * 1000,
+    handler: async (sock: any) => {
+      const events = await sweepLocks();
+      for (const ev of events) {
+        invalidateTotals();
+        await dm(sock, ev.userId,
+          `🔓 *MONEY LOCK MATURED*\n\nYour *${ev.lock.planName}* has paid out: *${fmt(ev.credited)} coins* are now in your savings ` +
+          `(${fmt(ev.lock.principal)} + ${fmt(ev.lock.interest)} interest).\n\nType *${BANK}* to see it, or lock it again to keep earning.`);
+      }
     },
   },
   {
     every: 60 * 60 * 1000,
-    handler: async () => { await ingestAllWagers(); },
+    handler: async (sock: any) => {
+      await sweepDefaultSetoffs(sock);
+      await sweepInsurance();   // moves the weekly/monthly share of game profit into the insurance fund when it falls due
+    },
   },
 ];

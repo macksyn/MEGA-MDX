@@ -12,15 +12,17 @@
  * wagering activity, and mixing loan cashflow in would make "today's
  * wagered/paid" misleading. Loans get their own stats via getLoanBookStats().
  *
- * ── Eligibility: credit assessment (recent play) ─────────────────────────
- * Like a lender underwriting an applicant, we look at what a member actually
- * does. Their coin STAKES on games and Sportybet over the last 30 days
- * (lib/wagers.ts) must reach a minimum volume AND be spread across a minimum
- * number of different days (lib/credit.ts) — consistency, not one big
- * session. Volume then sets a credit grade (Bronze..Platinum) and its base
- * limit. Economy level, exchange activity and wallet balance are NOT part of
- * this. An outstanding loan, or a default that is still being recovered,
- * blocks a new one regardless of play.
+ * ── Eligibility: credit score (play + banking) ───────────────────────────
+ * Like a lender underwriting an applicant, we look at how a member transacts
+ * AND how they bank. A 0–100 credit score (lib/credit.ts) adds points for
+ * recent play — coin stakes on games and Sportybet (lib/wagers.ts) — and for
+ * banking behaviour — average savings kept, how regularly they pay in, and
+ * coins committed to a Money Lock (lib/bankActivity.ts). The score sets a
+ * credit grade (Bronze..Platinum) and its base limit; the member must also
+ * have been active on a minimum number of different days, so one big session
+ * or one lump deposit can't buy a loan. Economy level and exchange activity
+ * are NOT part of this. An outstanding loan, or a default that is still being
+ * recovered, blocks a new one regardless of score.
  *
  * ── Capacity grows gradually with a clean repayment record ───────────────
  * Each consecutive fully-repaid loan that is repaid by its due date adds
@@ -52,6 +54,7 @@
 import { createStore } from './pluginStore.js';
 import { addCoins, deductCoins, registerGarnishmentHandler, type TransactionMeta } from './economy.js';
 import { getWagerSummary } from './wagers.js';
+import { getBankingSummary } from './bankActivity.js';
 import { assessCredit, CREDIT_CONFIG, type CreditGrade, type CreditAssessment, type CreditSignals } from './credit.js';
 import { getJackpotPool, deductFromJackpot, contributeToJackpot, settleWin, drawFromReserve, JACKPOT_SEED } from './slotMachine.js';
 import { withUserLock } from './bankLock.js';
@@ -98,7 +101,12 @@ export interface Loan {
 }
 
 export interface CreditProfile {
-  signals: CreditSignals & { bets: number; bySource: { games: number; sportybet: number }; lifetimeTurnover: number };
+  signals: CreditSignals & {
+    bets: number;
+    bySource: { games: number; sportybet: number };
+    lifetimeTurnover: number;
+    currentSavings: number;   // flexible savings right now
+  };
   assessment: CreditAssessment;
   repaidStreak: number;
   maxAmount: number | null;   // grade base limit scaled by the repayment record; null when no grade is earned yet
@@ -107,7 +115,7 @@ export interface CreditProfile {
 export interface EligibilityResult {
   eligible: boolean;
   reason?: 'active_loan' | 'defaulted_loan' | 'not_qualified';
-  grade?: CreditGrade;        // the credit grade their recent play earns
+  grade?: CreditGrade;        // the credit grade their credit score earns
   maxAmount?: number;         // repayment-bonus-adjusted limit for that grade
   repaidStreak?: number;
   signals?: CreditProfile['signals'];
@@ -204,7 +212,18 @@ export async function getRepayableLoan(userId: string): Promise<Loan | null> {
  */
 export async function getCreditProfile(userId: string, history?: Loan[]): Promise<CreditProfile> {
   const hist = history || await getLoanHistory(userId);
-  const signals = await getWagerSummary(userId, CREDIT_CONFIG.WINDOW_DAYS);
+  const [play, banking] = await Promise.all([
+    getWagerSummary(userId, CREDIT_CONFIG.WINDOW_DAYS),
+    getBankingSummary(userId, CREDIT_CONFIG.WINDOW_DAYS),
+  ]);
+  // An "active day" is any day with a stake OR a bank transaction.
+  const activityDays = new Set([...play.dayKeys, ...banking.eventDays]).size;
+  const signals = {
+    turnover: play.turnover, activeDays: play.activeDays, bets: play.bets, bySource: play.bySource,
+    lifetimeTurnover: play.lifetimeTurnover,
+    saveDays: banking.saveDays, avgBalance: banking.avgBalance, lockedNow: banking.lockedNow,
+    currentSavings: banking.currentSavings, activityDays,
+  };
   const assessment = assessCredit(signals);
   const repaidStreak = computeRepaidStreak(hist);
   const bonusMultiplier = Math.min(MAX_REPAID_BONUS_MULTIPLIER, 1 + repaidStreak * REPAID_BONUS_PER_LOAN);

@@ -13,6 +13,13 @@
  * depositors' money. Later features (interest, locks) are paid from the
  * reserve's surplus above JACKPOT_SEED, never from deposits.
  *
+ * ── Collateral hold ─────────────────────────────────────────────────────
+ * While a member has a loan (active OR in default), savings up to the amount
+ * they owe are HELD as security: they can't be withdrawn or locked away, only
+ * used to repay (see payLoanFromSavings in lib/bankLoans.ts) or seized by the
+ * default setoff sweep. This is what makes saving-based credit safe — a loan
+ * can never be walked away from while the savings that earned it are still here.
+ *
  * ── Why the journal ──────────────────────────────────────────────────────
  * A deposit or withdrawal moves coins between TWO records (wallet <-> account)
  * that no store transaction can cover. Each move is: write intent -> debit the
@@ -29,6 +36,8 @@
 import { createStore } from './pluginStore.js';
 import { addCoins, deductCoins } from './economy.js';
 import { withUserLock } from './bankLock.js';
+import { getRepayableLoan } from './loans.js';
+import { noteBalance } from './bankActivity.js';
 
 const root = createStore('bank');
 const accountsTbl = root.table('accounts'); // userId -> Account
@@ -54,6 +63,7 @@ export interface BankEntry {
   amount: number;        // signed from the account's point of view: + in, - out
   balanceAfter: number;
   note: string | null;
+  ref?: string | null;   // idempotency key (e.g. a lock id): the same ref is never credited twice
 }
 
 export interface Account {
@@ -78,16 +88,18 @@ interface JournalEntry {
 
 export type MoveFailure =
   | 'below_minimum' | 'insufficient_funds' | 'insufficient_savings'
-  | 'over_cap' | 'empty' | 'move_failed';
+  | 'over_cap' | 'empty' | 'held' | 'move_failed';
 
 export type MoveResult =
   | { ok: true; account: Account; entry: BankEntry }
-  | { ok: false; reason: MoveFailure; min?: number; room?: number };
+  | { ok: false; reason: MoveFailure; min?: number; room?: number; held?: number; available?: number };
 
 // ── Account helpers ──────────────────────────────────────────────────────────
 
 const rand = () => Math.random().toString(36).slice(2, 8);
 const userLockKey = (userId: string) => `bank:${userId}`;
+/** The per-member lock every balance-changing operation (here and in lib/bankLocks.ts) runs under. */
+export const bankLockKey = userLockKey;
 
 function emptyAccount(): Account {
   return { balance: 0, openedAt: Date.now(), rev: 0, lifetimeDeposited: 0, lifetimeWithdrawn: 0, history: [] };
@@ -142,7 +154,7 @@ async function mutateAccount(userId: string, step: (acc: Account) => any): Promi
   return { ...outcome, account };
 }
 
-function pushEntry(acc: Account, kind: EntryKind, signedAmount: number, note?: string): BankEntry {
+function pushEntry(acc: Account, kind: EntryKind, signedAmount: number, note?: string, ref?: string | null): BankEntry {
   const entry: BankEntry = {
     id: `b_${Date.now()}_${rand()}`,
     ts: Date.now(),
@@ -150,6 +162,7 @@ function pushEntry(acc: Account, kind: EntryKind, signedAmount: number, note?: s
     amount: signedAmount,
     balanceAfter: acc.balance,
     note: note || null,
+    ref: ref || null,
   };
   acc.history.unshift(entry);
   if (acc.history.length > BANK_CONFIG.HISTORY_CAP) acc.history.length = BANK_CONFIG.HISTORY_CAP;
@@ -157,24 +170,54 @@ function pushEntry(acc: Account, kind: EntryKind, signedAmount: number, note?: s
 }
 
 // NOTE: creditAccount/debitAccount do NOT take the user lock — callers do.
-async function creditAccount(userId: string, amount: number, kind: EntryKind, note?: string, enforceCap = true): Promise<any> {
+async function creditAccount(userId: string, amount: number, kind: EntryKind, note?: string, enforceCap = true, ref: string | null = null): Promise<any> {
   return mutateAccount(userId, (acc) => {
+    // Idempotent when a ref is given: re-running a settlement can never credit it twice.
+    if (ref) {
+      const dup = acc.history.find(h => h.ref === ref);
+      if (dup) return { ok: true, entry: dup, duplicate: true };
+    }
     if (enforceCap && acc.balance + amount > BANK_CONFIG.MAX_SAVINGS) {
       return { ok: false, reason: 'over_cap', room: Math.max(0, BANK_CONFIG.MAX_SAVINGS - acc.balance) };
     }
     acc.balance += amount;
     if (kind === 'deposit') acc.lifetimeDeposited += amount;
-    return { ok: true, entry: pushEntry(acc, kind, +amount, note) };
+    return { ok: true, entry: pushEntry(acc, kind, +amount, note, ref) };
   });
 }
 
-async function debitAccount(userId: string, amount: number, kind: EntryKind, note?: string): Promise<any> {
+async function debitAccount(userId: string, amount: number, kind: EntryKind, note?: string, ref: string | null = null): Promise<any> {
   return mutateAccount(userId, (acc) => {
     if (acc.balance < amount) return { ok: false, reason: 'insufficient_savings' };
     acc.balance -= amount;
     if (kind === 'withdraw') acc.lifetimeWithdrawn += amount;
-    return { ok: true, entry: pushEntry(acc, kind, -amount, note) };
+    return { ok: true, entry: pushEntry(acc, kind, -amount, note, ref) };
   });
+}
+
+// For lib/bankLocks.ts. Neither takes the member lock — the caller holds bankLockKey(userId).
+export const ledgerCredit = creditAccount;
+export const ledgerDebit = debitAccount;
+
+// ── Collateral hold ──────────────────────────────────────────────────────────
+
+async function getHold(userId: string): Promise<number> {
+  try {
+    const loan = await getRepayableLoan(userId);
+    return loan ? Math.max(0, Math.ceil(loan.balance)) : 0;
+  } catch (_) { return 0; }
+}
+
+/** Savings split into what is held as loan security and what can actually be moved. */
+export async function getAvailableSavings(userId: string): Promise<{ balance: number; hold: number; available: number }> {
+  const [acc, hold] = await Promise.all([getAccount(userId), getHold(userId)]);
+  return { balance: acc.balance, hold: Math.min(hold, acc.balance), available: Math.max(0, acc.balance - hold) };
+}
+
+/** Every account's balance — for the activity sync sweep and admin views. */
+export async function listAccountBalances(): Promise<Array<{ userId: string; balance: number }>> {
+  const all = (await accountsTbl.getAll()) || {};
+  return Object.entries(all).map(([userId, raw]) => ({ userId, balance: normalize(raw).balance }));
 }
 
 // ── Journal ──────────────────────────────────────────────────────────────────
@@ -222,6 +265,7 @@ export async function deposit(userId: string, rawAmount: number): Promise<MoveRe
       const res = await creditAccount(userId, amount, 'deposit', 'Deposit from wallet');
       if (!res.ok) throw new Error(res.reason);
       await jEnd(jid);
+      await noteBalance(userId, { savings: res.account.balance }, 'save').catch(() => {});  // credit-file activity, best effort
       return { ok: true, account: res.account, entry: res.entry };
     } catch (err: any) {
       console.error(`[bank] deposit credit failed after wallet debit (user=${userId} amount=${amount}):`, err?.message || err);
@@ -239,16 +283,31 @@ export async function deposit(userId: string, rawAmount: number): Promise<MoveRe
 
 // ── Withdraw: savings -> wallet ──────────────────────────────────────────────
 
-export async function withdraw(userId: string, rawAmount: number | 'all'): Promise<MoveResult> {
+export async function withdraw(
+  userId: string,
+  rawAmount: number | 'all',
+  opts: { bypassHold?: boolean; note?: string } = {}   // bypassHold: ONLY for repaying that member's own loan (setoff / pay-from-savings)
+): Promise<MoveResult> {
   return withUserLock(userLockKey(userId), async () => {
     const acc = await getAccount(userId);
-    const amount = rawAmount === 'all' ? acc.balance : Math.floor(Number(rawAmount));
+    const hold = opts.bypassHold ? 0 : await getHold(userId);
+    const available = Math.max(0, acc.balance - hold);
+    const amount = rawAmount === 'all' ? available : Math.floor(Number(rawAmount));
+    const heldNow = Math.min(hold, acc.balance);
 
     if (!Number.isFinite(amount) || amount <= 0) {
-      return { ok: false, reason: rawAmount === 'all' ? 'empty' : 'below_minimum', min: BANK_CONFIG.MIN_TXN };
+      if (rawAmount === 'all') {
+        return acc.balance > 0 && available === 0
+          ? { ok: false, reason: 'held', held: heldNow, available: 0 }
+          : { ok: false, reason: 'empty', min: BANK_CONFIG.MIN_TXN };
+      }
+      return { ok: false, reason: 'below_minimum', min: BANK_CONFIG.MIN_TXN };
     }
-    // The minimum doesn't trap dust: withdrawing your ENTIRE balance is always allowed.
-    if (amount < BANK_CONFIG.MIN_TXN && amount !== acc.balance) {
+    if (amount > available && amount <= acc.balance) {
+      return { ok: false, reason: 'held', held: heldNow, available };
+    }
+    // The minimum doesn't trap dust: withdrawing your ENTIRE available balance is always allowed.
+    if (amount < BANK_CONFIG.MIN_TXN && amount !== available) {
       return { ok: false, reason: 'below_minimum', min: BANK_CONFIG.MIN_TXN };
     }
 
@@ -257,7 +316,7 @@ export async function withdraw(userId: string, rawAmount: number | 'all'): Promi
     // Step 1 — take the coins out of the account.
     let debit: any;
     try {
-      debit = await debitAccount(userId, amount, 'withdraw', 'Withdrawal to wallet');
+      debit = await debitAccount(userId, amount, 'withdraw', opts.note || 'Withdrawal to wallet');
     } catch (err: any) {
       // mutateAccount only throws when the read-back shows the write did NOT land, so nothing moved.
       console.error(`[bank] account debit did not persist during withdraw (user=${userId} amount=${amount}):`, err?.message || err);
@@ -271,6 +330,7 @@ export async function withdraw(userId: string, rawAmount: number | 'all'): Promi
     try {
       await addCoins(userId, amount, { type: 'bank_withdraw', note: 'savings withdrawal' });
       await jEnd(jid);
+      await noteBalance(userId, { savings: debit.account.balance }, 'move').catch(() => {});
       return { ok: true, account: debit.account, entry: debit.entry };
     } catch (err: any) {
       console.error(`[bank] withdraw wallet credit failed after account debit (user=${userId} amount=${amount}):`, err?.message || err);
