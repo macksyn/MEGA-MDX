@@ -62,7 +62,7 @@ const home: Screen = {
       text: `${status}\n${RULE}\nWhat are you shopping for?`,
       options: [
         { label: '🛡️ Rob Protection', value: 'protection', description: 'Bodyguards & escorts' },
-        { label: '🎭 Robber Gear', value: 'gear', description: 'Masks & guns' },
+        { label: '🎭 Ammunition', value: 'gear', description: 'Masks & guns' },
         { label: '🎒 My Inventory', value: 'inventory', description: 'What you own' },
       ],
     };
