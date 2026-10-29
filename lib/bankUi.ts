@@ -35,6 +35,7 @@ export interface BankCtx {
   userId: string;       // cleanJid(senderId) — the wallet/account key
   channelInfo: any;
   notice?: string;
+  fallbackHint?: string; // plain-text hint if the very first menu cannot be sent (defaults to the bank commands)
 }
 
 export interface ScreenView {
@@ -112,7 +113,7 @@ export async function runApp(ctx: BankCtx, screens: Record<string, Screen>, star
     if (!anyMenuSent && lastView) {
       const plain =
         `*${lastView.title}*\n` + (lastView.subtitle ? `_${lastView.subtitle}_\n` : '') + `\n${lastView.text}\n\n` +
-        `_Menu buttons are unavailable right now — use *${prefix}bank deposit <amount>*, *${prefix}bank withdraw <amount>* or *${prefix}bank statement*._`;
+        `_${ctx.fallbackHint || `Menu buttons are unavailable right now — use *${prefix}bank deposit <amount>*, *${prefix}bank withdraw <amount>* or *${prefix}bank statement*.`}_`;
       const sent = await ctx.sock.sendMessage(ctx.chatId, { text: plain, ...ctx.channelInfo }, { quoted: ctx.message }).then(() => true, () => false);
       if (sent) return;
     }
