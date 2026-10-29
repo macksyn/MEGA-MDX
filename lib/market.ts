@@ -70,17 +70,17 @@ export interface ShopItem {
   damage?: number;       // gun: life-bar damage dealt to a protection per attempt
 }
 
-// Edit prices / stats freely — nothing else hard-codes them.
+// Edit prices / stats freely — nothing else hard-codes them. (Item ids stay stable: 'rifle' is the M16, 'assault' is the AK47.)
 export const ITEMS: Record<string, ShopItem> = {
-  bodyguard: { id: 'bodyguard', kind: 'protection', name: 'Bodyguard',       emoji: '🕴️', price: 150,  durationMs: 2 * DAY, life: 100 },
-  police:    { id: 'police',    kind: 'protection', name: 'Police Escort',   emoji: '🚔', price: 400,  durationMs: 4 * DAY, life: 250 },
-  military:  { id: 'military',  kind: 'protection', name: 'Military Escort', emoji: '🪖', price: 1000, durationMs: 7 * DAY, life: 600 },
+  bodyguard: { id: 'bodyguard', kind: 'protection', name: 'Bodyguard',       emoji: '🕴️', price: 20,    durationMs: 2 * DAY, life: 100 },
+  police:    { id: 'police',    kind: 'protection', name: 'Police Escort',   emoji: '🚔', price: 50,    durationMs: 4 * DAY, life: 250 },
+  military:  { id: 'military',  kind: 'protection', name: 'Military Escort', emoji: '🪖', price: 100,  durationMs: 7 * DAY, life: 600 },
 
-  mask:      { id: 'mask',      kind: 'mask',       name: 'Mask',            emoji: '🎭', price: 100,  durationMs: 2 * DAY, successRate: MARKET_CONFIG.MASK_SUCCESS },
+  mask:      { id: 'mask',      kind: 'mask',       name: 'Mask',            emoji: '🎭', price: 20,    durationMs: 2 * DAY, successRate: MARKET_CONFIG.MASK_SUCCESS },
 
-  pistol:    { id: 'pistol',    kind: 'gun',        name: 'Pistol',          emoji: '🔫', price: 200,  rounds: 3, damage: 20 },
-  rifle:     { id: 'rifle',     kind: 'gun',        name: 'Rifle',           emoji: '🎯', price: 500,  rounds: 5, damage: 45 },
-  assault:   { id: 'assault',   kind: 'gun',        name: 'Assault Rifle',   emoji: '💥', price: 1200, rounds: 8, damage: 90 },
+  pistol:    { id: 'pistol',    kind: 'gun',        name: 'Pistol',          emoji: '🔫', price: 30,    rounds: 3, damage: 20 },
+  rifle:     { id: 'rifle',     kind: 'gun',        name: 'M16',             emoji: '🎯', price: 60,    rounds: 5, damage: 45 },
+  assault:   { id: 'assault',   kind: 'gun',        name: 'AK47',            emoji: '💥', price: 100,  rounds: 8, damage: 90 },
 };
 
 export function listItems(...kinds: ItemKind[]): ShopItem[] {
