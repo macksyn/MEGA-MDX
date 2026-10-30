@@ -320,6 +320,8 @@ export type TransactionType =
   | 'bank_deposit' | 'bank_withdraw' | 'bank_refund'
   | 'admin_credit' | 'admin_debit' | 'admin_reset'
   | 'withdrawal_hold' | 'withdrawal_refund'
+  | 'shop' | 'shop_refund'
+  | 'rob_bail' | 'rob_loss' | 'rob_win' | 'rob_refund'
   | 'other';
 
 export interface Transaction {
