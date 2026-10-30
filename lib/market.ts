@@ -25,6 +25,11 @@ import { getWallet, addCoins, deductCoins } from './economy.js';
 import { contributeToJackpot } from './slotMachine.js';
 
 const root = createStore('market');
+
+if (typeof root.table !== 'function') {
+  throw new Error('Market store does not support tables');
+}
+
 const inventoryTbl = root.table('inventory');
 
 // ── Tunables ─────────────────────────────────────────────────────────────
