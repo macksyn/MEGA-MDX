@@ -218,10 +218,11 @@ async function sendReminderDM(sock: any, loan: any, kind: 'due_soon' | 'grace') 
   const text = kind === 'due_soon'
     ? `⏰ *LOAN REMINDER* ⏰\n\n` +
       `Your loan balance of *${formatNumber(loan.balance)} coins* is due within 24 hours.\n\n` +
-      `Pay it off: type *${BANK_COMMAND}* → *My loan* → *Pay in full* (or *Make a payment*). The ${formatDuration(GRACE_PERIOD_MS)} grace window after the due date has no extra charge; after grace, a default adds ${(DEFAULT_INTEREST_RATE * 100).toFixed(0)}% daily until fully repaid.`
+      `Pay it off: type *${BANK_COMMAND}* → *My loan* → *Pay in full* (or *Make a payment*). The ${formatDuration(GRACE_PERIOD_MS)} grace window after the due date has no extra charge; after grace, a default adds ${(DEFAULT_INTEREST_RATE * 100).toFixed(0)}% daily until fully repaid. Once it's overdue your savings are held, and if it defaults they're used to clear it.`
     : `🔴 *LOAN OVERDUE — GRACE PERIOD* 🔴\n\n` +
       `Your loan balance of *${formatNumber(loan.balance)} coins* is now overdue. You have a ${formatDuration(GRACE_PERIOD_MS)} grace window left before it defaults.\n\n` +
-      `Clear it now: type *${BANK_COMMAND}* → *My loan* → *Pay in full*`;
+      `Clear it now: type *${BANK_COMMAND}* → *My loan* → *Pay in full*\n\n` +
+      `Your savings are now held while this is overdue; if it defaults they're used to clear it.`;
 
   try {
     await sock.sendMessage(wallet.jid, { text });

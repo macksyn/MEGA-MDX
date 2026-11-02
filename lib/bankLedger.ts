@@ -13,12 +13,16 @@
  * depositors' money. Later features (interest, locks) are paid from the
  * reserve's surplus above JACKPOT_SEED, never from deposits.
  *
- * ── Collateral hold ─────────────────────────────────────────────────────
- * While a member has a loan (active OR in default), savings up to the amount
- * they owe are HELD as security: they can't be withdrawn or locked away, only
- * used to repay (see payLoanFromSavings in lib/bankLoans.ts) or seized by the
- * default setoff sweep. This is what makes saving-based credit safe — a loan
- * can never be walked away from while the savings that earned it are still here.
+ * ── Collateral hold (only when a loan has gone wrong) ───────────────────
+ * Holding a borrower's savings from day one would make a loan pointless — they'd
+ * receive 100 coins and lose access to 120 of their own — so by default nothing
+ * is held while a loan is current. BANK_CONFIG.LIEN_MODE decides when savings up
+ * to the amount owed are HELD (can't be withdrawn or locked away, only used to
+ * repay via payLoanFromSavings in lib/bankLoans.ts, or taken by the default
+ * setoff sweep in plugins/bank.ts):
+ *   'never'    never; the setoff sweep still takes whatever is left once a loan defaults
+ *   'overdue'  (default) from the moment a loan passes its due date, through default
+ *   'always'   from the day the loan is taken (the strictest, least useful, option)
  *
  * ── Why the journal ──────────────────────────────────────────────────────
  * A deposit or withdrawal moves coins between TWO records (wallet <-> account)
@@ -50,6 +54,7 @@ export const BANK_CONFIG = {
   RECOVERY_MIN_AGE_MS: 2 * 60_000,    // don't touch a move that might still be in flight
   RECOVERY_STUCK_AFTER_MS: 10 * 60_000,
   RECOVERY_MAX_ATTEMPTS: 5,
+  LIEN_MODE: 'overdue' as 'never' | 'overdue' | 'always',   // when a borrower's savings are held — see the header note
 };
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -201,10 +206,15 @@ export const ledgerDebit = debitAccount;
 
 // ── Collateral hold ──────────────────────────────────────────────────────────
 
-async function getHold(userId: string): Promise<number> {
+async function getHold(userId: string, now = Date.now()): Promise<number> {
+  const mode = BANK_CONFIG.LIEN_MODE;
+  if (mode === 'never') return 0;
   try {
     const loan = await getRepayableLoan(userId);
-    return loan ? Math.max(0, Math.ceil(loan.balance)) : 0;
+    if (!loan) return 0;
+    // 'overdue': a loan that is current (not past its due date and not in default) holds nothing.
+    if (mode === 'overdue' && loan.status !== 'defaulted' && now <= loan.dueAt) return 0;
+    return Math.max(0, Math.ceil(loan.balance));
   } catch (_) { return 0; }
 }
 

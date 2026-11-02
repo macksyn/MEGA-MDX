@@ -175,7 +175,7 @@ function infoText(): string {
     `• A ${pct(INTEREST_RATE)} interest is applied upfront, including for loans repaid the same day.`,
     `• Repayment is due at the end of the loan term, followed by a ${duration(GRACE_PERIOD_MS)} grace period with no edditional charge.`,
     `• After the grace period, the loan is in default. An additional +${pct(DEFAULT_INTEREST_RATE)} is added daily until the balance is cleared, ${pct(GARNISHMENT_RATE)} of your earnings will be applied to repayment, and your savings are used to clear it.`,
-    `• While a loan is open, savings equal to what you owe are held as security.`,
+    `• If a loan goes overdue, savings up to what you owe are held and used to clear it.`,
     `• Repaying on time increase your limit by +15% per loan (max 2×).`,
   ].join('\n');
 }
@@ -329,7 +329,7 @@ const loanConfirm: Screen = {
         `⏳ Due in ${termDays} days.`,
         ``,
         `⚠️ If it isn't repaid before due date: +${pct(DEFAULT_INTEREST_RATE)} is added daily, ${pct(GARNISHMENT_RATE)} of your earnings will go towards outstanding debt, and you lose future loan eligibility..`,
-        `🔐 Savings equal to what you owe are held as security until it's repaid.`,
+        `🔐 If it goes overdue, savings up to what you owe are held and used to clear it.`,
       ].join('\n'),
       options: [{ label: '✅ Confirm loan', value: 'confirm' }],
     };

@@ -473,8 +473,8 @@ async function syncBankActivity() {
 }
 
 /**
- * Default setoff: a member whose loan is in default has their savings used to clear it (the savings
- * were held as security for exactly this). Locked coins aren't touched — once a lock matures the
+ * Default setoff: a member whose loan is in default has their savings used to clear it (the standard
+ * right of set-off; savings are held from the moment a loan is overdue). Locked coins aren't touched — once a lock matures the
  * coins land in savings and the next sweep applies them.
  */
 async function sweepDefaultSetoffs(sock: any) {
