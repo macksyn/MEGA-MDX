@@ -63,11 +63,12 @@
  * plugins/testbuttons.ts: an iPhone user tapped Option 10 of 10). So for
  * menus too big for the 3-button path, promptMenu() checks the invoking
  * message's id:
- *   - looks like iOS  -> ONE quick_reply message with every option plus
- *                        Cancel. No paging.
- *   - anything else   -> the single_select dropdown, exactly as before.
+ *   - looks like iPhone  -> ONE quick_reply message with every option plus
+ *                        Cancel. No paging. (iPhone id = 20 uppercase-hex
+ *                        chars, any prefix — covers WhatsApp Business too.)
+ *   - anything else      -> the single_select dropdown, exactly as before.
  * Same opt_N ids and MenuResult either way. Detection is a message-id
- * heuristic (see isLikelyIOS), not a guarantee; setIosMode(userId, ...)
+ * heuristic (see prefersButtons), not a guarantee; setIosMode(userId, ...)
  * overrides it per user.
  * UNCONFIRMED: iOS rendering of MORE than 10 buttons in one message. If a
  * menu with 11+ options ever looks wrong on an iPhone, `.testbtn 11` /
@@ -172,28 +173,38 @@ type PendingPrompt = PendingOptionsPrompt | PendingTextPrompt;
 const pending = new Map<string, PendingPrompt>(); // keyed by the sent message's own id
 const registeredSocks = new WeakSet<any>();
 
-// ── iOS detection ──────────────────────────────────────────────────
+// ── Device routing ──────────────────────────────────────────────────
 // iPhone WhatsApp drops single_select messages, so iOS users get every option
 // as a quick_reply button in a single message instead (10 buttons confirmed
 // on a real iPhone).
 
 const iosOverrides = new Map<string, boolean>(); // userId -> forced on/off
 
-/** Manual override per user, for when the id heuristic guesses wrong. */
+/** Manual override per user: true = always buttons, false = always dropdown, null = auto-detect. */
 export function setIosMode(userId: string, on: boolean | null): void {
   if (on === null) iosOverrides.delete(userId);
   else iosOverrides.set(userId, on);
 }
 
 /**
- * Heuristic: WhatsApp iOS message ids are "3A" + 18 chars. Verified on-device
- * (testbuttons.ts correctly labelled an iPhone user's tap as ios and an
- * Android user's as android), but still a guess — hence the override above.
+ * Decides dropdown vs buttons for this user. The dropdown (single_select) is
+ * the default; quick_reply buttons are used only for iPhone senders, whose
+ * WhatsApp never renders the dropdown.
+ *
+ * iPhone = message id of exactly 20 uppercase-hex characters. Older iOS ids
+ * start with "3A"; a WhatsApp Business iPhone user's id was
+ * 2A9E09B317B7E0E2F721, so the prefix is NOT pinned — only length + hex.
+ * (Android ids are 32 chars; Web/bot ids are 22 and start with 3EB0.)
+ *
+ * It's a heuristic: an iPhone user whose id doesn't fit gets the dropdown and
+ * sees nothing. setIosMode(userId, true) forces buttons for that person.
  */
-function isLikelyIOS(message: any, userId: string): boolean {
+function prefersButtons(message: any, userId: string): boolean {
   const forced = iosOverrides.get(userId);
   if (forced !== undefined) return forced;
-  return /^3A.{18}$/.test(message?.key?.id || '');
+
+  const id: string = message?.key?.id || '';
+  return /^[0-9A-F]{20}$/.test(id);
 }
 
 function getContextInfo(msg: any): any {
@@ -359,7 +370,7 @@ export async function promptMenu(
   const totalWithCancel = config.options.length + 1;
   const useQuickReply = totalWithCancel <= QUICK_REPLY_MAX_TOTAL_BUTTONS;
 
-  const iosMode = !useQuickReply && isLikelyIOS(message, userId);
+  const iosMode = !useQuickReply && prefersButtons(message, userId);
   let sent: any;
 
   if (useQuickReply) {
