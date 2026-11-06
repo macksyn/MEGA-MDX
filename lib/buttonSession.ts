@@ -182,7 +182,7 @@ const registeredSocks = new WeakSet<any>();
 // user's id here when the id heuristic misses them (iPhone user sees no menu).
 // Use the exact id printed in the "[buttonSession] menu for ..." log line.
 // Survives restarts; setIosMode() below only lasts until the bot restarts.
-const FORCE_BUTTONS_USERS: string[] = ['120363365901956234@g.us'
+const FORCE_BUTTONS_USERS: string[] = ['189004465090656'
   // '2348024169809',
 ];
 
