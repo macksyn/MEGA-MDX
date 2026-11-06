@@ -178,7 +178,17 @@ const registeredSocks = new WeakSet<any>();
 // as a quick_reply button in a single message instead (10 buttons confirmed
 // on a real iPhone).
 
-const iosOverrides = new Map<string, boolean>(); // userId -> forced on/off
+// Users who ALWAYS get buttons, whatever their message ids look like. Add a
+// user's id here when the id heuristic misses them (iPhone user sees no menu).
+// Use the exact id printed in the "[buttonSession] menu for ..." log line.
+// Survives restarts; setIosMode() below only lasts until the bot restarts.
+const FORCE_BUTTONS_USERS: string[] = ['120363365901956234@g.us'
+  // '2348024169809',
+];
+
+const iosOverrides = new Map<string, boolean>(
+  FORCE_BUTTONS_USERS.map((id) => [id, true] as [string, boolean])
+); // userId -> forced on/off
 
 /** Manual override per user: true = always buttons, false = always dropdown, null = auto-detect. */
 export function setIosMode(userId: string, on: boolean | null): void {
@@ -371,6 +381,11 @@ export async function promptMenu(
   const useQuickReply = totalWithCancel <= QUICK_REPLY_MAX_TOTAL_BUTTONS;
 
   const iosMode = !useQuickReply && prefersButtons(message, userId);
+  if (!useQuickReply) {
+    console.log(
+      `[buttonSession] menu for ${userId} · msg id ${message?.key?.id} -> ${iosMode ? 'buttons' : 'dropdown'}`
+    );
+  }
   let sent: any;
 
   if (useQuickReply) {
