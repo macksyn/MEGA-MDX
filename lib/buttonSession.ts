@@ -56,6 +56,23 @@
  *     new code. If a reply to an amount prompt never resolves, check the
  *     console.warn this listener prints for the raw message shape.
  *
+ * ── iOS routing (added after on-device testing) ─────────────────────
+ * iPhone WhatsApp does not render single_select (list) messages sent this
+ * way — the message never shows up. Quick-reply buttons DO render and
+ * round-trip on iOS, including 10 at once (confirmed with
+ * plugins/testbuttons.ts: an iPhone user tapped Option 10 of 10). So for
+ * menus too big for the 3-button path, promptMenu() checks the invoking
+ * message's id:
+ *   - looks like iOS  -> ONE quick_reply message with every option plus
+ *                        Cancel. No paging.
+ *   - anything else   -> the single_select dropdown, exactly as before.
+ * Same opt_N ids and MenuResult either way. Detection is a message-id
+ * heuristic (see isLikelyIOS), not a guarantee; setIosMode(userId, ...)
+ * overrides it per user.
+ * UNCONFIRMED: iOS rendering of MORE than 10 buttons in one message. If a
+ * menu with 11+ options ever looks wrong on an iPhone, `.testbtn 11` /
+ * `.testbtn 15` shows where it stops.
+ *
  * ── Design notes carried over from menuSession.ts ───────────────────
  * - One listener per sock (WeakSet-guarded), shared across all plugins
  *   using this module.
@@ -154,6 +171,30 @@ type PendingPrompt = PendingOptionsPrompt | PendingTextPrompt;
 
 const pending = new Map<string, PendingPrompt>(); // keyed by the sent message's own id
 const registeredSocks = new WeakSet<any>();
+
+// ── iOS detection ──────────────────────────────────────────────────
+// iPhone WhatsApp drops single_select messages, so iOS users get every option
+// as a quick_reply button in a single message instead (10 buttons confirmed
+// on a real iPhone).
+
+const iosOverrides = new Map<string, boolean>(); // userId -> forced on/off
+
+/** Manual override per user, for when the id heuristic guesses wrong. */
+export function setIosMode(userId: string, on: boolean | null): void {
+  if (on === null) iosOverrides.delete(userId);
+  else iosOverrides.set(userId, on);
+}
+
+/**
+ * Heuristic: WhatsApp iOS message ids are "3A" + 18 chars. Verified on-device
+ * (testbuttons.ts correctly labelled an iPhone user's tap as ios and an
+ * Android user's as android), but still a guess — hence the override above.
+ */
+function isLikelyIOS(message: any, userId: string): boolean {
+  const forced = iosOverrides.get(userId);
+  if (forced !== undefined) return forced;
+  return /^3A.{18}$/.test(message?.key?.id || '');
+}
 
 function getContextInfo(msg: any): any {
   const m = msg.message;
@@ -318,6 +359,7 @@ export async function promptMenu(
   const totalWithCancel = config.options.length + 1;
   const useQuickReply = totalWithCancel <= QUICK_REPLY_MAX_TOTAL_BUTTONS;
 
+  const iosMode = !useQuickReply && isLikelyIOS(message, userId);
   let sent: any;
 
   if (useQuickReply) {
@@ -327,6 +369,24 @@ export async function promptMenu(
 
     sent = await sendButtons(sock, chatId, {
       text: bodyText,
+      footer,
+      buttons,
+    }, { quoted: message });
+  } else if (iosMode) {
+    // iOS path — single_select never renders on iPhone, so send every option
+    // as a quick_reply button in one message (shape confirmed on iOS). Ids
+    // stay opt_N, so tap handling below is identical to every other path.
+    const buttons = config.options.map((o, i) => ({ id: `opt_${i}`, text: o.label }));
+    buttons.push({ id: 'cancel', text: cancelLabel });
+
+    // Quick-reply buttons have no room for descriptions, so list them in the body.
+    const described = config.options.filter((o) => o.description);
+    const iosBody = described.length
+      ? `${bodyText}\n\n${described.map((o) => `• ${o.label} — ${o.description}`).join('\n')}`
+      : bodyText;
+
+    sent = await sendButtons(sock, chatId, {
+      text: iosBody,
       footer,
       buttons,
     }, { quoted: message });

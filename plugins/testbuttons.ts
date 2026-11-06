@@ -7,7 +7,7 @@
  *
  * Commands:
  *   .testbtn         -> simple quick-reply buttons (3)
- *   .testbtn <1-10>  -> N quick-reply buttons (device rendering / ceiling test)
+ *   .testbtn <1-15>  -> N quick-reply buttons (device rendering / ceiling test)
  *   .testbtn cta     -> cta_url / call button variant
  *   .testbtn list    -> single_select (list) variant
  *
@@ -49,7 +49,7 @@ interface WASocket {
   [key: string]: any;
 }
 
-const MAX_TEST_BUTTONS = 10;
+const MAX_TEST_BUTTONS = 15; // raised from 10 to probe the iOS ceiling (.testbtn 11 / 12 / 15)
 
 // Sent test messages, keyed by message id -> short label, so the tap
 // listener only reacts to replies to *our* test messages.
