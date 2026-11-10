@@ -64,7 +64,7 @@ const loansTbl = root.table('loans'); // userId -> Loan[] (full history, most re
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
-export const INTEREST_RATE = 0.20; // fixed standard loan interest at issuance
+export const INTEREST_RATE = 0.10; // fixed standard loan interest at issuance
 export const DEFAULT_INTEREST_RATE = 0.05; // additional daily interest after grace
 export const GRACE_PERIOD_MS = 1 * DAY_MS; // grace window past due before default
 export const DUE_SOON_WINDOW_MS = DAY_MS; // reminder fires when a loan is within this window of dueAt
