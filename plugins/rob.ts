@@ -65,8 +65,8 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
       case 'self':
         return send(`🤨 You can't rob yourself.`);
       default:
-        return send(`⚠️ The heist went sideways and nothing was taken. Try again in a moment.`);
-    }
+  console.error('[rob] attemptRob failed:', r);
+  return send(`⚠️ The heist went sideways and nothing was taken. (${r.reason ?? 'unknown'}) Try again in a moment.`);
   }
 
   if (r.outcome === 'victim_broke') {
