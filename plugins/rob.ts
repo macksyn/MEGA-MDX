@@ -67,6 +67,7 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
       default:
   console.error('[rob] attemptRob failed:', r);
   return send(`⚠️ The heist went sideways and nothing was taken. (${r.reason ?? 'unknown'}) Try again in a moment.`);
+   }
   }
 
   if (r.outcome === 'victim_broke') {
@@ -115,4 +116,3 @@ async function _handler(sock: any, message: any, args: string[], context: any) {
 
 export const handler = withEconomyGuard(_handler);
 export const usage = `${PREFIX}rob @member — rob a member's wallet (needs ${BAIL}+ coins for bail). Or reply to them with ${PREFIX}rob.`;
-}
