@@ -26,7 +26,10 @@ const dbConfig  = db.table!('config');
 const dbMembers = db.table!('members');
 
 const profileCache = new Map<string, Record<string, any>>();
-const historyCache = new Map<string, string[]>();
+// OPT 5: the WHOLE stored record (messages + updatedAt + gptThread) is cached, so a turn costs at
+// most one DB write. Group threads get their own cache (they're few, and expire by GROUP gap).
+const historyCache      = new Map<string, StoredHistory>();
+const groupHistoryCache = new Map<string, StoredHistory>();
 
 // ── Per-key async mutex ──────────────────────────────────────────────────────
 // This used to be `processingLock = new Set()` that was added to and deleted from but never
@@ -259,6 +262,10 @@ setInterval(() => {
             evicted++;
         }
     }
+    // Group threads past their (short) session gap are dead weight — drop them from memory.
+    for (const [gKey, rec] of groupHistoryCache) {
+        if (now - rec.updatedAt > GROUP_SESSION_GAP_MS) groupHistoryCache.delete(gKey);
+    }
     if (evicted > 0) console.log(`[CACHE] Evicted ${evicted} idle user(s) from cache`);
 }, CACHE_TTL_MS);
 
@@ -342,7 +349,7 @@ function groupHistoryKey(chatId: string): string {
 // Stored shape is now { messages, updatedAt } instead of a bare array, so we
 // can tell how long ago a thread last had a turn added to it.
 // gptThread is optional and only ever set on a personal (per-sender) record —
-// see loadGptThread/saveGptThread below. Group records never carry one.
+// see loadGptThread below (it is persisted by saveHistory). Group records never carry one.
 interface StoredHistory { messages: string[]; updatedAt: number; gptThread?: ChatGPTThread }
 
 function normalizeStoredHistory(raw: any): StoredHistory {
@@ -364,52 +371,62 @@ function normalizeStoredHistory(raw: any): StoredHistory {
     return { messages: [], updatedAt: 0 };
 }
 
-async function loadHistory(senderId: string, chatId: string): Promise<string[]> {
-    const key = historyKey(senderId, chatId);
-    cacheLastAccessed.set(senderId, Date.now());
-    if (historyCache.has(key)) return historyCache.get(key)!;
-
-    const { messages, updatedAt } = normalizeStoredHistory(await dbHistory.get(key));
-
-    if (messages.length > 0 && Date.now() - updatedAt > SESSION_GAP_MS) {
-        // Long enough since the last turn — start this thread fresh. We don't
-        // need to delete it from the DB: the next saveHistory() call will
-        // overwrite it with the new thread anyway.
-        console.log(`[HISTORY] Session gap (${SESSION_GAP_HOURS}h) exceeded for ${key} — starting fresh thread`);
-        historyCache.set(key, []);
-        return [];
+// ── OPT 5: one cached record per thread, one write per turn ──────────────────
+// Personal history, the ChatGPT thread and updatedAt all live in ONE stored record, but they used
+// to be read and written separately (every save re-read the record so the writes wouldn't clobber
+// each other): ~5 reads + 4 writes per answered turn, two of them BEFORE the reply went out.
+// Now the whole record is cached in memory; a turn reads it from cache and writes it once, after
+// the message has been sent. The session-gap check also lives here, so it applies on cache hits
+// too (it used to run only when the record happened to be read from the DB).
+async function getRecord(cache: Map<string, StoredHistory>, key: string, gapMs: number): Promise<StoredHistory> {
+    let rec = cache.get(key);
+    if (!rec) {
+        const loaded = normalizeStoredHistory(await dbHistory.get(key));
+        // Another turn may have filled (or already appended to) the cache while we awaited the DB.
+        rec = cache.get(key) ?? loaded;
+        cache.set(key, rec);
     }
-
-    historyCache.set(key, messages);
-    return messages;
+    if ((rec.messages.length > 0 || rec.gptThread) && Date.now() - rec.updatedAt > gapMs) {
+        // Long enough since the last turn — start this thread fresh (this also drops its gptThread).
+        // The DB copy is simply overwritten by the next save.
+        console.log(`[HISTORY] Session gap exceeded for ${key} — starting fresh thread`);
+        rec = { messages: [], updatedAt: Date.now() };
+        cache.set(key, rec);
+    }
+    return rec;
 }
 
-async function saveHistory(senderId: string, chatId: string, messages: string[]): Promise<void> {
+async function loadHistory(senderId: string, chatId: string): Promise<string[]> {
+    cacheLastAccessed.set(senderId, Date.now());
+    const rec = await getRecord(historyCache, historyKey(senderId, chatId), SESSION_GAP_MS);
+    return rec.messages;
+}
+
+// Writes messages AND (when the provider returned a new one) the ChatGPT thread in a single DB
+// write. With no new thread, the existing one is carried forward.
+async function saveHistory(
+    senderId: string,
+    chatId: string,
+    messages: string[],
+    thread?: ChatGPTThread | null
+): Promise<void> {
     const key = historyKey(senderId, chatId);
     cacheLastAccessed.set(senderId, Date.now());
-    historyCache.set(key, messages);
-    // This write must not clobber a ChatGPT thread saved separately by
-    // saveGptThread (below) under the same key — re-read and carry it forward.
-    const gptThread = normalizeStoredHistory(await dbHistory.get(key)).gptThread;
-    await dbHistory.set(key, { messages, updatedAt: Date.now(), ...(gptThread ? { gptThread } : {}) } as any);
+    const gptThread = thread ?? historyCache.get(key)?.gptThread;
+    const rec: StoredHistory = { messages, updatedAt: Date.now(), ...(gptThread ? { gptThread } : {}) };
+    historyCache.set(key, rec);
+    await dbHistory.set(key, rec as any);
 }
 
 // ── ChatGPT thread continuity ─────────────────────────────────────────────────
 // Stored inside the same personal-history record (keyed by historyKey) so it
 // expires on exactly the same session-gap rule as the rest of that thread —
 // a stale thread just means the next turn starts a fresh ChatGPT conversation.
+// Reads come from the cached record (no extra DB hit); the thread is written
+// by saveHistory() together with the turn, after the reply has been sent.
 async function loadGptThread(senderId: string, chatId: string): Promise<ChatGPTThread | null> {
-    const key = historyKey(senderId, chatId);
-    const { updatedAt, gptThread } = normalizeStoredHistory(await dbHistory.get(key));
-    if (!gptThread) return null;
-    if (Date.now() - updatedAt > SESSION_GAP_MS) return null;
-    return gptThread;
-}
-
-async function saveGptThread(senderId: string, chatId: string, thread: ChatGPTThread): Promise<void> {
-    const key      = historyKey(senderId, chatId);
-    const existing = normalizeStoredHistory(await dbHistory.get(key));
-    await dbHistory.set(key, { ...existing, gptThread: thread, updatedAt: Date.now() } as any);
+    const rec = await getRecord(historyCache, historyKey(senderId, chatId), SESSION_GAP_MS);
+    return rec.gptThread ?? null;
 }
 
 async function clearHistory(senderId: string, chatId: string): Promise<void> {
@@ -423,37 +440,33 @@ async function clearHistory(senderId: string, chatId: string): Promise<void> {
 // (e.g. "no one has cramps") keep circulating — every attempt to tell the
 // bot to drop it necessarily re-mentioned it, which just added a fresh turn
 // back into the same shared thread. .chatbot reset (no @mention) now calls
-// this to clear it immediately. No historyCache entry to clean up here —
-// group history is never cached in memory (see appendGroupHistory).
+// this to clear it immediately (and drops the in-memory copy too).
 async function clearGroupHistory(chatId: string): Promise<void> {
     const key = groupHistoryKey(chatId);
+    groupHistoryCache.delete(key);
     await dbHistory.del(key);
 }
 
 // ── BUG FIX #4: store raw messages; summarise only on load ───────────────────
+// OPT 5: the group record is cached in memory too (one process owns it, and every write already goes
+// through the per-chat lock in appendGroupHistory), so loading it no longer costs a DB read per message.
 async function loadGroupHistory(chatId: string): Promise<string[]> {
-    const key = groupHistoryKey(chatId);
-    const { messages, updatedAt } = normalizeStoredHistory(await dbHistory.get(key));
-
-    if (messages.length > 0 && Date.now() - updatedAt > GROUP_SESSION_GAP_MS) {
-        console.log(`[HISTORY] Group session gap (${GROUP_SESSION_GAP_HOURS}h) exceeded for ${key} — starting fresh thread`);
-        return [];
-    }
-
-    // Summarise on load only — never on save
-    return summarizeGroupHistory(messages);
+    const rec = await getRecord(groupHistoryCache, groupHistoryKey(chatId), GROUP_SESSION_GAP_MS);
+    // Summarise on load only — never on save. Copy so the summariser can't mutate the cached array.
+    return summarizeGroupHistory([...rec.messages]);
 }
 
-// Appends this exchange to the shared group thread INSIDE a per-chat lock, re-reading the stored
-// thread first. Two members answered at the same time used to overwrite each other (last write
+// Appends this exchange to the shared group thread INSIDE a per-chat lock, on top of the current
+// (cached) thread. Two members answered at the same time used to overwrite each other (last write
 // won). It also appends to the RAW stored messages — before, the summarised copy returned by
 // loadGroupHistory() was what got saved back, so summaries got re-summarised on every turn.
 async function appendGroupHistory(chatId: string, turns: string[]): Promise<void> {
     const key = groupHistoryKey(chatId);
     await runExclusive(`group:${chatId}`, async () => {
-        const stored = normalizeStoredHistory(await dbHistory.get(key));
-        const live   = stored.messages.length > 0 && Date.now() - stored.updatedAt > GROUP_SESSION_GAP_MS ? [] : stored.messages;
-        await dbHistory.set(key, { messages: [...live, ...turns].slice(-8), updatedAt: Date.now() } as any);
+        const rec  = await getRecord(groupHistoryCache, key, GROUP_SESSION_GAP_MS);
+        const next: StoredHistory = { messages: [...rec.messages, ...turns].slice(-8), updatedAt: Date.now() };
+        groupHistoryCache.set(key, next);
+        await dbHistory.set(key, next as any);
     });
 }
 
@@ -614,25 +627,48 @@ async function startTyping(sock: any, chatId: string): Promise<void> {
     }
 }
 
-async function stopTyping(sock: any, chatId: string): Promise<void> {
-    try {
-        await sock.sendPresenceUpdate('paused', chatId);
-    } catch (_) {}
+// ── OPT 4: typing delay overlaps the API wait instead of stacking on top of it ───
+// showTyping() used to sleep clamp(len*40, 1.5s, 6s) × jitter AFTER the answer was already in hand
+// (4–8s for any reply over ~150 chars, on top of the API call), inside the per-user lock, and the
+// stopTyping()→showTyping() pair made the indicator flicker off and on. Now typing starts once at
+// the top of the turn and typeUntil() only sleeps for whatever is LEFT of the target delay.
+const TYPING_MIN_MS = 1500;
+const TYPING_MAX_MS = Number(process.env.CHATBOT_TYPING_MAX_MS) || 3500;
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+/** How long a person would plausibly "type" a reply of this length (jittered). */
+function typingDelayFor(len: number): number {
+    const base = Math.min(Math.max(len * 40, TYPING_MIN_MS), TYPING_MAX_MS);
+    return Math.round(base * (0.7 + Math.random() * 0.6));
 }
 
+/** The occasional "stopped typing… started again" hesitation. */
+async function typingBlip(sock: any, chatId: string): Promise<void> {
+    await sock.sendPresenceUpdate('paused', chatId);
+    await sleep(400 + Math.random() * 600);
+    await sock.sendPresenceUpdate('composing', chatId);
+    await sleep(600 + Math.random() * 800);
+}
+
+// Standalone "type, then wait" — for short canned messages that have no API call to hide behind.
 async function showTyping(sock: any, chatId: string, estimatedResponseLength = 80): Promise<void> {
     try {
-        const base  = Math.min(Math.max(estimatedResponseLength * 40, 1500), 6000);
-        const delay = Math.round(base * (0.7 + Math.random() * 0.6));
         await sock.presenceSubscribe(chatId);
         await sock.sendPresenceUpdate('composing', chatId);
-        await new Promise(resolve => setTimeout(resolve, delay));
-        if (Math.random() < 0.25) {
-            await sock.sendPresenceUpdate('paused', chatId);
-            await new Promise(resolve => setTimeout(resolve, 400 + Math.random() * 600));
-            await sock.sendPresenceUpdate('composing', chatId);
-            await new Promise(resolve => setTimeout(resolve, 600 + Math.random() * 800));
-        }
+        await sleep(typingDelayFor(estimatedResponseLength));
+        if (Math.random() < 0.25) await typingBlip(sock, chatId);
+    } catch (error: any) {
+        console.error('Typing indicator error:', error.message);
+    }
+}
+
+/** Sleep only for the part of the human-typing delay that the API call hasn't already used up. */
+async function typeUntil(sock: any, chatId: string, startedAt: number, responseLength: number): Promise<void> {
+    try {
+        const remaining = typingDelayFor(responseLength) - (Date.now() - startedAt);
+        if (remaining <= 0) return;                     // the API was slow enough — send right away
+        await sleep(remaining);
+        if (remaining >= 1500 && Math.random() < 0.25) await typingBlip(sock, chatId);
     } catch (error: any) {
         console.error('Typing indicator error:', error.message);
     }
@@ -718,6 +754,57 @@ function isClosingRemark(text: string): boolean {
     return false;
 }
 
+// ── OPT 7: closing remarks never reach the model ────────────────────────────
+// A bare "ok" / "thanks" / "🙏" used to cost a full turn: history loads, taggables, an API call, 1–2s
+// of fake typing, and two of the eight history slots. Now it gets a reaction (default) or a tiny canned
+// line and the turn ends — no API call, nothing stored in history.
+//   CHATBOT_CLOSING_MODE=react (default) | text | ai   ('ai' restores the old model-written reply)
+// Guard: if the bot's own last message asked a question ("want me to explain more?"), a "yeah"/"ok" is
+// an ANSWER, not a closer — those still go through the model.
+const CLOSING_MODE = (process.env.CHATBOT_CLOSING_MODE ?? 'react').toLowerCase();
+const CLOSING_REACTIONS = {
+    thanks: ['🙏', '🤝', '👍'],
+    ack:    ['👍', '😄', '🤝', '👌']
+};
+const CLOSING_TEXTS = {
+    thanks: ['Anytime 🙏', "You're good 🤝", 'Easy 👍'],
+    ack:    ['👍', '😄', 'Alright 🤝']
+};
+
+function pick<T>(items: T[]): T {
+    return items[Math.floor(Math.random() * items.length)];
+}
+
+function getClosingKind(text: string): 'thanks' | 'ack' {
+    return /\b(thanks?|thank you|thank u|thx|tysm|ty|appreciat\w*)\b/i.test(text) ? 'thanks' : 'ack';
+}
+
+/** True if the bot's most recent turn in this thread ended on a question (or was cut off, so we can't tell). */
+function lastBotTurnAskedQuestion(messages: string[]): boolean {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        if (!messages[i].startsWith('Bot:')) continue;
+        const t = messages[i].trimEnd();
+        // Stored turns are truncated with '...' — be conservative and let the model handle those.
+        return t.endsWith('...') || /\?[^\p{L}\p{N}]*$/u.test(t);
+    }
+    return false;
+}
+
+async function sendClosingReply(sock: any, chatId: string, message: any, text: string): Promise<void> {
+    const kind = getClosingKind(text);
+    try {
+        if (CLOSING_MODE === 'text') {
+            await sleep(500 + Math.random() * 700);
+            await sock.sendMessage(chatId, { text: pick(CLOSING_TEXTS[kind]) }, { quoted: message });
+        } else {
+            await sock.sendMessage(chatId, { react: { text: pick(CLOSING_REACTIONS[kind]), key: message.key } });
+        }
+        console.log(`[CHATBOT] Closing remark (${kind}) handled without the model (mode=${CLOSING_MODE})`);
+    } catch (error: any) {
+        console.error('[CHATBOT] Closing reply failed:', error.message);
+    }
+}
+
 /**
  * Try to pull a name out of a short reply during name-collection flow.
  * Works for formal patterns ("My name is X") and bare short replies ("just call me Tunde").
@@ -754,16 +841,24 @@ function parseNameFromReply(text: string): string | null {
 
 // ── Live query detector ───────────────────────────────────────────────────────
 
+// OPT 6: this used to flag almost every question as "needs the web" — any "what is / who is / when is…"
+// (line 4 of the old list) and bare words like game / match / result / vs / squad — so "what is a noun?"
+// or "match my energy" got the "search the web before responding" instruction, the slowest and most
+// expensive path the model has. Generic wh-questions and bare nouns are out; real-time cues, sports
+// terms/teams and role-holders that change hands stay. `live` alone is gone too ("I live in Lagos").
+// Module-level so the patterns aren't re-allocated per message.
+const LIVE_PATTERNS: RegExp[] = [
+    /\b(scores?|fixtures?|kick.?off|line-?ups?|who won|full.?time|today.s (game|match|fixture))\b/,
+    /\b(today|tonight|right now|current(ly)?|live (score|stream|update|match|game)s?|latest|just now|this (week|month|season))\b/,
+    /\b(news|headlines?|prices?|stocks?|weather|forecast|transfer (news|window|rumou?rs?|fees?|targets?)|announce(d|ment)?|winner|champion)\b/,
+    /\bwho (is|are) (the )?(current |new |present )?(president|ceo|governor|coach|manager|captain|minister|prime minister)\b/,
+    /\bdid .{2,40} (win|lose|score)\b/,
+    /\b(psg|chelsea|arsenal|barcelona|real madrid|man (city|utd|united)|liverpool|champions league|premier league|laliga|serie a|bundesliga|nba|nfl|nhl|uefa|fifa)\b/
+];
+
 function requiresLiveData(message: string): boolean {
     const lower = message.toLowerCase();
-    const livePatterns = [
-        /\b(playing|match|game|score|fixture|result|vs\.?|versus|kickoff|kick.off|lineup|squad|today.s (game|match|fixture))\b/,
-        /\b(today|tonight|right now|current(ly)?|live|latest|just now|this (week|month|season))\b/,
-        /\b(news|headline|price|stock|weather|forecast|transfer|announce(d|ment)?|winner|champion)\b/,
-        /\b(who is|who are|what is|what are|when is|when did|did .+ (win|lose|score|play))\b/,
-        /\b(psg|chelsea|arsenal|barcelona|real madrid|man (city|utd|united)|liverpool|champions league|premier league|laliga|serie a|bundesliga|nba|nfl|nhl|uefa|fifa)\b/i
-    ];
-    return livePatterns.some(p => p.test(lower));
+    return LIVE_PATTERNS.some(p => p.test(lower));
 }
 
 // ── Prompt builder ────────────────────────────────────────────────────────────
@@ -1006,12 +1101,16 @@ async function callChatGPT(
 
 // ── AI call ───────────────────────────────────────────────────────────────────
 
+// The provider's thread travels back WITH the reply and is persisted by saveHistory() after the
+// message is sent — it used to be saved (get + set) before this function returned.
+interface AIResult { text: string; thread: ChatGPTThread | null }
+
 async function getAIResponse(
     userMessage: string,
     userContext: { messages: string[]; userInfo: Record<string, any> },
     chatId: string,
     senderId: string
-): Promise<string | null> {
+): Promise<AIResult | null> {
     const { systemPrompt, intent, closingRemark } = buildPrompt(userMessage, userContext.userInfo);
     const temperature = closingRemark ? CLOSING_REMARK_TEMPERATURE : TEMPERATURE_BY_INTENT[intent];
     // OPT: a real closing line never needs anywhere near 500 tokens — capping
@@ -1049,9 +1148,8 @@ async function getAIResponse(
             const prompt = `${systemPrompt}\n\n${contextBlock}`;
             const result = await callChatGPT(prompt, existingThread ?? undefined);
             recordSuccess(PRIMARY_PROVIDER_NAME);
-            if (result.thread) await saveGptThread(senderId, chatId, result.thread);
             console.log(`[AI] ${PRIMARY_PROVIDER_NAME} responded (intent=${intent}, closing=${closingRemark}, thread=${existingThread ? 'continued' : 'new'})`);
-            return cleanResponse(result.text);
+            return { text: cleanResponse(result.text), thread: result.thread };
         } catch (err: any) {
             recordFailure(PRIMARY_PROVIDER_NAME);
             console.log(`[AI] ${PRIMARY_PROVIDER_NAME} failed: ${err?.message}`);
@@ -1066,7 +1164,7 @@ async function getAIResponse(
             const result = await callGroq(FALLBACK_MODEL, systemPrompt, contextBlock, temperature, maxTokens);
             recordSuccess(FALLBACK_MODEL.name);
             console.log(`[AI] ${FALLBACK_MODEL.name} responded (fallback, intent=${intent}, temp=${temperature}, closing=${closingRemark}, maxTokens=${maxTokens})`);
-            return cleanResponse(result.text);
+            return { text: cleanResponse(result.text), thread: null };
         } catch (err: any) {
             recordFailure(FALLBACK_MODEL.name);
             console.log(`[AI] ${FALLBACK_MODEL.name} failed: ${err?.message}`);
@@ -1177,19 +1275,7 @@ export async function handleChatbotResponse(
                 return;
             }
 
-            // Normal flow
-            const sharedMessages = await loadGroupHistory(chatId);
-            const userMessages   = await loadHistory(senderId, chatId);
-            // BUG FIX: sharedMessages is every member's recent exchange with the
-            // bot in this group, not just this sender's. It used to be
-            // concatenated in uncapped, so a sender with little or no personal
-            // history (e.g. someone just saying "hi") got their context window
-            // filled almost entirely by whatever someone else last discussed —
-            // that's how one member's topic kept showing up in everyone else's
-            // replies. Cap the shared slice to the last exchange and always put
-            // it before the sender's own history, so their own turns are never
-            // the ones dropped by the slice(-8) budget below.
-            const messages = [...sharedMessages.slice(-2), ...userMessages].slice(-8);
+            // Normal flow (histories are loaded further down, after the closing-remark check)
 
             // ── Name resolution: WhatsApp first name takes priority ───────────
             // 1. Try to extract a clean first name from WhatsApp's pushName.
@@ -1287,6 +1373,20 @@ export async function handleChatbotResponse(
                 return;
             }
 
+            // ── OPT 7: closing remarks ("ok", "thanks", "🙏") skip the model entirely ──
+            // Placed AFTER the name flow (so a one-word reply to "what's your name?" isn't swallowed)
+            // and BEFORE any extraction/typing/history work, so these turns are nearly free.
+            const userMessages = await loadHistory(senderId, chatId);
+            if (CLOSING_MODE !== 'ai' && isClosingRemark(cleanedMessage) && !lastBotTurnAskedQuestion(userMessages)) {
+                await sendClosingReply(sock, chatId, message, cleanedMessage);
+                return;
+            }
+
+            // ── OPT 4: typing starts NOW — before the DB work and the API call — and stays on ──
+            // startTyping() swallows its own errors, so the un-awaited promise can never reject.
+            const typingStartedAt = Date.now();
+            const typingReady     = startTyping(sock, chatId);
+
             // ── OPT 3: skip extractUserInfo when profile is already complete ──
             // The regex scan across name/age/location patterns runs on every single
             // message. Short-circuit as soon as all three fields are known — users
@@ -1312,7 +1412,21 @@ export async function handleChatbotResponse(
             // network fetch on every chatbot message; invalidateGroupMetaCache()
             // still clears it immediately on group-participants.update so
             // kicks/joins are reflected promptly.
-            const groupMeta = await getCachedGroupMeta(sock, chatId);
+            // OPT 5: group thread comes from cache; fetched in parallel with the (cached) group metadata.
+            const [sharedMessages, groupMeta] = await Promise.all([
+                loadGroupHistory(chatId),
+                getCachedGroupMeta(sock, chatId)
+            ]);
+            // BUG FIX: sharedMessages is every member's recent exchange with the
+            // bot in this group, not just this sender's. It used to be
+            // concatenated in uncapped, so a sender with little or no personal
+            // history (e.g. someone just saying "hi") got their context window
+            // filled almost entirely by whatever someone else last discussed —
+            // that's how one member's topic kept showing up in everyone else's
+            // replies. Cap the shared slice to the last exchange and always put
+            // it before the sender's own history, so their own turns are never
+            // the ones dropped by the slice(-8) budget below.
+            const messages = [...sharedMessages.slice(-2), ...userMessages].slice(-8);
             const people = await buildTaggables(sock, chatId, groupMeta, [...allMentioned, senderId], botJids);
             // Only real names go to the model — never raw IDs/LIDs (that's what it was echoing back).
             const memberNames = people
@@ -1323,26 +1437,24 @@ export async function handleChatbotResponse(
                 ? `Group context: this chat includes ${memberNames.join(', ')}. Keep replies anchored to the current topic and the member asking the question. To tag someone ELSE write @ followed by their name exactly as listed. When talking to the person who messaged you, just use their name naturally without @. Never write phone numbers or long ID numbers.`
                 : 'Group context: this is a group chat. Keep replies anchored to the current topic and the person asking the question.';
 
-            // Typing starts BEFORE the API call
-            await startTyping(sock, chatId);
-
+            await typingReady;
             const quotedContext = extractQuotedContext(message);
-            const response = await getAIResponse(cleanedMessage, {
+            const aiResult = await getAIResponse(cleanedMessage, {
                 messages,
                 userInfo: { ...profile, groupContext: groupLabel, quotedContext }
             }, chatId, senderId);
-
-            await stopTyping(sock, chatId);
+            const response = aiResult?.text ?? null;
 
             if (!response) {
-                await showTyping(sock, chatId, 40);
+                await typeUntil(sock, chatId, typingStartedAt, 40);
                 await sock.sendMessage(chatId, {
                     text: "Hmm... I lost my train of thought there 🤔 try again?"
                 }, { quoted: message });
                 return;
             }
 
-            await showTyping(sock, chatId, response.length);
+            // OPT 4: only wait out whatever is left of the "human typing" time (usually none, if the API was slow).
+            await typeUntil(sock, chatId, typingStartedAt, response.length);
 
             // ── BUG FIX #2: send the message FIRST, save history only after
             //    successful delivery — prevents persisting undelivered bot turns. ──
@@ -1362,7 +1474,7 @@ export async function handleChatbotResponse(
 
             await Promise.all([
                 appendGroupHistory(chatId, [userTurn, botTurn]),
-                saveHistory(senderId, chatId, personalThread),
+                saveHistory(senderId, chatId, personalThread, aiResult?.thread),   // OPT 5: history + gptThread in ONE write
             ]);
 
         }, MAX_QUEUED_TURNS);
