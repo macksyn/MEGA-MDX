@@ -415,7 +415,7 @@ function rollHouseMood(): HouseMood {
     multiplier = 0.9;
   } else if (r < 0.30) {
     mood = 'cold';
-    multiplier = 1.2;
+    multiplier = 1.3;
   } else {
     mood = 'neutral';
     multiplier = 1.0;
@@ -487,8 +487,8 @@ const AVG_TIER_MULTIPLIER: Record<SpinOutcome['tier'], number> = {
 // neutral pressure) odds are tuned to land here — a bit more generous at the
 // lowest stake, a bit tighter at the highest, instead of the old baseline's
 // unexplained ~50%-to-96% swing across stakes.
-const MIN_STAKE_BASE_RTP = 0.93; // at stake 5  (normalized = 0.2)
-const MAX_STAKE_BASE_RTP = 0.90; // at stake 100 (normalized = 1.0)
+const MIN_STAKE_BASE_RTP = 0.94; // at stake 5  (normalized = 0.2)
+const MAX_STAKE_BASE_RTP = 0.91; // at stake 100 (normalized = 1.0)
 
 function targetBaseRTP(normalized: number): number {
   const t = (normalized - 0.2) / 0.8; // 0 at the lowest stake, 1 at the highest
