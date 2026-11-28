@@ -175,7 +175,7 @@ const pick = (arr: any[]) => arr[Math.floor(Math.random() * arr.length)];
 
 export default {
   command: 'menu',
-  aliases: ['help', 'commands', 'h', 'list'],
+  aliases: ['commands', 'list'],
   category: 'general',
   description: 'Show all commands',
   usage: '.menu [command]',
