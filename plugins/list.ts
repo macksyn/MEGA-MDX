@@ -41,7 +41,7 @@ interface MenuRenderOptions {
 const menuStyles = [
   {
     render({ _title, info, categories, prefix }: MenuRenderOptions) {
-      let t = `╭━━『 *MEGA MENU* 』━⬣\n`;
+      let t = `╭━━『 *GROQ MENU* 』━⬣\n`;
       t += `┃ ✨ *Bot: ${info.bot}*\n`;
       t += `┃ 🔧 *Prefix: ${info.prefix}*\n`;
       t += `┃ 📦 *Plugin: ${info.total}*\n`;
@@ -60,7 +60,7 @@ const menuStyles = [
 
   {
     render({ _title, info, categories, prefix }: MenuRenderOptions) {
-      let t = `◈╭─❍「 *MEGA MENU* 」❍\n`;
+      let t = `◈╭─❍「 *GROQ MENU* 」❍\n`;
       t += `◈├• 🌟 *Bot: ${info.bot}*\n`;
       t += `◈├• ⚙️ *Prefix: ${info.prefix}*\n`;
       t += `◈├• 🍫 *Plugins: ${info.total}*\n`;
@@ -79,7 +79,7 @@ const menuStyles = [
 
   {
     render({ _title, info, categories, prefix }: MenuRenderOptions) {
-      let t = `┏━━━━ *MEGA MENU* ━━━┓\n`;
+      let t = `┏━━━━ *GROQ MENU* ━━━┓\n`;
       t += `┃• *Bot : ${info.bot}*\n`;
       t += `┃• *Prefixes : ${info.prefix}*\n`;
       t += `┃• *Plugins : ${info.total}*\n`;
@@ -98,7 +98,7 @@ const menuStyles = [
 
   {
     render({ _title, info, categories, prefix }: MenuRenderOptions) {
-      let t = `✦═══ *MEGA MENU* ═══✦\n`;
+      let t = `✦═══ *GROQ MENU* ═══✦\n`;
       t += `║➩ *Bot: ${info.bot}*\n`;
       t += `║➩ *Prefixes: ${info.prefix}*\n`;
       t += `║➩ *Plugins: ${info.total}*\n`;
@@ -117,7 +117,7 @@ const menuStyles = [
 
   {
     render({ _title, info, categories, prefix }: MenuRenderOptions) {
-      let t = `❀━━━ *MEGA MENU* ━━━❀\n`;
+      let t = `❀━━━ *GROQ MENU* ━━━❀\n`;
       t += `┃☞ *Bot: ${info.bot}*\n`;
       t += `┃☞ *Prefixes: ${info.prefix}*\n`;
       t += `┃☞ *Plugins: ${info.total}*\n`;
@@ -136,7 +136,7 @@ const menuStyles = [
 
   {
     render({ _title, info, categories, prefix }: MenuRenderOptions) {
-      let t = `◆━━━ *MEGA MENU* ━━━◆\n`;
+      let t = `◆━━━ *GROQ MENU* ━━━◆\n`;
       t += `┃ ¤ *Bot: ${info.bot}*\n`;
       t += `┃ ¤ *Prefixes: ${info.prefix}*\n`;
       t += `┃ ¤ *Plugins: ${info.total}*\n`;
@@ -154,7 +154,7 @@ const menuStyles = [
 
   {
     render({ _title, info, categories, prefix }: MenuRenderOptions) {
-      let t = `╭───⬣ *MEGA MENU* ──⬣\n`;
+      let t = `╭───⬣ *GROQ MENU* ──⬣\n`;
       t += ` | ● *Bot: ${info.bot}*\n`;
       t += ` | ● *Prefixes: ${info.prefix}*\n`;
       t += ` | ● *Plugins: ${info.total}*\n`;
